@@ -1,0 +1,88 @@
+
+name: Build PhotoCraft Offline APK
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "apps/photocraft-web/**"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "android-wrapper/**"
+      - ".github/workflows/android-apk.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build offline Android APK
+    runs-on: ubuntu-latest
+
+    env:
+      TRUNK_VERSION: "0.21.14"
+      CARGO_BUILD_JOBS: "2"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: photocraft-web
+
+      - name: Install Trunk
+        run: |
+          mkdir -p "$HOME/.cargo/bin"
+          curl -fsSL \
+            "https://github.com/trunk-rs/trunk/releases/download/v${TRUNK_VERSION}/trunk-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar -xz -C "$HOME/.cargo/bin" trunk
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/trunk" --version
+
+      - name: Build PhotoCraft WebAssembly
+        run: |
+          cd apps/photocraft-web
+          trunk build --release
+
+      - name: Bundle web app into Android assets
+        run: |
+          test -f dist/web/index.html
+          mkdir -p android-wrapper/app/src/main/assets/photocraft
+          cp -a dist/web/. \
+            android-wrapper/app/src/main/assets/photocraft/
+          test -f android-wrapper/app/src/main/assets/photocraft/index.html
+          ls -lh android-wrapper/app/src/main/assets/photocraft/
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Build Android APK
+        run: |
+          gradle --no-daemon \
+            -p android-wrapper \
+            assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: PhotoCraft-Offline-APK
+          path: android-wrapper/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
