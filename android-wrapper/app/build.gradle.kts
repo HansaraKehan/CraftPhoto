@@ -1,4 +1,3 @@
-
 plugins {
     id("com.android.application")
 }
@@ -23,6 +22,7 @@ android {
 }
 
 dependencies {
+    implementation(platform("org.jetbrains.kotlin:kotlin-bom:1.8.22"))
     implementation("androidx.webkit:webkit:1.12.1")
     implementation("androidx.activity:activity:1.9.3")
 }
