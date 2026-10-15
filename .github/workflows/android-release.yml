@@ -67,9 +67,11 @@ jobs:
           VER=$(grep -m1 '^version' src/Cargo.toml | cut -d'"' -f2)
           SHA=$(git -C src rev-parse --short=7 HEAD)
           TAG="android-v${VER}-${SHA}"
-          echo "version=$VER" >> "$GITHUB_OUTPUT"
-          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          {
+            echo "version=$VER"
+            echo "sha=$SHA"
+            echo "tag=$TAG"
+          } >> "$GITHUB_OUTPUT"
           if [ "$FORCE" != "true" ] && gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
             echo "Release $TAG already exists - nothing to do."
             echo "skip=true" >> "$GITHUB_OUTPUT"
@@ -195,7 +197,7 @@ jobs:
           "$BT/zipalign" -f -P 16 4 "$B/unsigned.apk" "$B/aligned.apk"
           APK="dist/PhotoCraft-${VERSION}-android-arm64-v8a.apk"
           "$BT/apksigner" sign --ks ~/photocraft-signing/key.p12 --ks-key-alias photocraft \
-            --ks-pass file:$HOME/photocraft-signing/password.txt --out "$APK" "$B/aligned.apk"
+            --ks-pass "file:$HOME/photocraft-signing/password.txt" --out "$APK" "$B/aligned.apk"
           "$BT/apksigner" verify --verbose "$APK"
           echo "APK=$APK" >> "$GITHUB_ENV"
 
