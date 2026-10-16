@@ -9,7 +9,7 @@ newest upstream source, adds the Android layer and an English translation, build
 
 ## Download
 
-Get the latest `.apk` from the [Releases](../../releases) page, open it on your device and allow the
+Get the latest `.apk` from the [Releases](https://github.com/HansaraKehan/CraftPhoto/releases) page, open it on your device and allow the
 install when Android asks. You need:
 
 - an ARM64 phone or tablet (most devices from the last several years)
