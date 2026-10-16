@@ -1,3 +1,4 @@
+<img width="2304" height="1440" alt="Screenshot_20261016_160858" src="https://github.com/user-attachments/assets/f083d83d-0111-4d27-a9e5-06b2fbf065dd" />
 # PhotoCraft for Android (English, auto-updated)
 
 An unofficial Android build of [PhotoCraft](https://github.com/storytold/photocraft), the open-source
