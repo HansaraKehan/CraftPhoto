@@ -1,4 +1,5 @@
 <img width="2304" height="1440" alt="Screenshot_20261016_160858" src="https://github.com/user-attachments/assets/f083d83d-0111-4d27-a9e5-06b2fbf065dd" />
+
 # PhotoCraft for Android (English, auto-updated)
 
 An unofficial Android build of [PhotoCraft](https://github.com/storytold/photocraft), the open-source
@@ -18,6 +19,14 @@ install when Android asks. You need:
 - a GPU with Vulkan or OpenGL ES 3
 
 If an update won't install over an older build, uninstall the old one first.
+
+### 📊 App Downloads
+
+| Application | Description | Downloads | Link |
+| :--- | :--- | :--- | :--- |
+| **PhotoCraft** | Image editing app | [![Downloads](https://img.shields.io/github/downloads/HansaraKehan/CraftPhoto/total?style=flat-square&color=blue)](https://github.com/HansaraKehan/CraftPhoto/releases) | [Releases](https://github.com/HansaraKehan/CraftPhoto/releases) |
+| **LightCraft** | Light & theme utility | [![Downloads](https://img.shields.io/github/downloads/HansaraKehan/Craftlight/total?style=flat-square&color=orange)](https://github.com/HansaraKehan/Craftlight/releases) | [Releases](https://github.com/HansaraKehan/Craftlight/releases) |
+| **WordCraft** | Text utility app | [![Downloads](https://img.shields.io/github/downloads/HansaraKehan/CraftWord/total?style=flat-square&color=green)](https://github.com/HansaraKehan/CraftWord/releases) | [Releases](https://github.com/HansaraKehan/CraftWord/releases) |
 
 ## How it stays up to date
 
