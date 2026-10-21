@@ -6,7 +6,7 @@
 
 An unofficial native Android build (egui + wgpu) of [PhotoCraft](https://github.com/storytold/photocraft). It runs full-screen with native touch, active pen, and keyboard/mouse support.
 
-[What's new](WHATS-NEW.md) · [Get the app](#-get-the-app) · [Settings guide](#-settings-guide) · [Troubleshooting](#-troubleshooting) · [App Suite Downloads](#-app-downloads)
+[What's new](WHATS-NEW.md) · [Get the app](#-get-the-app) · [Settings guide](#-settings-guide) · [App Suite Downloads](#-app-downloads)
 
 <img width="2304" height="1440" alt="Screenshot_20261016_160858" src="https://github.com/user-attachments/assets/f083d83d-0111-4d27-a9e5-06b2fbf065dd" />
 
