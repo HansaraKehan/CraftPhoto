@@ -31,24 +31,14 @@ An unofficial native Android build (egui + wgpu) of [PhotoCraft](https://github.
 ---
 
 ## 📲 Get the App
+Get the latest `.apk` from the [Releases](https://github.com/HansaraKehan/CraftPhoto/releases) page, open it on your device and allow the
+install when Android asks. You need:
 
-This repository builds an Android APK on GitHub — no computer or IDE needed.
-
-1. Open the **Actions** tab → **Android release** (or **Build and release Android APK**) → **Run workflow**.
-2. Choose the branch or tag that holds your `android-layer/android-layer.tar.gz`.
-3. When the run finishes, download the APK from **Releases** (or the run's artifacts) and install it.
-
-> 💡 **How it works:** The workflow downloads the latest upstream [PhotoCraft](https://github.com/storytold/photocraft), applies the Android layer from `android-layer/android-layer.tar.gz` and the English translation script (`translate_en.py`) on top, and builds the result. Your features live in that one file.
-
-### Requirements
-- An ARM64 phone or tablet (most devices from recent years)
+- an ARM64 phone or tablet (most devices from the last several years)
 - Android 9 or newer
-- A GPU with Vulkan or OpenGL ES 3 support
+- a GPU with Vulkan or OpenGL ES 3
 
-### Installation & Download
-1. Get the latest `.apk` from the [Releases](https://github.com/HansaraKehan/CraftPhoto/releases) page.
-2. Open it on your Android device and allow installation when asked.
-3. *Note:* If an update will not install over an older build, uninstall the old version first.
+If an update won't install over an older build, uninstall the old one first.
 
 ---
 
