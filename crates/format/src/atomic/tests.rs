@@ -69,8 +69,8 @@ impl AtomicFs for Faulty {
     fn sync_dir(&self, dir: &Path) -> io::Result<()> {
         RealFs.sync_dir(dir)
     }
-    fn copy_permissions(&self, from: &Path, to: &Path) -> io::Result<()> {
-        RealFs.copy_permissions(from, to)
+    fn copy_metadata(&self, from: &Path, to: &Path) -> io::Result<()> {
+        RealFs.copy_metadata(from, to)
     }
 }
 
@@ -176,6 +176,81 @@ fn lock_that_outlasts_the_retries_keeps_original() {
     assert_no_temp(&d.0);
 }
 
+/// A file system that reports the target as read-only and records every write and rename.
+#[derive(Default)]
+struct ReadOnlyTarget {
+    writes: Cell<u32>,
+    renames: Cell<u32>,
+}
+
+impl AtomicFs for ReadOnlyTarget {
+    fn is_readonly(&self, _path: &Path) -> bool {
+        true
+    }
+    fn write_new(&self, tmp: &Path, bytes: &[u8]) -> io::Result<()> {
+        self.writes.set(self.writes.get() + 1);
+        RealFs.write_new(tmp, bytes)
+    }
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        self.renames.set(self.renames.get() + 1);
+        RealFs.rename(from, to)
+    }
+    fn remove(&self, path: &Path) -> io::Result<()> {
+        RealFs.remove(path)
+    }
+    fn sync_dir(&self, dir: &Path) -> io::Result<()> {
+        RealFs.sync_dir(dir)
+    }
+    fn copy_metadata(&self, from: &Path, to: &Path) -> io::Result<()> {
+        RealFs.copy_metadata(from, to)
+    }
+}
+
+/// #6600: a read-only destination is refused before anything is written, with an error that says
+/// so, instead of being replaced by the rename (which only needs the folder to be writable).
+#[test]
+fn read_only_target_is_refused_before_anything_is_written() {
+    let d = TempDir::new("rofake");
+    let p = d.0.join("a.psd");
+    std::fs::write(&p, ORIGINAL).unwrap();
+    let fs = ReadOnlyTarget::default();
+    let e = atomic_write_with(&fs, NO_RETRY, &p, b"new").unwrap_err();
+    assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+    assert!(e.to_string().contains("a.psd") && e.to_string().contains("read-only") && e.to_string().contains("not changed"), "{e}");
+    assert_eq!((fs.writes.get(), fs.renames.get()), (0, 0), "nothing is written or renamed");
+    assert_eq!(std::fs::read(&p).unwrap(), ORIGINAL);
+    assert_no_temp(&d.0);
+}
+
+/// #6600 on the real file system: a file marked read-only (`chmod 444`, or the Windows read-only
+/// attribute) keeps its bytes and the save says why; a writable one still saves.
+#[test]
+fn read_only_file_on_disk_is_never_replaced() {
+    let d = TempDir::new("rofile");
+    let p = d.0.join("a.psd");
+    std::fs::write(&p, ORIGINAL).unwrap();
+    let mut perms = std::fs::metadata(&p).unwrap().permissions();
+    perms.set_readonly(true);
+    std::fs::set_permissions(&p, perms.clone()).unwrap();
+    let r = atomic_write(&p, b"new");
+    let unchanged = std::fs::read(&p).unwrap();
+    let still_readonly = std::fs::metadata(&p).unwrap().permissions().readonly();
+    // Make it writable again so the folder can be removed (Windows refuses to delete it otherwise).
+    #[allow(clippy::permissions_set_readonly_false)]
+    perms.set_readonly(false);
+    std::fs::set_permissions(&p, perms).unwrap();
+    let e = r.unwrap_err();
+    assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+    assert!(e.to_string().contains("the file is read-only;"), "a clear reason, not a failed rename: {e}");
+    assert_eq!(unchanged, ORIGINAL);
+    assert!(still_readonly);
+    assert_no_temp(&d.0);
+    // New files and writable files are unaffected.
+    atomic_write(&p, b"new").unwrap();
+    assert_eq!(std::fs::read(&p).unwrap(), b"new");
+    atomic_write(&d.0.join("fresh.psd"), b"x").unwrap();
+}
+
 #[cfg(unix)]
 #[test]
 fn read_only_folder_errors_clearly_and_never_writes_in_place() {
@@ -219,6 +294,52 @@ fn writes_through_a_symlink() {
     atomic_write(&link, b"new").unwrap();
     assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
     assert_eq!(std::fs::read(&real).unwrap(), b"new");
+}
+
+/// #6605: saving onto a dangling symlink writes through to its target instead of replacing the
+/// link with a regular file, even when a folder on the way to the target doesn't exist yet.
+#[cfg(unix)]
+#[test]
+fn writes_through_a_dangling_symlink() {
+    let d = TempDir::new("dangling");
+    let real = d.0.join("missing/dir/a.psd");
+    let link = d.0.join("link.psd");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    atomic_write(&link, b"new").unwrap();
+    assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "the link survives");
+    assert_eq!(std::fs::read(&real).unwrap(), b"new", "the bytes land at the target");
+    assert_no_temp(real.parent().unwrap_or(Path::new(".")));
+}
+
+/// A dangling link with a relative target resolves against the link's own folder.
+#[cfg(unix)]
+#[test]
+fn writes_through_a_dangling_relative_symlink() {
+    let d = TempDir::new("dangling-rel");
+    let here = d.0.join("here");
+    std::fs::create_dir(&here).unwrap();
+    let link = here.join("link.psd");
+    std::os::unix::fs::symlink("../elsewhere/real.psd", &link).unwrap();
+    atomic_write(&link, b"new").unwrap();
+    assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "the link survives");
+    assert_eq!(std::fs::read(d.0.join("elsewhere/real.psd")).unwrap(), b"new");
+    assert_no_temp(&d.0.join("elsewhere"));
+}
+
+/// A symlink loop is an error; it never replaces either link.
+#[cfg(unix)]
+#[test]
+fn symlink_loop_errors_without_replacing_the_links() {
+    let d = TempDir::new("loop");
+    let a = d.0.join("a.psd");
+    let b = d.0.join("b.psd");
+    std::os::unix::fs::symlink(&b, &a).unwrap();
+    std::os::unix::fs::symlink(&a, &b).unwrap();
+    let e = atomic_write(&a, b"new").unwrap_err();
+    assert!(e.to_string().contains("symbolic links"), "{e}");
+    assert!(std::fs::symlink_metadata(&a).unwrap().file_type().is_symlink());
+    assert!(std::fs::symlink_metadata(&b).unwrap().file_type().is_symlink());
+    assert_no_temp(&d.0);
 }
 
 #[test]

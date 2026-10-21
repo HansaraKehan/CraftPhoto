@@ -415,6 +415,45 @@ async fn headless_doc_save_writes_targa_bits() {
     cleanup(&dir);
 }
 
+/// `ddsCompression` and `ddsMipmaps` reach the app's `app.save` through the bridge; an unknown
+/// compression is refused before anything is sent.
+#[tokio::test(flavor = "multi_thread")]
+async fn bridge_doc_save_forwards_dds_options() {
+    let (addr, app) = fake_app().await;
+    let client = connect(PhotocraftMcp::bridge(&addr, CONTROL_TOKEN).unwrap()).await;
+    let saved = json_of(&call(&client, "doc_save", json!({"path": "out.dds", "ddsCompression": "DXT5", "ddsMipmaps": true})).await);
+    assert_eq!(saved, json!({"saved": {"path": "out.dds", "ddsCompression": "bc3", "ddsMipmaps": true}}));
+    let r = call(&client, "doc_save", json!({"path": "out.dds", "ddsCompression": "bc7"})).await;
+    assert_eq!(r.is_error, Some(true), "{}", text(&r));
+    assert!(text(&r).contains("ddsCompression"), "{}", text(&r));
+    client.cancel().await.unwrap();
+    app.abort();
+}
+
+/// Headless `doc_save`/`doc_export` write the DDS compression (the FourCC, bytes 84–87) and mip
+/// count (bytes 28–31) asked for; unset, an uncompressed texture without mipmaps.
+#[tokio::test(flavor = "multi_thread")]
+async fn headless_doc_save_writes_dds_options() {
+    let dir = tmp("dds-options");
+    let client = connect(headless_in(&dir)).await;
+    call(&client, "doc_new", json!({"width": 16, "height": 8, "background": "white"})).await;
+    for (tool, params, fourcc, mips) in [
+        ("doc_export", json!({"path": "plain.dds"}), [0; 4], 1),
+        ("doc_export", json!({"path": "bc1.dds", "ddsCompression": "bc1"}), *b"DXT1", 1),
+        ("doc_save", json!({"path": "bc3.dds", "ddsCompression": "bc3", "ddsMipmaps": true}), *b"DXT5", 5),
+    ] {
+        let r = call(&client, tool, params.clone()).await;
+        assert_ne!(r.is_error, Some(true), "{params}: {}", text(&r));
+        let bytes = std::fs::read(dir.join(params["path"].as_str().unwrap())).unwrap();
+        assert_eq!((&bytes[84..88], u32::from_le_bytes(bytes[28..32].try_into().unwrap())), (&fourcc[..], mips), "{params}");
+    }
+    let r = call(&client, "doc_export", json!({"path": "bad.dds", "ddsCompression": "bc7"})).await;
+    assert_eq!(r.is_error, Some(true), "{}", text(&r));
+    assert!(!dir.join("bad.dds").exists());
+    client.cancel().await.unwrap();
+    cleanup(&dir);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn bridge_response_budget_drops_connection_without_retrying_the_operation() {
     use photocraft_automation::{BridgeClient, budgets::MAX_RESPONSE_BYTES};

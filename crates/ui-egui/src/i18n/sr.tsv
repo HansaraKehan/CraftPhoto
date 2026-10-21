@@ -535,6 +535,9 @@
 	Field Blur…	Zamućenje polja…
 	No pin selected	Nijedna čioda nije izabrana
 	Click the image to add a pin; drag a pin to move it, or its ring to change its blur. Delete removes the selected pin.	Kliknite na sliku da dodate čiodu; prevucite čiodu da je pomerite ili njen prsten da promenite zamućenje. Delete uklanja izabranu čiodu.
+	Drag the handles on the outline to resize and turn it, the square to round its corners, and the dots inside to set where the blur starts.	Prevucite ručke na obrisu da promenite veličinu i rotirate ga, kvadrat da zaoblite uglove, a tačke unutra da odredite gde zamućenje počinje.
+	Drag the pin to move the band, or its ring to change its blur. Drag the solid lines to widen the sharp band, the dashed lines to set the transition, and the dots to turn it.	Prevucite čiodu da pomerite traku ili njen prsten da promenite zamućenje. Prevucite pune linije da proširite oštru traku, isprekidane linije da podesite prelaz, a tačke da je rotirate.
+	Drag the handles on the outline to resize and turn it; the ring sets the blur angle.	Prevucite ručke na obrisu da promenite veličinu i rotirate ga; prsten određuje ugao zamućenja.
 	Iris Blur…	Iris zamućenje…
 	Tilt-Shift…	Tilt-shift…
 	Path Blur…	Zamućenje duž putanje…
@@ -954,7 +957,6 @@
 	Contiguous	Susedno
 	Contrast	Kontrast
 	Control:	Kontrola:
-	Convert document's colors to the working space	Pretvori boje dokumenta u radni prostor
 	Convert to sRGB	Pretvori u sRGB
 	Copies	Primerci
 	Copper	Bakar
@@ -1009,6 +1011,7 @@
 	Delete Group	Obriši grupu
 	Delete Layer Mask	Obriši masku sloja
 	Delete Layers	Obriši slojeve
+	Add Shortcut	Dodaj prečicu
 	Delete Shortcut	Obriši prečicu
 	Delete Timeline	Obriši vremensku liniju
 	Delete Tool Preset	Obriši šablon alatke
@@ -1526,7 +1529,6 @@
 	Use Default	Koristi podrazumevano
 	Use Legacy	Koristi staro
 	Use Measurement Scale	Koristi razmeru merenja
-	Use the embedded profile (instead of the working space)	Koristi ugrađeni profil (umesto radnog prostora)
 	Variables bind a layer's visibility, text or pixels to a named data slot.	Promenljive vezuju vidljivost, tekst ili piksele sloja za imenovano polje podataka.
 	Vertical scale	Vertikalna razmera
 	Vibrance	Živost
@@ -1844,6 +1846,8 @@
 	Camera Raw Defaults	Podrazumevana Camera Raw podešavanja
 	Canvas border	Ivica platna
 	Show canvas dots	Prikaži tačke na platnu
+	Clip thumbnails to layer bounds	Iseci sličice prema granicama sloja
+	Clip Thumbnails to Layer Bounds	Iseci sličice prema granicama sloja
 	Canvas color	Boja platna
 	Canvas custom color	Prilagođena boja platna
 	Color picker	Birač boja
@@ -2091,6 +2095,11 @@
 	Apply the pen's tilt and rotation to the tip shape	Primeni nagib i rotaciju olovke na oblik vrha
 	Mixer Brush	Četkica za mešanje
 	Wet	Vlažnost
+	Current Brush Load	Trenutno punjenje četkice
+	Load Brush	Napuni četkicu
+	Clean Brush	Očisti četkicu
+	Load the brush after each stroke	Napuni četkicu posle svakog poteza
+	Clean the brush after each stroke	Očisti četkicu posle svakog poteza
 	Mix	Mešanje
 	Wetness Jitter	Kolebanje vlažnosti
 	Mix Jitter	Kolebanje mešanja
@@ -2139,7 +2148,6 @@
 	Cancelled opening {name}	Otkazano otvaranje: {name}
 	The document “{name}” does not have an embedded {mode} profile.	Dokument „{name}“ nema ugrađeni {mode} profil.
 	The document “{name}” has an embedded color profile that does not match the current {mode} working space.	Dokument „{name}“ ima ugrađeni profil boja koji se ne slaže sa trenutnim {mode} radnim prostorom.
-	Embedded: {embedded}	Ugrađeni: {embedded}
 	Working: {working}	Radni prostor: {working}
 	Developing {name}	Razvijanje: {name}
 	Cancelled {label}	Otkazano: {label}
@@ -2833,7 +2841,6 @@ cameraRaw	Blending	Stapanje
 	Large document: redrawing on the CPU	Veliki dokument: ponovno iscrtavanje procesorom
 	This redraw took {seconds} s on the CPU.	Ovo iscrtavanje je trajalo {seconds} s na procesoru.
 	Edits that change the whole document, such as a layer's blend mode, opacity or visibility, redraw all of it.	Izmene koje menjaju ceo dokument, kao što su režim stapanja, neprozirnost ili vidljivost sloja, ponovo iscrtavaju ceo dokument.
-	Its layers don't fit the GPU memory budget. Raising Memory usage in Preferences › Performance raises the budget, up to a quarter of this computer's memory.	Njegovi slojevi ne staju u budžet GPU memorije. Povećanje vrednosti Korišćenje memorije u Podešavanja › Performanse povećava budžet, do četvrtine memorije ovog računara.
 	The GPU compositor wasn't used: {reason}	GPU kompozitor nije korišćen: {reason}
 fontWeight	Thin	Tanko
 fontWeight	ExtraLight	Ekstra lagano
@@ -2897,6 +2904,8 @@ fontWeight	Italic	Kurziv
 	Color Picker (Layer Style Color)	Birač boja (boja stila sloja)
 	Auto Hide Notifications	Automatski sakrij obaveštenja
 	Notification Duration (seconds)	Trajanje obaveštenja (sekunde)
+	Bundle Arrow-Key Nudges	Objedini pomeranja strelicama
+	Nudge Bundle Pause (ms)	Pauza za objedinjavanje pomeranja (ms)
 	Appearance Mode	Režim izgleda
 	Presentation	Prikaz
 	Dark Theme	Tamna tema
@@ -3000,6 +3009,7 @@ cameraData	Lens	Objektiv
 	Create a new rectangular frame	Napravi novi pravougaoni okvir
 	Create a new elliptical frame	Napravi novi eliptični okvir
 	Include in playback	Uključi u reprodukciju
+	Include All Subfolders	Uključi sve podfascikle
 	Perspective Crop Tool	Alatka za perspektivno opsecanje
 	Show Grid	Prikaži mrežu
 	Drag a box or click four corners · drag the corners onto the edges of a skewed shape · {commit} commits · Esc cancels	Prevucite okvir ili kliknite četiri ugla · prevucite uglove na ivice iskošenog oblika · {commit} potvrđuje · Esc otkazuje
@@ -3730,6 +3740,7 @@ layerLabel	No Color	Bez boje
 	Color Settings	Podešavanja boja
 	Color Table	Tabela boja
 	Conditional Mode Change	Uslovna promena režima
+	Background (Default)	Pozadina (podrazumevano)
 	Content-Aware Fill	Popuna prema sadržaju
 	Convert to Linked	Pretvori u povezani
 	Convert to Profile	Pretvori u profil
@@ -4219,3 +4230,102 @@ shape	Appearance	Izgled
 	Ink Characteristics	Karakteristike mastila
 	Solidity:	Punoća:
 	Redrawing	Ponovno iscrtavanje
+# Edit › Content-Aware Fill workspace
+	Sampling Brush Tool	Alatka četkica za uzorkovanje
+	Sampling Area Overlay	Preklop oblasti uzorkovanja
+	Show Sampling Area	Prikaži oblast uzorkovanja
+	Indicates	Označava
+	Sampling Area	Oblast uzorkovanja
+	Excluded Area	Izuzeta oblast
+	Sampling Area Options	Opcije oblasti uzorkovanja
+	Rectangular	Pravougaona
+	Fill Settings	Podešavanja popune
+	Rotation Adaptation	Prilagođavanje rotacije
+	Very High	Veoma visoka
+	Full	Potpuna
+	Mirror	Preslikavanje
+	Output Settings	Podešavanja izlaza
+	Output To	Izlaz u
+	Response curve	Kriva odziva
+# Embedded Profile Mismatch: profile names beside the choices, Remember this choice
+	Use the embedded profile ({profile})	Koristi ugrađeni profil ({profile})
+	Convert to the working space ({profile})	Pretvori u radni prostor ({profile})
+	Remember this choice for future images	Zapamti ovaj izbor za buduće slike
+	Turn the prompt back on with Ask On Mismatch in Edit › Color Settings.	Pitanje ponovo uključite opcijom Ask On Mismatch u Uređivanje › Podešavanja boja.
+	Button Mode	Režim dugmadi
+	Button Mode On	Režim dugmadi uključen
+
+# Darken / Lighten Interface (⇧⌘F1 / ⇧⌘F2)
+	Darken Interface	Zatamni interfejs
+	Lighten Interface	Posvetli interfejs
+# Bevel & Emboss Technique.
+	Technique	Tehnika
+	Chisel Hard	Tvrdo klesanje
+	Chisel Soft	Meko klesanje
+	Open color-less EXR as ACEScg	Otvori EXR bez podatka o bojama kao ACEScg
+	Show home recent files	Prikaži nedavne datoteke na početnom ekranu
+
+# View › Guides › right-click a guide
+	Edit Selected Guides	Uredi izabrane vodilje
+	Clear Selected Guides	Ukloni izabrane vodilje
+	Pasting from other apps is unavailable	Lepljenje iz drugih aplikacija nije dostupno
+	PhotoCraft can't reach the system clipboard in this session. On Wayland, a Flatpak sandbox hides the protocol that images from other apps are read through.	PhotoCraft u ovoj sesiji ne može da pristupi sistemskoj ostavi. Na Wayland-u, Flatpak sandbox skriva protokol preko kog se čitaju slike iz drugih aplikacija.
+	To paste from other apps, start PhotoCraft under XWayland: `{command}`	Da biste lepili iz drugih aplikacija, pokrenite PhotoCraft pod XWayland-om: `{command}`
+	Nothing to paste: PhotoCraft can't read the system clipboard here	Nema šta da se nalepi: PhotoCraft ovde ne može da čita sistemsku ostavu
+	Delete this set	Obriši ovaj skup
+	New Set…	Novi skup…
+	PhotoCraft Defaults	Podrazumevano za PhotoCraft
+	Save a list of these shortcuts as a web page	Sačuvaj listu ovih prečica kao veb stranicu
+	Save the changes to this set	Sačuvaj izmene u ovom skupu
+	Save these shortcuts as a .kys file	Sačuvaj ove prečice kao .kys datoteku
+	Save these shortcuts as a new set	Sačuvaj ove prečice kao novi skup
+	Set deleted.	Skup je obrisan.
+	Set saved.	Skup je sačuvan.
+	Set:	Skup:
+	Summarize…	Rezime…
+	There are too many sets: delete one first.	Previše skupova: prvo obrišite jedan.
+	set name	ime skupa
+	{set} (modified)	{set} (izmenjen)
+	Show file name in title	Prikaži naziv datoteke u naslovu
+	Accept and Go to Conflict	Prihvati i idi na sukob
+	Changes undone.	Izmene su poništene.
+	Choose a new shortcut for this command, or leave it without one.	Izaberite novu prečicu za ovu komandu ili je ostavite bez prečice.
+	Put this command's shortcuts back as they were	Vrati prečice ove komande kakve su bile
+	Take the shortcut from the other command and select it	Uzmi prečicu drugoj komandi i izaberi je
+	Undo Changes	Poništi izmene
+	{shortcut} is reserved by the system and can't be assigned.	{shortcut} je rezervisana od strane sistema i ne može se dodeliti.
+	Low-Latency Drawing (vsync off, applies at next launch)	Crtanje sa malim kašnjenjem (bez vsync-a, primenjuje se pri sledećem pokretanju)
+# Free Transform: a new layer while the box is open (#5859)
+	Free Transform is still being applied; try again when it has finished.	Slobodna transformacija se još primenjuje; pokušajte ponovo kad se završi.
+	The transform couldn't be applied.	Transformacija nije mogla da se primeni.
+# Preferences › Performance › GPU Memory; the status bar and slow-redraw notice
+	Its layers need {needed} of GPU memory; the budget leaves them {budget}.	Njegovim slojevima treba {needed} GPU memorije; budžet im ostavlja {budget}.
+	Set GPU Memory in Preferences › Performance to what your graphics card can hold, at most 3/8 of its memory. Automatic follows Memory Usage, within a quarter of this computer's memory and 3/8 of the card's, and doesn't count the document against a card whose memory is known. The status bar shows GPU Memory Full while they don't fit.	Podesite GPU memoriju u Podešavanja › Performanse na onoliko koliko vaša grafička kartica može da primi, najviše 3/8 njene memorije. Automatski prati Korišćenje memorije, u okviru četvrtine memorije ovog računara i 3/8 memorije kartice, i ne računa dokument kod kartice čija je memorija poznata. Dok ne staju, statusna traka prikazuje GPU memorija je puna.
+	GPU Memory Full	GPU memorija je puna
+	The layers need {needed} of GPU memory and may hold {budget}, so edits that redraw the whole document do it on the CPU. Click to set GPU Memory.	Slojevima treba {needed} GPU memorije, a smeju da zauzmu {budget}, pa izmene koje ponovo iscrtavaju ceo dokument to rade na CPU-u. Kliknite da podesite GPU memoriju.
+	GPU memory budget: {budget}	Budžet GPU memorije: {budget}
+	This document's layers: {needed} of {budget} for layers	Slojevi ovog dokumenta: {needed} od {budget} za slojeve
+	This document's layers need {needed} but may hold {budget}: whole-document redraws use the CPU	Slojevima ovog dokumenta treba {needed}, a smeju da zauzmu {budget}: ceo dokument se ponovo iscrtava na CPU-u
+	GPU Memory (MB, 0 = Automatic)	GPU memorija (MB, 0 = Automatski)
+	{name} was changed by another app after it was opened or saved here.	Datoteku {name} je izmenila druga aplikacija nakon što je ovde otvorena ili sačuvana.
+	Replace it with this document, or cancel and use File › Save As to keep both.	Zameni je ovim dokumentom ili otkaži i koristi Datoteka › Sačuvaj kao da zadržiš obe.
+	Decrease Brush Size	Smanji veličinu četkice
+	Increase Brush Size	Povećaj veličinu četkice
+	Decrease Brush Hardness	Smanji tvrdoću četkice
+	Increase Brush Hardness	Povećaj tvrdoću četkice
+	Memory Usage	Upotreba memorije
+	Per-document RAM limit (MB)	RAM limit po dokumentu (MB)
+	Installed RAM: {ram} MB; this limit: {percent}%	Instalisan RAM: {ram} MB; ovaj limit: {percent}%
+	Limits each open document's pixels plus History. Oldest undo states are discarded when the limit is exceeded.	Ograničava piksele plus Istoriju svakog otvorenog dokumenta. Najstarija stanja opoziva se odbacuju kad se prekorači limit.
+	Applies immediately when saved. Memory is not reserved in advance.	Važi odmah po čuvanju. Memorija se unapred ne rezerviše.
+	With GPU Memory set to Automatic, this also limits the GPU layer budget. That budget is capped at one quarter of installed RAM and, when known, three eighths of the graphics card's memory, with a 512 MB minimum. Raising this limit beyond those caps does not increase the GPU budget.	Kad je GPU memorija Automatski, ograničava i GPU budžet. Plafon je četvrtina RAM-a i, ako je poznato, tri osmine memorije kartice, najmanje 512 MB. Veći limit ne povećava GPU budžet.
+	Use	Koristi
+	In Front	Ispred
+	Behind	Iza
+
+# DDS Options (#1327)
+	DDS Options	DDS opcije
+	Generate Mipmaps	Generiši mipmape
+
+# Graphics Adapter preference (#1885)
+	GPU adapter	GPU adapter

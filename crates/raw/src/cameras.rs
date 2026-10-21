@@ -127,6 +127,10 @@ const PROFILES: &[Profile] = &[Profile {
 ///   4992 x 3280 sensor data, giving the camera JPEG's 4928 x 3264 frame.
 /// * **ILCE-7** (2 files): 12 x 12 pixels in from the left and top of the
 ///   6048 x 4024 cRAW data (36 and 12 pixels of margin on the right and bottom).
+/// * **D90** (1 file): 10 x 10 pixels in from the left and top of the
+///   4352 x 2868 sensor data, giving the camera JPEG's 4288 x 2848 frame
+///   (10 pixels of margin on the right and bottom; the right border reads the
+///   camera's flat 255 from column 4310 on).
 struct ImageArea {
     make: &'static str,
     model: &'static str,
@@ -137,6 +141,7 @@ struct ImageArea {
 }
 
 const IMAGE_AREAS: &[ImageArea] = &[
+    ImageArea { make: "NIKON CORPORATION", model: "NIKON D90", size: (4352, 2868), crop: (10, 10, 4288, 2848) },
     ImageArea { make: "NIKON CORPORATION", model: "NIKON D5100", size: (4992, 3280), crop: (8, 8, 4928, 3264) },
     ImageArea { make: "NIKON CORPORATION", model: "NIKON D800E", size: (7424, 4924), crop: (8, 6, 7360, 4912) },
     ImageArea { make: "SONY", model: "ILCE-7", size: (6048, 4024), crop: (12, 12, 6000, 4000) },
@@ -152,6 +157,11 @@ pub(crate) fn apply(s: &mut Sensor) {
         s.crop = Rect::new(x, y, w, h);
     }
     let Some(p) = PROFILES.iter().find(|p| make == p.make && model == p.model && (s.width, s.height) == p.size) else { return };
+    // A raw with its own colour calibration (a DNG) keeps it: only the measured image area
+    // above applies. The measured profile stands in for files that carry no matrix themselves.
+    if !s.color.calibrations.is_empty() {
+        return;
+    }
     let (x, y, w, h) = p.crop;
     s.crop = Rect::new(x, y, w, h);
     s.white = [p.white; 3];
@@ -263,6 +273,36 @@ mod tests {
         let mut s = nef("NIKON D800", 7424, 4924);
         apply(&mut s);
         assert_eq!(s.crop, Rect::new(0, 0, 7424, 4924));
+    }
+
+    #[test]
+    fn d90_image_area_matches_the_camera_jpeg() {
+        let mut s = nef("NIKON D90", 4352, 2868);
+        apply(&mut s);
+        assert_eq!(s.crop, Rect::new(10, 10, 4288, 2848));
+        // Only the image area is measured: levels, colour and tone stay untouched.
+        assert!(s.color.calibrations.is_empty() && s.tone_curve.is_empty());
+        assert_eq!(s.white, [16383.0; 3]);
+        // An explicit crop in the file wins over the measured area.
+        s.crop = Rect::new(0, 0, 4288, 2848);
+        apply(&mut s);
+        assert_eq!(s.crop, Rect::new(0, 0, 4288, 2848));
+    }
+
+    #[test]
+    fn a_file_with_its_own_calibration_keeps_it() {
+        // A file that carries its own colour calibration (a DNG, or any calibrated raw) keeps
+        // it: the measured profile must not override it (only the image area would apply).
+        let mut s = nef("NIKON D4", 4992, 3292);
+        s.color = ColorInfo {
+            calibrations: vec![Calibration { temperature: 6504.0, color_matrix: IDENTITY, forward_matrix: None, camera_calibration: IDENTITY }],
+            ..ColorInfo::default()
+        };
+        apply(&mut s);
+        assert_eq!(s.color.calibrations.len(), 1);
+        assert_eq!(s.color.calibrations[0].temperature, 6504.0, "the file's own calibration stands");
+        assert!(s.tone_curve.is_empty() && s.black_point == 0.0);
+        assert_eq!(s.crop, Rect::new(0, 0, 4992, 3292), "the D4 has no measured image area");
     }
 
     #[test]

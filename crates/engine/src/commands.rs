@@ -4,7 +4,7 @@ use photocraft_color::{BlendMode, Color, ColorMode, SampleType};
 use photocraft_doc::{Adjustment, Document, Fill, Layer, LayerContent, LayerId, LayerMask, Size};
 use photocraft_geom::Rect;
 use photocraft_raster::Surface;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::{EngineError, Result, Session, inspect, pixels};
 
@@ -117,7 +117,10 @@ fn has_selection(s: &Session) -> std::result::Result<(), String> {
 fn turn(s: &mut Session, label: &str, t: crate::canvas_geom::Turn) -> Result<Value> {
     if let Some(d) = s.active() {
         let a = t.affine(f64::from(d.doc.size.width), f64::from(d.doc.size.height));
-        s.set_sampler_map(a);
+        // Sampler points are pixel indices, not pixel edges: map the pixel's centre, so the point
+        // lands on the same pixel `Turn::pixel_map` moves the pixels to (`w - 1 - x`).
+        let half = photocraft_geom::Affine::translate(0.5, 0.5);
+        s.set_sampler_map(half.then(&a).then(&photocraft_geom::Affine::translate(-0.5, -0.5)));
     }
     s.edit(label, |doc, _| {
         crate::canvas_geom::turn_canvas(doc, t);
@@ -232,15 +235,53 @@ pub(crate) fn u32_id_param(cmd: &str, p: &Value, key: &str) -> Result<Option<u32
 fn f32_or(p: &Value, key: &str, default: f32) -> f32 {
     p.get(key).and_then(Value::as_f64).map(|v| v as f32).unwrap_or(default)
 }
-pub(crate) fn color_param(p: &Value, key: &str, default: [f32; 4]) -> [f32; 4] {
-    match p.get(key) {
+/// JSON numbers may be finite f64 values but overflow when stored in a document's f32 field.
+pub(crate) fn finite_f32(cmd: &str, key: &str, value: f64) -> Result<f32> {
+    let narrowed = value as f32;
+    if narrowed.is_finite() { Ok(narrowed) } else { Err(bad(cmd, format!("`{key}` must fit a finite 32-bit number"))) }
+}
+
+/// Effect/type parameters contain nested colour arrays and snapshots as well as scalars.
+/// Validate before parsing or editing, including numbers hidden in an effect snapshot.
+pub(crate) fn check_f32_values(cmd: &str, value: &Value) -> Result<()> {
+    // Bound the call stack, without allocating a work list proportional to an input array.
+    fn check(cmd: &str, value: &Value, depth: usize) -> Result<()> {
+        if depth > 64 {
+            return Err(bad(cmd, "parameters nested deeper than 64 levels"));
+        }
+        match value {
+            Value::Number(n) => {
+                finite_f32(cmd, "number", n.as_f64().ok_or_else(|| bad(cmd, "invalid number"))?)?;
+            }
+            Value::Array(a) => {
+                for v in a {
+                    check(cmd, v, depth + 1)?;
+                }
+            }
+            Value::Object(o) => {
+                for v in o.values() {
+                    check(cmd, v, depth + 1)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    check(cmd, value, 0)
+}
+
+pub(crate) fn color_param(cmd: &str, p: &Value, key: &str, default: [f32; 4]) -> Result<[f32; 4]> {
+    Ok(match p.get(key) {
         Some(Value::Array(a)) if a.len() >= 3 => {
-            let v: Vec<f32> = a.iter().map(|x| x.as_f64().unwrap_or(0.0) as f32).collect();
-            [v[0], v[1], v[2], v.get(3).copied().unwrap_or(1.0)]
+            let mut out = [0.0, 0.0, 0.0, 1.0];
+            for (slot, value) in out.iter_mut().zip(a) {
+                *slot = finite_f32(cmd, key, value.as_f64().unwrap_or(0.0))?;
+            }
+            out
         }
         Some(Value::String(s)) => parse_hex(s).unwrap_or(default),
         _ => default,
-    }
+    })
 }
 pub(crate) fn parse_hex(s: &str) -> Option<[f32; 4]> {
     let s = s.trim_start_matches('#');
@@ -253,7 +294,10 @@ pub(crate) fn parse_hex(s: &str) -> Option<[f32; 4]> {
 }
 /// Layer › Create / Release Clipping Mask. With a `layer` param, just that layer. Otherwise, as in
 /// Photoshop, the selection (#1248): Create clips every selected layer except the lowest, which
-/// becomes the base; Release releases every selected layer. One history step either way.
+/// becomes the base; Release releases every selected layer. Releasing a clipped layer also
+/// releases the clipped layers above it in its group, as Adobe documents ("removes the selected
+/// layer and any layers above it from the clipping mask"), so none is left clipped to a layer
+/// that is no longer clipped. One history step either way.
 fn set_clipped(s: &mut Session, p: &Value, clip: bool) -> Result<Value> {
     let label = if clip { "Create Clipping Mask" } else { "Release Clipping Mask" };
     let ids: Vec<LayerId> = if p.get("layer").is_some() {
@@ -267,6 +311,20 @@ fn set_clipped(s: &mut Session, p: &Value, clip: bool) -> Result<Value> {
             (false, all) => all.to_vec(),
         }
     };
+    let ids = if clip {
+        ids
+    } else {
+        let doc = &s.active().ok_or(EngineError::NoDocument)?.doc;
+        let mut all = ids.clone();
+        for id in ids.iter().filter(|id| doc.layer(**id).is_some_and(|l| l.clipped)) {
+            for above in crate::clip_group::clipped_above(doc, *id) {
+                if !all.contains(&above) {
+                    all.push(above);
+                }
+            }
+        }
+        all
+    };
     s.edit(label, |doc, _| {
         for id in &ids {
             doc.layer_mut(*id).ok_or(EngineError::NoLayer(*id))?.clipped = clip;
@@ -278,7 +336,8 @@ fn set_clipped(s: &mut Session, p: &Value, clip: bool) -> Result<Value> {
 
 /// The layer a command's `"layer"` param names: an id, or a name (the topmost layer of that
 /// name, as Photoshop's "select layer by name" action step finds it, so a loaded action replays
-/// in another document). `None` when the param is absent.
+/// in another document; a name that matches no layer exactly matches regardless of case, so
+/// `"background"` finds the Background). `None` when the param is absent.
 pub(crate) fn explicit_layer(s: &Session, p: &Value) -> Result<Option<LayerId>> {
     match p.get("layer") {
         Some(Value::Number(n)) => {
@@ -286,17 +345,39 @@ pub(crate) fn explicit_layer(s: &Session, p: &Value) -> Result<Option<LayerId>> 
         }
         Some(Value::String(name)) => {
             let d = s.active().ok_or(EngineError::NoDocument)?;
-            d.doc
-                .walk()
-                .into_iter()
-                .rev()
+            let layers = d.doc.walk();
+            let mut top_down = layers.iter().rev();
+            top_down
+                .clone()
                 .find(|(_, _, l)| l.name == *name)
+                .or_else(|| top_down.find(|(_, _, l)| l.name.to_lowercase() == name.to_lowercase()))
                 .map(|(_, _, l)| Some(l.id))
-                .ok_or_else(|| EngineError::Other(format!("no layer named \"{name}\"")))
+                .ok_or_else(|| EngineError::Other(format!("no layer named \"{name}\"; {}", layer_listing(&d.doc))))
         }
         Some(Value::Null) | None => Ok(None),
         Some(other) => Err(EngineError::Other(format!("`layer` must be an id or a name, not {other}"))),
     }
+}
+
+/// The layers of `doc` as a caller can name them, for an error about a layer that isn't there:
+/// `the document's layers are 2 "Background", 3 "Layer 1"` (top-down, at most 20).
+pub(crate) fn layer_listing(doc: &Document) -> String {
+    const MAX: usize = 20;
+    let layers = doc.walk();
+    if layers.is_empty() {
+        return "the document has no layers".into();
+    }
+    // Names are unbounded input: each one is cut at NAME characters so the error stays short.
+    const NAME: usize = 64;
+    let name = |n: &str| match n.char_indices().nth(NAME) {
+        Some((cut, _)) => format!("{}…", &n[..cut]),
+        None => n.to_string(),
+    };
+    let mut list: Vec<String> = layers.iter().rev().take(MAX).map(|(_, _, l)| format!("{} {:?}", l.id.0, name(&l.name))).collect();
+    if layers.len() > MAX {
+        list.push(format!("… {} more (see `document.inspect`)", layers.len() - MAX));
+    }
+    format!("the document's layers are {} (a `layer` param takes an id or a name)", list.join(", "))
 }
 
 /// The layer a command targets: [`explicit_layer`], else the active layer.
@@ -381,12 +462,12 @@ fn destructive_adjust(s: &mut Session, label: &str, adj: Adjustment, p: &Value) 
         });
     }
     if crate::channel_cmds::is_channel_target(p) {
-        // Alpha channel / Quick Mask target: the adjustment runs on the grayscale channel.
+        // Alpha channel / Quick Mask target: the adjustment runs on the grayscale channel as on
+        // a layer mask, its unstored black included, so ⌘I in Quick Mask inverts it all (#6095).
         return s.edit(label, |doc, _| {
             let sel = doc.selection.clone();
             if let Some(surf) = crate::channel_cmds::channel_surface_for_filter(doc, None, p)? {
-                pixels::adjust_surface(surf, &adj, sel.as_ref(), ColorMode::Grayscale);
-                surf.prune();
+                pixels::adjust_mask(surf, &adj, sel.as_ref());
             }
             Ok(Value::Null)
         });
@@ -412,6 +493,31 @@ pub fn adjustment_from_params(kind: &str, p: &Value) -> Adjustment {
 
 fn doc_mode(s: &Session) -> ColorMode {
     s.active().map_or(ColorMode::Rgb, |d| d.doc.mode)
+}
+
+/// The colour mode a destructive adjustment parses its tone space in: a targeted layer mask,
+/// saved channel or Quick Mask holds gray levels whatever the document's mode, so Curves and
+/// Levels stay in the neutral space instead of Lab (where the composite is ignored) or CMYK
+/// (where the curve runs on the inks) (#5335).
+fn adjust_mode(s: &Session, p: &Value) -> ColorMode {
+    if is_mask_target(p) || crate::channel_cmds::is_channel_target(p) { ColorMode::Grayscale } else { doc_mode(s) }
+}
+
+/// Tone params for a gray plane target: the document-space channel records are dropped, because
+/// those keys select the Lab or CMYK tone space and a plane only holds levels (#5335).
+fn gray_tone_params(p: &Value) -> Value {
+    match p {
+        Value::Object(m) => {
+            let mut o = Map::new();
+            for (k, v) in m {
+                if !matches!(k.as_str(), "cyan" | "magenta" | "yellow" | "black" | "lightness" | "a" | "b") {
+                    o.insert(k.clone(), v.clone());
+                }
+            }
+            Value::Object(o)
+        }
+        other => other.clone(),
+    }
 }
 
 // ---------- the table ----------
@@ -648,7 +754,6 @@ fn build() -> Vec<CommandSpec> {
                     return crate::layer_multi_cmds::duplicate_selected(s, in_place, "Duplicate Layers");
                 }
                 let id = layer_param(s, p)?;
-                let before = s.active().ok_or(EngineError::NoDocument)?.doc.clone();
                 let nid = s.edit("Duplicate Layer", |doc, active| {
                     let mut dup = layer_copy(doc, id)?;
                     if let Some(name) = &name {
@@ -661,7 +766,6 @@ fn build() -> Vec<CommandSpec> {
                     *active = Some(nid);
                     Ok(nid)
                 })?;
-                crate::layer_multi_cmds::note_insert(s, &before);
                 Ok(json!({ "layer": nid.0 }))
             }
         ),
@@ -699,10 +803,32 @@ fn build() -> Vec<CommandSpec> {
             "Layer Properties",
             [],
             None,
-            r##"{"layer":id?,"name":str?,"visible":bool?,"opacity":0..1?,"fill":0..1?,"blend":"Multiply|…"?,"clipped":bool?,"locked":bool?,"locks":{"transparency","pixels","position","artboard","all":bool}?,"channels":[bool,…]? (Advanced Blending: which colour channels blend, R G B / C M Y K / L a b)}"##,
+            r##"{"layer":id?,"layers":[id,…]? (the same change to each, one step: the Layers panel's controls with several layers selected),"name":str? (one layer only),"visible":bool?,"opacity":0..1?,"fill":0..1?,"blend":"Multiply|…"?,"clipped":bool?,"locked":bool?,"locks":{"transparency","pixels","position","artboard","all":bool}?,"channels":[bool,…]? (Advanced Blending: which colour channels blend, R G B / C M Y K / L a b)}"##,
             has_layer,
             |s, p| {
-                let id = layer_param(s, p)?;
+                // Several layers at once (the Layers panel with several selected, as in Photoshop),
+                // else the given or active one.
+                let ids: Vec<LayerId> = match p.get("layers") {
+                    None | Some(Value::Null) => vec![layer_param(s, p)?],
+                    Some(Value::Array(a)) if !a.is_empty() && a.len() <= 10_000 => {
+                        let doc = &s.active().ok_or(EngineError::NoDocument)?.doc;
+                        let mut ids = Vec::with_capacity(a.len());
+                        for v in a {
+                            let id = v.as_u64().map(LayerId).ok_or_else(|| bad("layer.setProps", format!("`layers` holds layer ids, got {v}")))?;
+                            if doc.layer(id).is_none() {
+                                return Err(EngineError::NoLayer(id));
+                            }
+                            if !ids.contains(&id) {
+                                ids.push(id);
+                            }
+                        }
+                        ids
+                    }
+                    Some(v) => return Err(bad("layer.setProps", format!("`layers` is a non-empty list of layer ids, got {v}"))),
+                };
+                if ids.len() > 1 && p.get("name").is_some() {
+                    return Err(bad("layer.setProps", "`name` renames one layer, not several"));
+                }
                 // Opacity and Fill are fractions here, while the Layer Style commands take
                 // percentages: a value outside 0..1 is refused, never clamped to 100 % (#5242).
                 let unit = |key: &str| -> Result<Option<f32>> {
@@ -713,9 +839,19 @@ fn build() -> Vec<CommandSpec> {
                     }
                 };
                 let (opacity, fill) = (unit("opacity")?, unit("fill")?);
-                let only_visibility =
-                    p.as_object().is_some_and(|o| o.contains_key("visible") && o.keys().all(|k| matches!(k.as_str(), "layer" | "visible" | "coalesce")));
-                let label = if only_visibility { "Layer Visibility" } else { "Layer Properties" };
+                // Photoshop's History names for a single kind of change; a mix is "Layer Properties".
+                let changed: Vec<&str> = p
+                    .as_object()
+                    .map(|o| o.keys().map(String::as_str).filter(|k| !matches!(*k, "layer" | "layers" | "coalesce")).collect())
+                    .unwrap_or_default();
+                let label = match changed.as_slice() {
+                    ["visible"] => "Layer Visibility",
+                    ["opacity"] => "Opacity Change",
+                    ["fill"] => "Fill Opacity Change",
+                    ["blend"] => "Blending Change",
+                    ["name"] => "Rename Layer",
+                    _ => "Layer Properties",
+                };
                 let before = s.active().ok_or(EngineError::NoDocument)?.doc.clone();
                 // Clipping and channel changes reach the layers around it: recomposite everything.
                 let local = p.get("clipped").is_none() && p.get("channels").is_none();
@@ -724,47 +860,54 @@ fn build() -> Vec<CommandSpec> {
                     // one that changes its look turns it into a normal layer ("Layer 0") first.
                     let num = |k: &str| p.get(k).and_then(Value::as_f64).is_some_and(|v| v < 1.0);
                     let blends = p.get("blend").and_then(Value::as_str).and_then(blend_from_str).is_some_and(|b| b != photocraft_color::BlendMode::Normal);
-                    if num("opacity") || num("fill") || blends {
-                        crate::extra_cmds::background_to_layer(doc, id);
-                    }
-                    let l = doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?;
-                    if let Some(v) = p.get("name").and_then(Value::as_str) {
-                        l.name = v.to_string();
-                    }
-                    if let Some(v) = p.get("visible").and_then(Value::as_bool) {
-                        l.visible = v;
-                    }
-                    if let Some(v) = opacity {
-                        l.opacity = v;
-                    }
-                    if let Some(v) = fill {
-                        l.fill_opacity = v;
-                    }
-                    if let Some(v) = p.get("blend").and_then(Value::as_str) {
-                        l.blend = blend_from_str(v).ok_or_else(|| bad("layer.setProps", format!("unknown blend mode `{v}`")))?;
-                    }
-                    if let Some(v) = p.get("clipped").and_then(Value::as_bool) {
-                        l.clipped = v;
-                    }
-                    if let Some(v) = p.get("locked").and_then(Value::as_bool) {
-                        l.locks.all = v;
-                    }
-                    if let Some(Value::Array(ch)) = p.get("channels") {
-                        // Blending Options › Advanced Blending › Channels: unchecked = left out.
-                        l.excluded_channels = ch.iter().take(32).enumerate().filter(|(_, v)| v.as_bool() == Some(false)).fold(0, |m, (i, _)| m | 1 << i);
-                    }
-                    if let Some(Value::Object(m)) = p.get("locks") {
-                        for (k, v) in m {
-                            let v = v.as_bool().unwrap_or(false);
-                            if !l.locks.set(k, v) {
-                                return Err(bad("layer.setProps", format!("unknown lock `{k}`")));
+                    for &id in &ids {
+                        if num("opacity") || num("fill") || blends {
+                            crate::extra_cmds::background_to_layer(doc, id);
+                        }
+                        let l = doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?;
+                        if let Some(v) = p.get("name").and_then(Value::as_str) {
+                            l.name = v.to_string();
+                        }
+                        if let Some(v) = p.get("visible").and_then(Value::as_bool) {
+                            l.visible = v;
+                        }
+                        if let Some(v) = opacity {
+                            l.opacity = v;
+                        }
+                        if let Some(v) = fill {
+                            l.fill_opacity = v;
+                        }
+                        if let Some(v) = p.get("blend").and_then(Value::as_str) {
+                            let b = blend_from_str(v).ok_or_else(|| bad("layer.setProps", format!("unknown blend mode `{v}`")))?;
+                            // Pass Through is a group's mode only, as in Photoshop.
+                            if b == photocraft_color::BlendMode::PassThrough && !l.is_group() {
+                                return Err(bad("layer.setProps", format!("Pass Through applies to groups only; layer {} isn't one", l.id.0)));
+                            }
+                            l.blend = b;
+                        }
+                        if let Some(v) = p.get("clipped").and_then(Value::as_bool) {
+                            l.clipped = v;
+                        }
+                        if let Some(v) = p.get("locked").and_then(Value::as_bool) {
+                            l.locks.all = v;
+                        }
+                        if let Some(Value::Array(ch)) = p.get("channels") {
+                            // Blending Options › Advanced Blending › Channels: unchecked = left out.
+                            l.excluded_channels = ch.iter().take(32).enumerate().filter(|(_, v)| v.as_bool() == Some(false)).fold(0, |m, (i, _)| m | 1 << i);
+                        }
+                        if let Some(Value::Object(m)) = p.get("locks") {
+                            for (k, v) in m {
+                                let v = v.as_bool().unwrap_or(false);
+                                if !l.locks.set(k, v) {
+                                    return Err(bad("layer.setProps", format!("unknown lock `{k}`")));
+                                }
                             }
                         }
                     }
                     Ok(())
                 })?;
                 if local {
-                    crate::layer_multi_cmds::note_damage(s, &before, &[id]);
+                    crate::layer_multi_cmds::note_damage(s, &before, &ids);
                 }
                 Ok(Value::Null)
             }
@@ -887,7 +1030,7 @@ fn build() -> Vec<CommandSpec> {
             r##"{"color":"#rrggbb"=foreground,"path":"work"|saved path name|{…path}? (the active path: becomes the vector mask, making a shape; else the selection is the layer mask)}"##,
             has_doc,
             |s, p| {
-                let c = color_param(p, "color", s.tools.foreground);
+                let c = color_param("layer.newFillLayer.solidColor", p, "color", s.tools.foreground)?;
                 let id = s.edit("New Color Fill Layer", |doc, active| {
                     let fill = Fill::Solid(Color::rgba(c[0], c[1], c[2], c[3])).in_mode(doc.mode);
                     let mut l = Layer::new(doc.next_layer_name("Color Fill"), LayerContent::Fill(fill));
@@ -907,8 +1050,8 @@ fn build() -> Vec<CommandSpec> {
             r##"{"from":"#rrggbb","to":"#rrggbb","angle":deg=90,"style":"linear|radial|angle|reflected|diamond","reverse":bool,"path":"work"|saved path name|{…path}? (the active path: becomes the vector mask; else the selection is the layer mask)}"##,
             has_doc,
             |s, p| {
-                let a = color_param(p, "from", s.tools.foreground);
-                let b = color_param(p, "to", s.tools.background);
+                let a = color_param("layer.newFillLayer.gradient", p, "from", s.tools.foreground)?;
+                let b = color_param("layer.newFillLayer.gradient", p, "to", s.tools.background)?;
                 let angle = f32_or(p, "angle", 90.0);
                 let style = crate::layer_style::gradient_style(p.get("style").and_then(Value::as_str).unwrap_or("linear"));
                 let reverse = p.get("reverse").and_then(Value::as_bool).unwrap_or(false);
@@ -1039,8 +1182,10 @@ fn build() -> Vec<CommandSpec> {
                     }
                 };
                 let (fg_cmyk, bg_cmyk) = (cmyk("foregroundCmyk")?, cmyk("backgroundCmyk")?);
-                s.tools.foreground = color_param(p, "foreground", s.tools.foreground);
-                s.tools.background = color_param(p, "background", s.tools.background);
+                let foreground = color_param("tools.setColors", p, "foreground", s.tools.foreground)?;
+                let background = color_param("tools.setColors", p, "background", s.tools.background)?;
+                s.tools.foreground = foreground;
+                s.tools.background = background;
                 if let Some(k) = fg_cmyk {
                     let [r, g, b, _] = s.tools.foreground;
                     s.tools.remember_cmyk([r, g, b], k);
@@ -1269,7 +1414,16 @@ fn build() -> Vec<CommandSpec> {
                 });
                 let adj = match eyedropped {
                     Some(adj) => adj,
-                    None => crate::adjust_params::from_params(&kind, p, None, doc_mode(s))?,
+                    None => {
+                        // A gray plane target keeps the neutral tone space even over params
+                        // carrying Lab or CMYK records (#5335).
+                        let tone = if is_mask_target(p) || crate::channel_cmds::is_channel_target(p) {
+                            if matches!(kind.as_str(), "levels" | "curves") { gray_tone_params(p) } else { p.clone() }
+                        } else {
+                            p.clone()
+                        };
+                        crate::adjust_params::from_params(&kind, &tone, None, adjust_mode(s, p))?
+                    }
                 };
                 let label = adj.label().to_string();
                 // A smart object records the adjustment as a smart filter (Photoshop), which
@@ -1332,6 +1486,7 @@ fn build() -> Vec<CommandSpec> {
     v.extend(crate::edit_menu_cmds::specs());
     v.extend(crate::fill_key_cmds::specs());
     v.extend(crate::sample_cmds::specs());
+    v.extend(crate::face_cmds::specs());
     v.extend(crate::sampler_cmds::specs());
     v.extend(crate::brush_key_cmds::specs());
     v.extend(crate::stamp_cmds::specs());
@@ -1357,6 +1512,7 @@ fn build() -> Vec<CommandSpec> {
     v.extend(crate::proof_sim::specs());
     v.extend(crate::presets::specs());
     v.extend(crate::document_preset_cmds::specs());
+    v.extend(crate::export_preset_cmds::specs());
     v.extend(crate::render_cmds::specs());
     v.extend(crate::slice_cmds::specs());
     v.extend(crate::web_cmds::specs());

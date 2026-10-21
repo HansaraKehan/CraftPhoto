@@ -110,11 +110,22 @@ pub(crate) fn interact(ui: &mut Ui, state: &mut CameraRawPreviewState, viewport:
     let rect = state.image_rect(viewport, size);
     // Reuse the canvas wheel policy: retain the modifiers of the wheel event while egui
     // smooths it, even if Alt is released before the final part of the notch arrives.
-    let wheel = crate::wheel_nav::read(ui.ctx(), false, true);
-    if response.hovered() {
+    let cr_hovered = response.hovered();
+    let wheel = crate::wheel_nav::read(ui.ctx(), false, true, ui.id().with("cr-wheel"), cr_hovered);
+    if cr_hovered {
         ui.input_mut(|i| i.smooth_scroll_delta = Vec2::ZERO);
         match wheel {
             Some(crate::wheel_nav::Wheel::Zoom(factor)) => state.zoom_at(state.scale(viewport, size) * factor, at, viewport, size),
+            Some(crate::wheel_nav::Wheel::SnapZoom(n)) => {
+                let dir = if n > 0 { 1 } else { -1 };
+                let mut nz = state.scale(viewport, size);
+                for _ in 0..n.unsigned_abs() {
+                    nz = crate::zoom_levels::step_in_range(nz, dir, MIN_ZOOM, MAX_ZOOM);
+                }
+                if nz != state.scale(viewport, size) {
+                    state.zoom_at(nz, at, viewport, size);
+                }
+            }
             Some(crate::wheel_nav::Wheel::Pan(delta)) => state.pan(delta, viewport, size),
             None => {}
         }
@@ -287,6 +298,74 @@ mod tests {
         view.fit();
         assert_eq!(view.image_rect(viewport, size), initial);
     }
+    #[test]
+    fn shift_alt_wheel_snaps_zoom_in_camera_raw() {
+        let viewport = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0));
+        let size = vec2(1600.0, 1200.0);
+        let at = pos2(400.0, 300.0);
+        let mut state = CameraRawPreviewState { zoom: Some(1.0), center: [0.5, 0.5], hand: false };
+        let scale_before = state.scale(viewport, size);
+        let n = 1i32;
+        let dir = if n > 0 { 1 } else { -1 };
+        let mut nz = state.scale(viewport, size);
+        for _ in 0..n.unsigned_abs() {
+            nz = crate::zoom_levels::step_in_range(nz, dir, MIN_ZOOM, MAX_ZOOM);
+        }
+        assert_ne!(nz, scale_before, "zoom-in steps to a new level");
+        state.zoom_at(nz, at, viewport, size);
+        assert_eq!(state.scale(viewport, size), nz, "zoom applied");
+        assert!(nz > scale_before, "zoomed in");
+        let scale_after_in = state.scale(viewport, size);
+        let mut nz = state.scale(viewport, size);
+        nz = crate::zoom_levels::step_in_range(nz, -1, MIN_ZOOM, MAX_ZOOM);
+        state.zoom_at(nz, at, viewport, size);
+        assert!(state.scale(viewport, size) < scale_after_in, "zoomed out");
+    }
+
+    #[test]
+    fn shift_alt_snap_at_limits_does_not_move() {
+        let viewport = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0));
+        let size = vec2(1600.0, 1200.0);
+        let at = viewport.center();
+        let state = CameraRawPreviewState { zoom: Some(MAX_ZOOM), center: [0.5, 0.5], hand: false };
+        let nz = crate::zoom_levels::step_in_range(state.scale(viewport, size), 1, MIN_ZOOM, MAX_ZOOM);
+        assert_eq!(nz, state.scale(viewport, size), "at max, step up stays put");
+        let state_lo = CameraRawPreviewState { zoom: Some(MIN_ZOOM), center: [0.5, 0.5], hand: false };
+        let nz = crate::zoom_levels::step_in_range(state_lo.scale(viewport, size), -1, MIN_ZOOM, MAX_ZOOM);
+        assert_eq!(nz, state_lo.scale(viewport, size), "at min, step down stays put");
+        let _ = at;
+    }
+
+    #[test]
+    fn snap_zoom_from_fit_enters_explicit_zoom() {
+        let viewport = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0));
+        let size = vec2(1600.0, 1200.0);
+        let at = viewport.center();
+        let mut state = CameraRawPreviewState::default();
+        assert!(state.zoom.is_none(), "starts in fit mode");
+        let fit_scale = state.scale(viewport, size);
+        let nz = crate::zoom_levels::step_in_range(fit_scale, 1, MIN_ZOOM, MAX_ZOOM);
+        if nz != fit_scale {
+            state.zoom_at(nz, at, viewport, size);
+        }
+        assert!(state.zoom.is_some(), "snap zoom leaves fit mode");
+    }
+
+    #[test]
+    fn snap_zoom_preserves_point_under_pointer() {
+        let viewport = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0));
+        let size = vec2(1600.0, 1200.0);
+        let at = pos2(300.0, 200.0);
+        let mut state = CameraRawPreviewState { zoom: Some(1.0), center: [0.5, 0.5], hand: false };
+        let rect_before = state.image_rect(viewport, size);
+        let point_before = (at - rect_before.min) / rect_before.size();
+        let nz = crate::zoom_levels::step_in_range(1.0, 1, MIN_ZOOM, MAX_ZOOM);
+        state.zoom_at(nz, at, viewport, size);
+        let rect_after = state.image_rect(viewport, size);
+        let point_after = (at - rect_after.min) / rect_after.size();
+        assert!((point_before - point_after).length() < 0.01, "point preserved: {point_before:?} vs {point_after:?}");
+    }
+
     #[test]
     fn tiny_images_nonfinite_state_and_resize_stay_centered_and_finite() {
         let viewport = Rect::from_min_size(Pos2::ZERO, vec2(600.0, 400.0));

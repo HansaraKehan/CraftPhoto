@@ -337,6 +337,78 @@ pub(crate) fn decode(bytes: &[u8], limits: &Limits) -> Result<Image, CodecError>
     Ok(img)
 }
 
+// ---------------------------------------------------------------- Cineon (Kodak .cin)
+//
+// Cineon is the 10-bit film-scan format DPX grew from (same Kodak header family, big-endian).
+// The generic header is 1024 bytes: the file information fields, then at offset 192 the image
+// orientation (1 byte), the channel count (1 byte) and up to eight 28-byte channel descriptors
+// (the first carries the bits per pixel and the line/image dimensions). Image data is three
+// 10-bit samples packed into each 32-bit word, lines on a word boundary — the same layout as
+// DPX's 10-bit packing method A, so the unpacking is shared.
+
+/// The Cineon magic number (`802A5FD7` hex), big-endian.
+pub(crate) fn is_cineon(b: &[u8]) -> bool {
+    b.get(..4) == Some(&[0x80, 0x2A, 0x5F, 0xD7])
+}
+
+/// The EXIF orientation (1–8) for a Cineon header's orientation code (the same 0–7 order as DPX).
+pub(crate) fn cineon_orientation(b: &[u8]) -> u16 {
+    let Some(code) = b.get(192).copied() else { return 1 };
+    match code {
+        1 => 2,
+        2 => 4,
+        3 => 3,
+        4 => 5,
+        5 => 6,
+        6 => 8,
+        7 => 7,
+        _ => 1,
+    }
+}
+
+/// Decode a Cineon (`.cin`) frame: 10-bit logarithmic film scans, big-endian, one (gray) or
+/// three (RGB) channels. The 10-bit code values become U16 as `round(c × 65535 / 1023)`; the
+/// file's black/white reference points are not applied (a log conversion is a display choice).
+pub(crate) fn decode_cineon(bytes: &[u8], limits: &Limits) -> Result<Image, CodecError> {
+    if !is_cineon(bytes) {
+        return Err(err("missing the Cineon magic number (802A5FD7)"));
+    }
+    let o = Order::Big;
+    let missing = |what: &str| err(format!("the header ends before {what}"));
+    let image_offset = usize::try_from(o.u32(bytes, 4).ok_or_else(|| missing("the image data offset"))?).map_err(|_| err("image data offset out of range"))?;
+    let channels = *bytes.get(193).ok_or_else(|| missing("the channel count"))?;
+    let bits = *bytes.get(198).ok_or_else(|| missing("the bits per pixel"))?;
+    if bits != 10 {
+        return Err(unsupported(format!("{bits}-bit samples (Cineon frames are 10-bit)")));
+    }
+    let layout = match channels {
+        1 => ChannelLayout::Gray,
+        3 => ChannelLayout::Rgb,
+        n => return Err(unsupported(format!("{n} channels (Cineon frames have 1 or 3)"))),
+    };
+    let width = o.u32(bytes, 200).ok_or_else(|| missing("the pixels per line"))?;
+    let height = o.u32(bytes, 204).ok_or_else(|| missing("the lines per image"))?;
+    limits.check(width, height, layout, SampleType::U16)?;
+
+    let (w, h) = (width as usize, height as usize);
+    let per_line = w.checked_mul(layout.channels()).ok_or_else(|| CodecError::LimitExceeded("line too long".into()))?;
+    // Three 10-bit samples per 32-bit word, lines on a word boundary (DPX packing 1).
+    let line_len = line_bytes(per_line, 10, 1).ok_or_else(|| CodecError::LimitExceeded("line too long".into()))?;
+    let data = bytes.get(image_offset..).ok_or_else(|| err("the image data offset is past the end of the file"))?;
+    let need = line_len.checked_mul(h).ok_or_else(|| CodecError::LimitExceeded("image too large".into()))?;
+    if data.len() < need {
+        return Err(err("truncated image data"));
+    }
+    let mut codes = vec![0u16; per_line.checked_mul(h).ok_or_else(|| CodecError::LimitExceeded("image too large".into()))?];
+    for (y, row) in codes.chunks_exact_mut(per_line).enumerate() {
+        let start = y * line_len;
+        let line = data.get(start..start + line_len).ok_or_else(|| err("truncated image data"))?;
+        unpack_line(line, o, 10, 1, row)?;
+    }
+    let wide: Vec<u16> = codes.iter().map(|&c| widen(c, 1023)).collect();
+    Image::from_u16(width, height, layout, &wide)
+}
+
 /// The kept header fields as text metadata, in [`KEYS`] order; undefined ones are left out.
 fn header_text(b: &[u8], o: Order, e: Element) -> Vec<(String, String)> {
     let mut text = Vec::new();
@@ -652,5 +724,61 @@ mod tests {
         b.extend_from_slice(&[1, 2, 3, 4, 5, 6]);
         let img = decode(&b, &Limits::default()).unwrap();
         assert_eq!(img.data(), &[1, 2, 3, 4, 5, 6]);
+    }
+
+    /// A minimal Cineon: a 1024-byte generic header, then `w × h` 10-bit samples packed three
+    /// to a 32-bit word (RGB in word order, or gray three pixels per word).
+    fn cineon(w: u32, h: u32, channels: u8, px: &[[u16; 3]]) -> Vec<u8> {
+        let mut b = vec![0u8; 1024];
+        b[0..4].copy_from_slice(&[0x80, 0x2A, 0x5F, 0xD7]); // magic (802A5FD7)
+        b[4..8].copy_from_slice(&1024u32.to_be_bytes()); // image data offset
+        b[192] = 0; // orientation: left-to-right, top-to-bottom
+        b[193] = channels;
+        b[198] = 10; // bits per pixel (channel 1)
+        b[200..204].copy_from_slice(&w.to_be_bytes()); // pixels per line
+        b[204..208].copy_from_slice(&h.to_be_bytes()); // lines per image
+        let word = |a: u16, c: u16, e: u16| ((u32::from(a) << 22) | (u32::from(c) << 12) | (u32::from(e) << 2)).to_be_bytes();
+        if channels == 3 {
+            for p in px {
+                b.extend_from_slice(&word(p[0], p[1], p[2]));
+            }
+        } else {
+            let g = |i: usize| px.get(i).map_or(0, |p| p[0]);
+            for i in (0..px.len()).step_by(3) {
+                b.extend_from_slice(&word(g(i), g(i + 1), g(i + 2)));
+            }
+        }
+        b
+    }
+
+    #[test]
+    fn cineon_reads_ten_bit_rgb() {
+        let px = [[0, 512, 1023], [1023, 0, 256]];
+        let b = cineon(2, 1, 3, &px);
+        assert!(is_cineon(&b));
+        assert_eq!(order(&b), None, "Cineon is not DPX");
+        let img = decode_cineon(&b, &Limits::default()).unwrap();
+        assert_eq!((img.width(), img.height(), img.layout()), (2, 1, ChannelLayout::Rgb));
+        assert_eq!(
+            img.to_u16_samples().unwrap(),
+            vec![widen(0, 1023), widen(512, 1023), widen(1023, 1023), widen(1023, 1023), widen(0, 1023), widen(256, 1023)]
+        );
+    }
+
+    #[test]
+    fn cineon_reads_grayscale_and_rejects_other_depths() {
+        let px = [[10, 0, 0], [20, 0, 0], [30, 0, 0], [40, 0, 0]];
+        let b = cineon(4, 1, 1, &px);
+        let img = decode_cineon(&b, &Limits::default()).unwrap();
+        assert_eq!(img.layout(), ChannelLayout::Gray);
+        assert_eq!(img.to_u16_samples().unwrap(), vec![widen(10, 1023), widen(20, 1023), widen(30, 1023), widen(40, 1023)]);
+        // A depth other than 10 is unsupported, and truncation errors rather than panicking.
+        let mut bad = cineon(1, 1, 3, &[[0, 0, 0]]);
+        bad[198] = 8;
+        assert!(matches!(decode_cineon(&bad, &Limits::default()), Err(CodecError::Unsupported { .. })));
+        let full = cineon(4, 4, 3, &[[0; 3]; 16]);
+        for cut in [0, 4, 200, 1024, full.len() - 1] {
+            assert!(decode_cineon(&full[..cut.min(full.len())], &Limits::default()).is_err(), "cut {cut}");
+        }
     }
 }

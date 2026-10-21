@@ -109,7 +109,7 @@ pub fn savable(o: &ToolOptions) -> Option<(Map<String, Value>, String)> {
     if !(a.is_finite() && b.is_finite() && a > 0.0 && b > 0.0) {
         return None;
     }
-    let name = format!("{} : {}", crate::widgets::fmt_num(a), crate::widgets::fmt_num(b));
+    let name = format!("{} : {}", crop_size::fmt_ratio(a), crop_size::fmt_ratio(b));
     let mut fields = Map::new();
     fields.insert("crop_ratio".into(), json!(o.crop_ratio));
     Some((fields, name))

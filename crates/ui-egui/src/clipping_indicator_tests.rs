@@ -83,6 +83,7 @@ fn alt_click_clipping_still_creates_releases_and_undoes_without_moving_rows() {
 #[test]
 #[ignore = "writes synthetic English Layers-panel screenshots for before/after inspection"]
 fn write_clipping_indicator_preview() {
+    let _gpu = photocraft_testkit::gpu_lock();
     let output = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plan/evidence/clipping");
     std::fs::create_dir_all(&output).unwrap();
     for theme in crate::theme::ThemeKind::ALL {

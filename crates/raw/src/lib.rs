@@ -28,7 +28,7 @@
 //!   Bodies whose full profile is not measured yet can still carry a measured
 //!   image area (the D800E, the ILCE-7).
 //!
-//! Decoded today: DNG (uncompressed, lossless-JPEG and JPEG XL, strips and
+//! Decoded today: DNG (uncompressed, deflate, lossless-JPEG, lossy-JPEG and JPEG XL, strips and
 //! tiles, CFA and LinearRaw), CR2 (lossless JPEG with Canon slices), uncompressed or
 //! lossless-JPEG TIFF/EP raws (NEF, ARW, PEF… when not vendor-compressed),
 //! Nikon compressed NEF (lossless and lossy), Sony compressed ARW (cRAW),

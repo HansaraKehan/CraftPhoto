@@ -173,6 +173,35 @@ fn the_web_opens_every_selected_file() {
     assert!(app.ui.notices.iter().any(|n| n.error && n.title.contains("broken.png")), "{:?}", app.ui.notices);
 }
 
+/// #5749: the web shell reads dropped files itself, so it asks where they landed: image files
+/// dropped on the canvas are placed from their bytes, presets and drops elsewhere are opened.
+#[test]
+fn web_drops_onto_the_canvas_are_placed_from_their_bytes() {
+    let ctx = egui::Context::default();
+    let mut app = app_with_canvas();
+    let names = vec!["photo.png".to_string(), "brushes.abr".to_string()];
+    // No pointer known: nothing is placed.
+    assert_eq!(app.dropped_on_canvas(&ctx, &names), [false, false]);
+    let at = Rc::new(std::cell::Cell::new(egui::pos2(400.0, 300.0)));
+    let reported = at.clone();
+    app.services.cursor_pos = Some(Box::new(move |_: &egui::Context| Some(reported.get())));
+    assert_eq!(app.dropped_on_canvas(&ctx, &names), [true, false]);
+    at.set(egui::pos2(20.0, 20.0));
+    assert_eq!(app.dropped_on_canvas(&ctx, &names), [false, false], "off the canvas: opened");
+    let layers = layer_count(&app);
+    app.drop_places.push_back(crate::file_open::DropPlace::Bytes("photo.png".into(), png_bytes(4, 3)));
+    app.drop_places.push_back(crate::file_open::DropPlace::Bytes("bad.png".into(), b"bad".to_vec()));
+    app.place_next_dropped(&ctx);
+    assert_eq!(layer_count(&app), layers + 1);
+    assert_eq!(app.ui.transform.as_ref().and_then(|t| t.made), Some(crate::state::MadeLayer::Place));
+    crate::transform_tool::commit(&mut app);
+    // The undecodable one is reported, not placed.
+    app.place_next_dropped(&ctx);
+    assert_eq!(layer_count(&app), layers + 1);
+    assert!(app.ui.notices.iter().any(|n| n.error && n.title.contains("bad.png")), "{:?}", app.ui.notices);
+    assert!(app.drop_places.is_empty());
+}
+
 #[test]
 fn pcraft_documents_save_in_place_but_flat_files_ask() {
     let (mut app, written) = app_with(vec![None]);
@@ -315,6 +344,28 @@ fn os_open_events_open_files_with_paths() {
     app.drain_os_events(&ctx);
     assert_eq!(app.session.documents().len(), 2);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The viewport commands an `Open` event sends: focus, or an attention request on native Wayland
+/// where winit can't focus (#3708).
+fn raise_commands(is_wayland: bool) -> Vec<egui::ViewportCommand> {
+    let (mut app, _) = app_with(Vec::new());
+    app.services.is_wayland = is_wayland;
+    let mut queue = vec![OsEvent::Open(Vec::new())];
+    app.services.os_events = Some(Box::new(move || std::mem::take(&mut queue)));
+    let mut out = egui::Context::default().run_ui(egui::RawInput::default(), |ui| app.drain_os_events(ui.ctx()));
+    out.textures_delta.clear();
+    out.viewport_output.get(&egui::ViewportId::ROOT).map(|v| v.commands.clone()).unwrap_or_default()
+}
+
+#[test]
+fn an_os_open_brings_the_window_forward_or_asks_for_attention_on_wayland() {
+    use egui::{UserAttentionType, ViewportCommand};
+    let attention = ViewportCommand::RequestUserAttention(UserAttentionType::Informational);
+    let x11 = raise_commands(false);
+    assert!(x11.contains(&ViewportCommand::Focus) && !x11.contains(&attention), "{x11:?}");
+    let wayland = raise_commands(true);
+    assert!(wayland.contains(&attention) && !wayland.contains(&ViewportCommand::Focus), "{wayland:?}");
 }
 
 #[test]
@@ -570,6 +621,29 @@ fn a_drop_slot_counts_documents_not_the_tabs_shown() {
     assert_eq!(strip.slot(130.0), 5);
     assert_eq!(strip.slot(500.0), 7, "past the last shown tab: after it");
     assert_eq!(crate::canvas::TabStrip { rect: strip.rect, tabs: vec![] }.slot(10.0), 0);
+}
+
+/// #5687: files dropped from another app's window bring PhotoCraft to the front (a focus request
+/// in the frame that takes the drop), so the source window ends up behind it.
+#[test]
+fn a_drop_brings_the_window_to_the_front() {
+    let dir = std::env::temp_dir().join(format!("photocraft-drop-focus-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("photo.png");
+    std::fs::write(&file, png_bytes(8, 8)).unwrap();
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(800.0, 600.0)).with_max_steps(8).build_eframe(|cc| {
+        PhotocraftApp::setup_context(&cc.egui_ctx, Default::default());
+        PhotocraftApp::new(photocraft_engine::Session::new(), Services::default())
+    });
+    h.run_steps(2);
+    let focus = |h: &egui_kittest::Harness<'_, PhotocraftApp>| {
+        h.output().viewport_output.get(&egui::ViewportId::ROOT).is_some_and(|v| v.commands.contains(&egui::ViewportCommand::Focus))
+    };
+    assert!(!focus(&h), "no focus request without a drop");
+    h.input_mut().dropped_files.push(dropped(file, Err("read from the path".into())));
+    h.step();
+    assert!(focus(&h), "the drop brings the window forward");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The whole app (eframe harness, real layout): over the tab strip, the pointer read from the OS
@@ -882,4 +956,62 @@ fn opening_type_in_a_missing_font_warns() {
     assert_eq!(app.ui.notices.len(), 1);
     // The importer's own warning for the same font isn't doubled.
     assert_eq!(app.open_bytes("warned.psd", b"x").unwrap(), vec![warning]);
+}
+
+/// #6598: opening a file that is already open shows its document, as Photoshop does, rather than
+/// a second copy bound to the same file (saving one would overwrite the other). The path is
+/// compared as the file it names: another spelling of it, a symlink to it or, with background
+/// opens, a file still opening finds the same tab.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn opening_an_open_file_again_shows_its_tab() {
+    let (dir, paths) = files("already-open", &["a.psd", "b.psd"], b"x");
+    let (a, b) = (&paths[0], &paths[1]);
+    let (mut app, _) = app_with(Vec::new());
+    app.open_path(a).unwrap();
+    app.open_path(b).unwrap();
+    app.run("layer.new.layer", json!({})).unwrap();
+    app.ui.chrome.home = Some(2);
+    // Open Recent, File › Open, a drop: all go through `open_path`.
+    #[allow(unused_mut)]
+    let mut spellings = vec![a.clone(), dir.join(".").join("a.psd").to_string_lossy().into_owned()];
+    #[cfg(unix)]
+    {
+        let link = dir.join("link.psd");
+        std::os::unix::fs::symlink(a, &link).unwrap();
+        spellings.push(link.to_string_lossy().into_owned());
+    }
+    for again in spellings {
+        app.session.set_active(1);
+        app.ui.chrome.home = Some(2);
+        app.open_path(&again).unwrap();
+        assert_eq!(doc_names(&app), ["a.psd", "b.psd"], "{again}");
+        assert_eq!(app.session.active_index(), Some(0), "{again}");
+        assert_eq!(app.ui.chrome.home, None, "the Home screen gives way to the document");
+    }
+    assert!(app.session.documents()[1].is_dirty(), "b keeps its unsaved changes");
+    // A set holding an open file opens only the others.
+    let (dir2, more) = files("already-open-set", &["c.psd"], b"x");
+    assert_eq!(app.open_paths(&[b.clone(), more[0].clone()]), 1);
+    assert_eq!(doc_names(&app), ["a.psd", "b.psd", "c.psd"]);
+    // In the background: an open document, then a file still opening, show their tabs.
+    app.background_jobs = true;
+    app.open_path(a).unwrap();
+    assert!(app.jobs.opens.is_empty());
+    assert_eq!(app.session.active_index(), Some(0));
+    let (dir3, late) = files("already-open-bg", &["d.psd"], b"x");
+    app.open_path(&late[0]).unwrap();
+    let job = app.jobs.opens[0].job;
+    app.jobs.focus = None;
+    app.open_path(&late[0]).unwrap();
+    assert_eq!(app.jobs.opens.len(), 1, "one tab for the file still opening");
+    assert_eq!(app.jobs.focus, Some(job));
+    // A template still loading opens again as another Untitled, as it does once loaded.
+    let (dir4, template) = files("already-open-template", &["e.psdt"], b"x");
+    app.open_path(&template[0]).unwrap();
+    app.open_path(&template[0]).unwrap();
+    assert_eq!(app.jobs.opens.len(), 3, "two Untitleds from the template");
+    for d in [dir, dir2, dir3, dir4] {
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }

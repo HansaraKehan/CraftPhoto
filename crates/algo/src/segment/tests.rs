@@ -761,3 +761,212 @@ fn object_at_on_the_background_or_off_canvas_finds_nothing() {
     assert!(grabcut::object_at(&s, canvas, f32::NAN, 10.0, 20_000).is_none());
     assert!(grabcut::object_at(&s, canvas, 400.0, 10.0, 0).is_none());
 }
+
+// ---------- Select Subject on the cases reported in #2788 ----------
+
+/// A figure whose upper part is close to the background colour (a cream shirt on a near-white
+/// backdrop): the whole figure is the subject. Returns (image, truth, the low-contrast part).
+pub(crate) fn low_contrast_figure(seed: u64) -> (RgbImage, Vec<bool>, Vec<bool>) {
+    let (w, h) = (240usize, 200usize);
+    let mut rng = Rng::new(seed);
+    let mut img = RgbImage::new(w, h);
+    let mut truth = vec![false; w * h];
+    let mut cream = vec![false; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let body = (90..150).contains(&x) && (70..190).contains(&y);
+            let shoulders = (80..160).contains(&x) && (40..70).contains(&y);
+            let print = (105..135).contains(&x) && (100..130).contains(&y);
+            let n = 0.012 * rng.normal();
+            let i = y * w + x;
+            truth[i] = body || shoulders;
+            cream[i] = shoulders;
+            img.px[i] = if print {
+                [0.9 + n, 0.15 + n, 0.1 + n]
+            } else if body {
+                [0.12 + n, 0.2 + n, 0.45 + n]
+            } else if shoulders {
+                // Cream, a few levels off the backdrop.
+                [0.90 + n, 0.88 + n, 0.80 + n]
+            } else {
+                [0.96 + n, 0.96 + n, 0.95 + n]
+            }
+            .map(|v| v.clamp(0.0, 1.0));
+        }
+    }
+    (img, truth, cream)
+}
+
+fn coverage(region: &Region, part: &[bool], w: usize, h: usize) -> f32 {
+    let (mut hit, mut n) = (0usize, 0usize);
+    for y in 0..h {
+        for x in 0..w {
+            if part[y * w + x] {
+                n += 1;
+                hit += (region.at(x as i32, y as i32) >= 0.5) as usize;
+            }
+        }
+    }
+    hit as f32 / n.max(1) as f32
+}
+
+#[test]
+fn select_subject_keeps_parts_close_to_the_background_colour() {
+    let (img, truth, cream) = low_contrast_figure(7);
+    let s = ImageSampler { img: &img, origin: (0, 0) };
+    let reg = subject::select_subject(&s, Rect::new(0, 0, 240, 200)).unwrap();
+    let v = iou(&reg, &truth, 240, 200);
+    let c = coverage(&reg, &cream, 240, 200);
+    assert!(c > 0.85, "the cream shoulders are part of the subject: covered {c}");
+    assert!(v > 0.9, "IoU {v}");
+}
+
+#[test]
+fn select_subject_leaves_a_background_coloured_gap_open() {
+    // A dark ring (arms on hips) around a patch of plain backdrop: the patch is not the subject.
+    let (w, h) = (220usize, 200usize);
+    let mut rng = Rng::new(11);
+    let mut img = RgbImage::new(w, h);
+    let mut truth = vec![false; w * h];
+    let mut gap = vec![false; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let d = (x as f32 - 110.0).hypot(y as f32 - 100.0);
+            let ring = (17.0..80.0).contains(&d);
+            let hole = d < 17.0;
+            let n = 0.012 * rng.normal();
+            let i = y * w + x;
+            truth[i] = ring;
+            gap[i] = hole;
+            img.px[i] = if ring { [0.2 + n, 0.15 + n, 0.35 + n] } else { [0.95 + n, 0.94 + n, 0.92 + n] }.map(|v| v.clamp(0.0, 1.0));
+        }
+    }
+    let s = ImageSampler { img: &img, origin: (0, 0) };
+    let reg = subject::select_subject(&s, Rect::new(0, 0, w as i32, h as i32)).unwrap();
+    let g = coverage(&reg, &gap, w, h);
+    assert!(g < 0.1, "the backdrop inside the ring stays unselected: covered {g}");
+    let v = iou(&reg, &truth, w, h);
+    assert!(v > 0.9, "IoU {v}");
+}
+
+/// Timing on a 6 MP figure, for before/after numbers (`cargo test --release -- --ignored select_subject_timing --nocapture`).
+#[test]
+#[ignore = "timing only"]
+fn select_subject_timing() {
+    let (w, h) = (3000usize, 2000usize);
+    let img = RgbImage::from_fn(w, h, |x, y| {
+        let body = (1100..1900).contains(&x) && (700..1900).contains(&y);
+        let shoulders = (1000..2000).contains(&x) && (400..700).contains(&y);
+        let t = ((x * 7 + y * 13) % 17) as f32 / 1700.0;
+        if body {
+            [0.12 + t, 0.2, 0.45]
+        } else if shoulders {
+            [0.90, 0.88 + t, 0.80]
+        } else {
+            [0.96, 0.96 + t, 0.95]
+        }
+    });
+    let s = ImageSampler { img: &img, origin: (0, 0) };
+    for _ in 0..2 {
+        let t0 = std::time::Instant::now();
+        let reg = subject::select_subject(&s, Rect::new(0, 0, w as i32, h as i32)).unwrap();
+        eprintln!("select_subject 6 MP: {:?} bbox {:?}", t0.elapsed(), reg.bbox);
+    }
+}
+
+/// Writes the #2788 scenes and the Select Subject mask over them as PPM files into
+/// `$SUBJECT_DUMP` (for the PR's before/after pictures).
+#[test]
+#[ignore = "writes pictures"]
+fn select_subject_dump_pictures() {
+    let Ok(dir) = std::env::var("SUBJECT_DUMP") else { return };
+    let write = |name: &str, img: &RgbImage, reg: Option<&Region>| {
+        let mut out = format!("P6\n{} {}\n255\n", img.w, img.h).into_bytes();
+        for y in 0..img.h {
+            for x in 0..img.w {
+                let mut c = img.at(x, y);
+                if let Some(r) = reg
+                    && r.at(x as i32, y as i32) >= 0.5
+                {
+                    c = [c[0] * 0.5 + 0.5, c[1] * 0.5, c[2] * 0.5 + 0.5];
+                }
+                out.extend(c.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8));
+            }
+        }
+        std::fs::write(format!("{dir}/{name}.ppm"), out).unwrap();
+    };
+    let (img, _, _) = low_contrast_figure(7);
+    let s = ImageSampler { img: &img, origin: (0, 0) };
+    let reg = subject::select_subject(&s, Rect::new(0, 0, 240, 200));
+    write("figure", &img, None);
+    write("figure-selected", &img, reg.as_ref());
+    let (w, h) = (220usize, 200usize);
+    let mut rng = Rng::new(11);
+    let img = RgbImage::from_fn(w, h, |x, y| {
+        let d = (x as f32 - 110.0).hypot(y as f32 - 100.0);
+        let n = 0.012 * rng.normal();
+        if (17.0..80.0).contains(&d) { [0.2 + n, 0.15 + n, 0.35 + n] } else { [0.95 + n, 0.94 + n, 0.92 + n] }.map(|v| v.clamp(0.0, 1.0))
+    });
+    let s = ImageSampler { img: &img, origin: (0, 0) };
+    let reg = subject::select_subject(&s, Rect::new(0, 0, w as i32, h as i32));
+    write("ring", &img, None);
+    write("ring-selected", &img, reg.as_ref());
+}
+
+/// A dark square on a light background with a square hole that shows the background colour.
+fn square_with_hole(hole: usize) -> RgbImage {
+    let (w, h) = (400usize, 300usize);
+    let mut rng = Rng::new(11);
+    let (x0, y0) = (100usize, 50usize);
+    RgbImage::from_fn(w, h, |x, y| {
+        let n = 0.02 * rng.normal();
+        let in_square = x >= x0 && x < x0 + 200 && y >= y0 && y < y0 + 200;
+        let in_hole = x >= x0 + 96 && x < x0 + 96 + hole && y >= y0 + 96 && y < y0 + 96 + hole;
+        let c = if in_square && !in_hole { [0.1, 0.12, 0.15] } else { [0.9, 0.9, 0.85] };
+        c.map(|v: f32| (v + n).clamp(0.0, 1.0))
+    })
+}
+
+#[test]
+fn object_select_keeps_small_background_hole_open() {
+    let img = square_with_hole(8);
+    let s = ImageSampler { img: &img, origin: (0, 0) };
+    let canvas = Rect::new(0, 0, 400, 300);
+    let reg = grabcut::object_select(&s, canvas, Rect::new(80, 30, 320, 270), 1_000_000).unwrap();
+    assert!(reg.at(150, 100) >= 0.5, "the square itself is selected");
+    assert!(reg.at(200, 150) < 0.5, "background seen through the object stays unselected");
+}
+
+#[test]
+fn object_at_keeps_small_background_hole_open() {
+    let img = square_with_hole(16);
+    let s = ImageSampler { img: &img, origin: (0, 0) };
+    let canvas = Rect::new(0, 0, 400, 300);
+    let reg = grabcut::object_at(&s, canvas, 130.0, 80.0, 1_000_000).unwrap();
+    assert!(reg.at(150, 100) >= 0.5, "the square itself is selected");
+    assert!(reg.at(203, 153) < 0.5, "background seen through the object stays unselected");
+}
+
+#[test]
+fn hole_fill_without_specks_fills_object_coloured_holes_only() {
+    // The hole check Object Selection uses: no hole fills just for being small, a speck of the object's colour still does.
+    let (w, h) = (40usize, 40usize);
+    let mut rng = Rng::new(5);
+    let in_square = |x: usize, y: usize| (5..35).contains(&x) && (5..35).contains(&y);
+    let bg_hole = |x: usize, y: usize| (10..12).contains(&x) && (10..12).contains(&y);
+    let fg_hole = |x: usize, y: usize| (25..27).contains(&x) && (25..27).contains(&y);
+    let img = RgbImage::from_fn(w, h, |x, y| {
+        let n = 0.02 * rng.normal();
+        let c = if in_square(x, y) && !bg_hole(x, y) { [0.1, 0.12, 0.15] } else { [0.9, 0.9, 0.85] };
+        c.map(|v: f32| (v + n).clamp(0.0, 1.0))
+    });
+    let mask: Vec<bool> = (0..w * h).map(|i| in_square(i % w, i / w) && !bg_hole(i % w, i / w) && !fg_hole(i % w, i / w)).collect();
+    // The colour models, as GrabCut would fit them: the object colour vs. the backdrop colour.
+    let dark: Vec<bool> = (0..w * h).map(|i| in_square(i % w, i / w) && !bg_hole(i % w, i / w)).collect();
+    let (fs, bs): (Vec<_>, Vec<_>) = img.px.iter().zip(&dark).partition(|(_, m)| **m);
+    let fit = |v: Vec<(&[f32; 3], &bool)>| Gmm::fit(&v.iter().map(|(p, _)| **p).collect::<Vec<_>>(), 3, gmm::DEFAULT_REG).unwrap();
+    let (fg, bg) = (fit(fs), fit(bs));
+    let out = fill_holes_by_model(&mask, &img, &fg, &bg, 0.0, 0.05);
+    assert!(out[25 * w + 25], "a speck of the object's colour fills");
+    assert!(!out[10 * w + 10], "a speck of the background's colour stays open");
+}

@@ -75,19 +75,33 @@ fn show(app: &mut PhotocraftApp) {
     let name = front.name.as_str();
     let working = crate::i18n::fmt(tl!("Working: {working}"), &[("working", q.get("working").and_then(Value::as_str).unwrap_or("?"))]);
     let missing = q.get("missing").and_then(Value::as_bool) == Some(true);
+    // A mismatch names the two profiles on the choices they belong to (`prefs_ui::mismatch_body`).
     let message = if missing {
         let what = crate::i18n::fmt(tl!("The document “{name}” does not have an embedded {mode} profile."), &[("mode", mode), ("name", name)]);
         format!("{what}\n{working}")
     } else {
-        let what = crate::i18n::fmt(
+        crate::i18n::fmt(
             tl!("The document “{name}” has an embedded color profile that does not match the current {mode} working space."),
             &[("mode", mode), ("name", name)],
-        );
-        let embedded = crate::i18n::fmt(tl!("Embedded: {embedded}"), &[("embedded", q.get("embedded").and_then(Value::as_str).unwrap_or("?"))]);
-        format!("{what}\n{embedded}\n{working}")
+        )
     };
     let action = q.get("action").and_then(Value::as_str).unwrap_or("preserve").to_string();
-    crate::prefs_ui::open_mismatch(app, &message, &action, missing, FIELD);
+    let names = json!({
+        "embedded": q.get("embedded").and_then(Value::as_str).unwrap_or("?"),
+        "working": q.get("working").and_then(Value::as_str).unwrap_or("?"),
+        "policyKey": policy_key(front.doc.mode),
+    });
+    crate::prefs_ui::open_mismatch(app, &message, &action, missing, FIELD, names);
+}
+
+/// The Color Settings policy that answers this mode's files when Ask On Mismatch is off.
+fn policy_key(mode: ColorMode) -> Option<&'static str> {
+    match photocraft_engine::color_cmds::mode_space(mode) {
+        photocraft_cms::ColorSpace::Rgb => Some("policyRgb"),
+        photocraft_cms::ColorSpace::Cmyk => Some("policyCmyk"),
+        photocraft_cms::ColorSpace::Gray => Some("policyGray"),
+        _ => None,
+    }
 }
 
 /// Whether `fields` are one of this module's prompts.
@@ -111,6 +125,31 @@ pub fn answer(app: &mut PhotocraftApp, action: Option<&str>) -> Result<Value, St
     };
     let Some(held) = app.held_opens.pop_front() else { return Err("no file is waiting to open".into()) };
     let r = open(app, held, Some(action));
+    advance(app);
+    r
+}
+
+/// OK with "Remember this choice": `action` becomes the Color Settings policy for the file's
+/// mode and Ask On Mismatch turns off, so files read from now on open without asking. Files
+/// already waiting with a mismatch in the same mode were asked before that and get the same
+/// answer; any other question still asks.
+pub fn answer_remembering(app: &mut PhotocraftApp, action: &str) -> Result<Value, String> {
+    let Some(key) = app.held_opens.front().and_then(|h| policy_key(h.doc.mode)) else { return answer(app, Some(action)) };
+    let policy = match action {
+        "convert" => "convert",
+        "discard" => "off",
+        _ => "preserve",
+    };
+    app.run("edit.colorSettings", json!({key: policy, "askOnMismatch": false}))?;
+    let same = |h: &Held| policy_key(h.doc.mode) == Some(key) && h.question.as_ref().is_some_and(|q| q.get("missing").and_then(Value::as_bool) != Some(true));
+    let Some(held) = app.held_opens.pop_front() else { return Err("no file is waiting to open".into()) };
+    let r = open(app, held, Some(action));
+    while app.held_opens.front().is_some_and(same) {
+        if let Some(held) = app.held_opens.pop_front() {
+            // A failure is shown to the user (`open_failed`); the next file still opens.
+            let _ = open(app, held, Some(action));
+        }
+    }
     advance(app);
     r
 }

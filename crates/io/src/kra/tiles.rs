@@ -231,19 +231,22 @@ impl<'a> TileFile<'a> {
         for &(x, y, data) in &self.tiles {
             ctl.check().map_err(|_| IoError::Cancelled)?;
             let (flag, payload) = data.split_first().ok_or_else(|| invalid("empty tile"))?;
-            let planar: std::borrow::Cow<'_, [u8]> = match flag {
-                1 => lzf_decompress(payload, expected)?.into(),
-                0 if payload.len() == expected => payload.into(),
-                0 => return Err(invalid("raw tile has the wrong size")),
-                f => return Err(invalid(format!("unknown tile compression flag {f}"))),
-            };
-            // Byte planes: byte k of pixel i is at k * n + i.
-            for (k, plane) in planar.chunks_exact(n).enumerate() {
-                for (i, b) in plane.iter().enumerate() {
-                    if let Some(slot) = interleaved.get_mut(i * self.pixel_size + k) {
-                        *slot = *b;
+            match flag {
+                1 => {
+                    // LZF tiles hold byte planes: byte k of pixel i is at k * n + i.
+                    let planar = lzf_decompress(payload, expected)?;
+                    for (k, plane) in planar.chunks_exact(n).enumerate() {
+                        for (i, b) in plane.iter().enumerate() {
+                            if let Some(slot) = interleaved.get_mut(i * self.pixel_size + k) {
+                                *slot = *b;
+                            }
+                        }
                     }
                 }
+                // Raw tiles (written when LZF doesn't shrink them) are already interleaved.
+                0 if payload.len() == expected => interleaved.copy_from_slice(payload),
+                0 => return Err(invalid("raw tile has the wrong size")),
+                f => return Err(invalid(format!("unknown tile compression flag {f}"))),
             }
             space.convert(&interleaved, fmt, &mut out);
             let (x0, y0) =

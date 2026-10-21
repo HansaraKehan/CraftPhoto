@@ -10,7 +10,7 @@
 
 use egui::{Align2, Color32, FontId, Pos2, Rect as ERect, Sense, Stroke, TextureHandle, pos2, vec2};
 use photocraft_algo::liquify::{LiquifyField, LiquifyStroke, LiquifyTool, ProxyImage, auto_cell};
-use photocraft_doc::LayerId;
+use photocraft_doc::{Document, LayerId};
 use photocraft_geom::Rect;
 use photocraft_raster::Surface;
 use serde_json::{Value, json};
@@ -40,8 +40,30 @@ pub struct LiquifyOpts {
     pub mesh_size: usize,
     pub show_mask: bool,
     pub show_backdrop: bool,
+    /// Show Backdrop › Use: the layer shown as the backdrop (its id), `None` for All Layers.
+    pub backdrop_layer: Option<u64>,
+    pub backdrop_mode: BackdropMode,
     pub backdrop_opacity: f32,
     pub reconstruct_amount: f32,
+}
+
+/// Show Backdrop › Mode, as Photoshop draws them (#7609): In Front lays the backdrop over the
+/// image at the Opacity, Behind lays the image over the backdrop at the Opacity, and Blend fades
+/// the image to 100 − Opacity under the backdrop at the Opacity.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BackdropMode {
+    #[default]
+    InFront,
+    Behind,
+    Blend,
+}
+
+impl BackdropMode {
+    const ALL: [(BackdropMode, &'static str); 3] = [(BackdropMode::InFront, "inFront"), (BackdropMode::Behind, "behind"), (BackdropMode::Blend, "blend")];
+
+    fn key(self) -> &'static str {
+        Self::ALL.iter().find(|(m, _)| *m == self).map_or("inFront", |(_, k)| k)
+    }
 }
 
 impl Default for LiquifyOpts {
@@ -56,6 +78,8 @@ impl Default for LiquifyOpts {
             mesh_size: 1,
             show_mask: true,
             show_backdrop: false,
+            backdrop_layer: None,
+            backdrop_mode: BackdropMode::InFront,
             backdrop_opacity: 50.0,
             reconstruct_amount: 100.0,
         }
@@ -88,6 +112,13 @@ impl LiquifyOpts {
                 *slot = b;
             }
         }
+        // `"all"` (or anything but a layer id) is All Layers.
+        if let Some(u) = v.get("backdropUse") {
+            self.backdrop_layer = u.as_u64();
+        }
+        if let Some(m) = v.get("backdropMode").and_then(Value::as_str).and_then(|m| BackdropMode::ALL.iter().find(|(_, k)| *k == m)) {
+            self.backdrop_mode = m.0;
+        }
         if let Some(m) = v.get("meshSize").and_then(Value::as_str) {
             self.mesh_size = match m {
                 "small" => 0,
@@ -114,6 +145,8 @@ impl LiquifyOpts {
             "meshSize": mesh,
             "showMask": self.show_mask,
             "showBackdrop": self.show_backdrop,
+            "backdropUse": self.backdrop_layer.map_or(json!("all"), |id| json!(id)),
+            "backdropMode": self.backdrop_mode.key(),
             "backdropOpacity": self.backdrop_opacity,
         })
     }
@@ -143,7 +176,8 @@ pub struct LiquifyDialog {
     view_source_scratch: Vec<[f32; 4]>,
     view_tex: Option<TextureHandle>,
     view_dirty: Option<Rect>,
-    backdrop: Option<TextureHandle>,
+    /// The backdrop and the Use it shows (see [`LiquifyOpts::backdrop_layer`]).
+    backdrop: Option<(Option<u64>, TextureHandle)>,
     mask_tex: Option<TextureHandle>,
     mask_dirty: bool,
     pub opts: LiquifyOpts,
@@ -495,6 +529,8 @@ pub fn open(app: &mut PhotocraftApp, ctx: &egui::Context) -> Result<(), String> 
     if let Some(saved) = app.session.prefs().dialogs.get(REMEMBERED) {
         let _ = d.opts.apply(saved);
     }
+    // Layer ids belong to one document: a remembered backdrop Use starts at All Layers.
+    d.opts.backdrop_layer = None;
     d.upload(ctx);
     app.distort.liquify = Some(d);
     Ok(())
@@ -536,8 +572,16 @@ pub fn control(app: &mut PhotocraftApp, ui: &Value) -> Result<Value, String> {
         cancel(app);
         return Ok(json!({"cancelled": true}));
     }
+    // A `backdropUse` that names no layer of the document is All Layers, as the Use list shows it.
+    let missing = |id: u64| app.session.active().is_none_or(|st| st.doc.layer(LayerId(id)).is_none());
+    let unknown_use = ui.get("backdropUse").and_then(Value::as_u64).is_some_and(missing);
     let d = app.distort.liquify.as_mut().ok_or(tl!("Liquify is not open"))?;
-    d.opts.apply(ui)?;
+    // `apply` takes every setting it can before a bad one fails it, so normalize first.
+    let applied = d.opts.apply(ui);
+    if unknown_use {
+        d.opts.backdrop_layer = None;
+    }
+    applied?;
     let num = |k: &str| ui.get(k).and_then(Value::as_f64).map(|v| v as f32);
     let flag = |k: &str| ui.get(k).and_then(Value::as_bool);
     if flag("undo") == Some(true) {
@@ -710,26 +754,85 @@ fn shortcut(t: LiquifyTool) -> &'static str {
     }
 }
 
-fn load_backdrop(app: &PhotocraftApp, ctx: &egui::Context, layer: LayerId, canvas: Rect) -> Option<TextureHandle> {
+/// The backdrop for Show Backdrop › Use `of`: the document as it is (All Layers, the liquified
+/// layer's own pixels included, as in Photoshop) or that one layer alone. A layer that is gone
+/// shows All Layers.
+fn load_backdrop(app: &PhotocraftApp, ctx: &egui::Context, of: Option<u64>, canvas: Rect) -> Option<TextureHandle> {
     let st = app.session.active()?;
-    let doc = crate::distort_ui::without_layer(&st.doc, layer);
-    let buf = photocraft_compose::render(&doc, canvas);
+    let buf = photocraft_compose::render(&backdrop_doc(&st.doc, of), canvas);
     let mut s = photocraft_raster::Surface::new(photocraft_color::PixelFormat::RGBA8);
     let flat: Vec<f32> = buf.px.iter().flat_map(|p| *p).collect();
     s.write_region(canvas, &flat);
     Some(ctx.load_texture("liquify-backdrop", crate::distort_ui::surface_image(&s, canvas, PROXY_SIDE), egui::TextureOptions::LINEAR))
 }
 
+/// The document [`load_backdrop`] renders for Use `of`.
+fn backdrop_doc(doc: &Document, of: Option<u64>) -> std::borrow::Cow<'_, Document> {
+    match of.map(LayerId).filter(|id| doc.layer(*id).is_some()) {
+        Some(id) => {
+            let mut d = doc.clone();
+            crate::transform_tool::solo_layer(&mut d.layers, id);
+            // A hidden layer, or one in a hidden group, shows too: Use lists every layer.
+            reveal(&mut d.layers, id);
+            std::borrow::Cow::Owned(d)
+        }
+        None => std::borrow::Cow::Borrowed(doc),
+    }
+}
+
+/// Makes layer `id` and the groups holding it visible; whether it was found.
+fn reveal(layers: &mut [photocraft_doc::Layer], id: LayerId) -> bool {
+    layers.iter_mut().any(|l| {
+        let found = l.id == id
+            || match &mut l.content {
+                photocraft_doc::LayerContent::Group(g) => reveal(&mut g.children, id),
+                _ => false,
+            };
+        if found {
+            l.visible = true;
+        }
+        found
+    })
+}
+
+/// How the preview layers the image and the backdrop texture `T`: the image's tint, and the
+/// backdrop drawn behind it or in front of it, with its tint.
+#[derive(Debug, PartialEq)]
+struct Layering<T> {
+    image: Color32,
+    behind: Option<(T, Color32)>,
+    front: Option<(T, Color32)>,
+}
+
+/// The [`Layering`] for the backdrop `backdrop` (when shown) in `mode` at `opacity` (0..1):
+/// Photoshop's modes, measured on its Liquify (#7609).
+fn backdrop_layering<T: Copy>(backdrop: Option<T>, mode: BackdropMode, opacity: f32) -> Layering<T> {
+    let alpha = |a: f32| Color32::from_white_alpha((a.clamp(0.0, 1.0) * 255.0).round() as u8);
+    let (image, behind, front) = match (backdrop, mode) {
+        (None, _) => (Color32::WHITE, None, None),
+        (Some(b), BackdropMode::InFront) => (Color32::WHITE, None, Some((b, alpha(opacity)))),
+        (Some(b), BackdropMode::Behind) => (alpha(opacity), Some((b, Color32::WHITE)), None),
+        (Some(b), BackdropMode::Blend) => (alpha(1.0 - opacity), None, Some((b, alpha(opacity)))),
+    };
+    Layering { image, behind, front }
+}
+
 /// Draws the dialog (a full-window layer over the app).
 pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
     let t = Tokens::get(ctx);
     let screen = ctx.content_rect();
-    if app.distort.liquify.as_ref().is_some_and(|d| d.opts.show_backdrop && d.backdrop.is_none()) {
-        let tex = app.distort.liquify.as_ref().map(|d| (d.layer, d.canvas)).and_then(|(layer, canvas)| load_backdrop(app, ctx, layer, canvas));
+    // The backdrop is built when it's first shown and again when its Use changes.
+    let wanted = app.distort.liquify.as_ref().filter(|d| d.opts.show_backdrop && d.backdrop.as_ref().is_none_or(|(of, _)| *of != d.opts.backdrop_layer));
+    if let Some((of, canvas)) = wanted.map(|d| (d.opts.backdrop_layer, d.canvas)) {
+        let tex = load_backdrop(app, ctx, of, canvas);
         if let Some(d) = app.distort.liquify.as_mut() {
-            d.backdrop = tex;
+            d.backdrop = tex.map(|t| (of, t));
         }
     }
+    // Show Backdrop › Use: All Layers or one layer, bottom to top as Photoshop lists them.
+    let backdrop_layers: Vec<(Option<u64>, String)> = std::iter::once((None, tl!("All Layers").to_string()))
+        .chain(app.session.active().into_iter().flat_map(|st| st.doc.walk().into_iter().map(|(_, _, l)| (Some(l.id.0), l.name.clone())).collect::<Vec<_>>()))
+        .collect();
     let mut action: Option<&str> = None;
     let mut events: Vec<ToolEvent> = Vec::new();
     let mut mods = egui::Modifiers::NONE;
@@ -818,6 +921,16 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
             widgets::checkbox(ui, &mut d.opts.show_mask, tl!("Show Mask"));
             widgets::checkbox(ui, &mut d.opts.show_backdrop, tl!("Show Backdrop"));
             if d.opts.show_backdrop {
+                ui.horizontal(|ui| {
+                    ui.label(tl!("Use"));
+                    let names: Vec<(Option<u64>, &str)> = backdrop_layers.iter().map(|(id, n)| (*id, n.as_str())).collect();
+                    widgets::dropdown_literal(ui, "liquify-backdrop-use", &mut d.opts.backdrop_layer, &names, 150.0);
+                });
+                ui.horizontal(|ui| {
+                    ui.label(tl!("Mode"));
+                    let modes = [(BackdropMode::InFront, tl!("In Front")), (BackdropMode::Behind, tl!("Behind")), (BackdropMode::Blend, tl!("Blend"))];
+                    widgets::dropdown(ui, "liquify-backdrop-mode", &mut d.opts.backdrop_mode, &modes, 150.0);
+                });
                 widgets::slider_row(ui, tl!("Opacity"), &mut d.opts.backdrop_opacity, 0.0..=100.0, "", None);
             }
             widgets::hairline(ui);
@@ -875,10 +988,10 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
         let clip = painter.with_clip_rect(area);
         widgets::checker(&clip, img.intersect(area), 8.0);
         let uv = ERect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
-        if d.opts.show_backdrop
-            && let Some(b) = &d.backdrop
-        {
-            clip.image(b.id(), img, uv, Color32::from_white_alpha((d.opts.backdrop_opacity / 100.0 * 255.0) as u8));
+        let backdrop = d.backdrop.as_ref().filter(|_| d.opts.show_backdrop).map(|(_, t)| t.id());
+        let Layering { image: image_tint, behind, front } = backdrop_layering(backdrop, d.opts.backdrop_mode, d.opts.backdrop_opacity / 100.0);
+        if let Some((b, c)) = behind {
+            clip.image(b, img, uv, c);
         }
         if d.zoom > 1.0
             && let (Some(bounds), Some(tex)) = (d.view_bounds, &d.view_tex)
@@ -887,7 +1000,7 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
                 to_screen(d, area, [f64::from(bounds.x0), f64::from(bounds.y0)]),
                 to_screen(d, area, [f64::from(bounds.x1), f64::from(bounds.y1)]),
             );
-            clip.image(tex.id(), detail, uv, Color32::WHITE);
+            clip.image(tex.id(), detail, uv, image_tint);
         } else {
             // The proxy covers whole proxy pixels, a little past the canvas edge.
             let pr = ERect::from_min_max(
@@ -895,8 +1008,11 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
                 img.min + vec2(d.proxy.w as f32 * d.proxy.scale as f32 * d.zoom, d.proxy.h as f32 * d.proxy.scale as f32 * d.zoom),
             );
             if let Some(tex) = &d.tex {
-                clip.image(tex.id(), pr, uv, Color32::WHITE);
+                clip.image(tex.id(), pr, uv, image_tint);
             }
+        }
+        if let Some((b, c)) = front {
+            clip.image(b, img, uv, c);
         }
         if d.opts.show_mask
             && let Some(m) = &d.mask_tex
@@ -1109,6 +1225,55 @@ mod tests {
         d.update_view_preview(&ctx, ERect::from_min_size(pos2(0.0, 0.0), vec2(60.0, 40.0)));
         assert_ne!(d.view_out, before, "a brush update refreshes the visible source-resolution crop");
         assert!(d.preview_ms.is_finite());
+    }
+
+    /// #7609: Show Backdrop › Use and Mode, as in Photoshop: the settings, how each mode layers the
+    /// backdrop and the image, and what each Use shows.
+    #[test]
+    fn backdrop_use_and_mode() {
+        let mut o = LiquifyOpts::default();
+        assert_eq!((o.backdrop_layer, o.backdrop_mode), (None, BackdropMode::InFront), "All Layers, In Front");
+        o.apply(&json!({"backdropUse": 3, "backdropMode": "behind"})).unwrap();
+        assert_eq!((o.backdrop_layer, o.backdrop_mode), (Some(3), BackdropMode::Behind));
+        assert_eq!((&o.to_json()["backdropUse"], &o.to_json()["backdropMode"]), (&json!(3), &json!("behind")));
+        o.apply(&json!({"backdropUse": "all", "backdropMode": "nope"})).unwrap();
+        assert_eq!((o.backdrop_layer, o.backdrop_mode), (None, BackdropMode::Behind), "a bad mode is ignored");
+        let (w, a) = (Color32::WHITE, |x: f32| Color32::from_white_alpha((x * 255.0).round() as u8));
+        let l = |image, behind, front| Layering { image, behind, front };
+        assert_eq!(backdrop_layering(Some(1), BackdropMode::InFront, 0.25), l(w, None, Some((1, a(0.25)))), "backdrop over the image");
+        assert_eq!(backdrop_layering(Some(1), BackdropMode::Behind, 0.25), l(a(0.25), Some((1, w)), None), "image over the backdrop");
+        assert_eq!(backdrop_layering(Some(1), BackdropMode::Blend, 0.25), l(a(0.75), None, Some((1, a(0.25)))), "faded together");
+        assert_eq!(backdrop_layering::<u8>(None, BackdropMode::Blend, 0.25), l(w, None, None), "no backdrop: the image as is");
+        // All Layers is the document with the liquified layer in it; one layer is that layer alone.
+        let app = app_with_layer();
+        let st = app.session.active().unwrap();
+        let (layer, background) = (st.active_layer.unwrap(), st.doc.layers[0].id);
+        let at = |doc: &Document| photocraft_compose::render(doc, Rect::new(10, 10, 11, 11)).px[0];
+        let own = at(&st.doc);
+        assert_eq!(at(&backdrop_doc(&st.doc, None)), own, "All Layers");
+        assert_eq!(at(&backdrop_doc(&st.doc, Some(layer.0))), own, "the liquified layer alone");
+        assert_ne!(at(&backdrop_doc(&st.doc, Some(background.0))), own, "the Background alone");
+        assert_eq!(at(&backdrop_doc(&st.doc, Some(9999))), own, "a layer that's gone: All Layers");
+        // A hidden layer shows when it is the one used.
+        let mut hidden = (*st.doc).clone();
+        hidden.layer_mut(layer).unwrap().visible = false;
+        assert_eq!(at(&backdrop_doc(&hidden, Some(layer.0))), own, "the hidden liquified layer, alone");
+        // A remembered Use is a layer of another document: Liquify opens on All Layers.
+        let ctx = egui::Context::default();
+        let mut app = app_with_layer();
+        app.session.prefs.edit(|p| p.dialogs.insert(REMEMBERED.into(), json!({"backdropUse": 42, "backdropMode": "blend"})));
+        open(&mut app, &ctx).unwrap();
+        let o = &app.distort.liquify.as_ref().unwrap().opts;
+        assert_eq!((o.backdrop_layer, o.backdrop_mode), (None, BackdropMode::Blend), "the mode is kept, the layer is not");
+        // Over the control channel, a layer of the document is kept and one that isn't is All Layers.
+        let layer = app.session.active().unwrap().active_layer.unwrap().0;
+        control(&mut app, &json!({"backdropUse": layer})).unwrap();
+        assert_eq!(app.distort.liquify.as_ref().unwrap().opts.backdrop_layer, Some(layer));
+        control(&mut app, &json!({"backdropUse": 4242})).unwrap();
+        assert_eq!(app.distort.liquify.as_ref().unwrap().opts.backdrop_layer, None, "no such layer: All Layers");
+        control(&mut app, &json!({"backdropUse": layer})).unwrap();
+        assert!(control(&mut app, &json!({"backdropUse": 4242, "tool": "nope"})).is_err());
+        assert_eq!(app.distort.liquify.as_ref().unwrap().opts.backdrop_layer, None, "also when another setting fails");
     }
 
     /// #418: the brush settings survive Cancel, OK and Esc, and come back the next time Liquify

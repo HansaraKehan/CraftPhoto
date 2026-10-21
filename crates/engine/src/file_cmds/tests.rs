@@ -65,6 +65,33 @@ fn camera_raw_opens_as_16_bit_with_notes() {
     assert!(open_bytes_as(&mut s, "bad.dng", &bad, None, None).is_err());
 }
 
+/// #5799: Batch with Format "Same" over a folder of camera raws saved nothing (every output was
+/// a raw PhotoCraft can't write). Raws are saved as PSD; other inputs keep their format.
+#[test]
+fn batch_same_format_saves_camera_raws_as_psd() {
+    use photocraft_raw::testgen::{DngSpec, mosaic, scene};
+    let dir = tmp("batch-same-raw");
+    let (w, h) = (24, 16);
+    std::fs::write(join(&dir, "IMG_0001.dng"), DngSpec::cfa(w, h, mosaic(&scene(w, h), w, [0, 1, 1, 2], 0, 65535)).build()).unwrap();
+    png(&dir, "b.png", 8, 8, "#ff0000");
+    // Also with a file naming template, which picks the output extension separately.
+    for (out, naming) in [("out", None), ("named", Some("{name}_{serial}"))] {
+        let out = join(&dir, out);
+        let mut p = json!({"steps": [["image.adjustments.invert", {}]], "input": dir, "output": out, "format": "same"});
+        if let Some(naming) = naming {
+            p["naming"] = json!(naming);
+        }
+        let r = Session::new().execute("file.automate.batch", p).unwrap();
+        assert!(r["errors"].as_array().unwrap().is_empty(), "{naming:?}: {r}");
+        let mut files: Vec<String> = r["files"].as_array().unwrap().iter().map(|f| f.as_str().unwrap().replace('\\', "/")).collect();
+        files.sort();
+        assert_eq!(files.len(), 2, "{r}");
+        assert!(files[0].contains("/IMG_0001") && files[0].ends_with(".psd") && files[1].contains("/b") && files[1].ends_with(".png"), "{files:?}");
+        let psd = photocraft_io::import("IMG_0001.psd", &std::fs::read(&files[0]).unwrap()).unwrap().document;
+        assert_eq!((psd.size.width, psd.size.height), (w as u32, h as u32));
+    }
+}
+
 #[test]
 fn revert_reloads_as_one_undoable_step() {
     let dir = tmp("revert");
@@ -135,6 +162,44 @@ fn save_a_copy_keeps_path_and_dirty_state() {
     assert!(s.execute("file.saveACopy", json!({})).is_err());
 }
 
+/// A copy over the document's own file, however the path is spelt, would replace it (a lossy
+/// re-encode can't be undone), so it is refused unless `overwrite` is passed (#7437).
+#[test]
+fn save_a_copy_refuses_the_documents_own_file() {
+    let dir = tmp("copy-own");
+    let path = png(&dir, "own.png", 6, 4, "#ff0000");
+    let bytes = std::fs::read(&path).unwrap();
+    let mut s = Session::new();
+    open_bytes_as(&mut s, &path, &bytes, None, Some(path.clone())).unwrap();
+    s.execute("layer.new.layer", json!({})).unwrap();
+    s.execute("edit.fill", json!({"color": "#00ff00"})).unwrap();
+    let link = join(&dir, "link.png");
+    std::fs::hard_link(&path, &link).unwrap();
+    let rev = s.active().unwrap().revision;
+    for p in [path.clone(), format!("{dir}/./own.png"), link] {
+        let r = s.execute("file.saveACopy", json!({"path": p}));
+        assert!(r.as_ref().is_err_and(|e| e.to_string().contains("overwrite")), "{p}: {r:?}");
+        assert!(s.execute("file.saveACopy", json!({"path": p, "overwrite": false})).is_err(), "{p}");
+        assert_eq!(std::fs::read(&path).unwrap(), bytes, "{p}");
+        let st = s.active().unwrap();
+        assert_eq!(st.path.as_deref(), Some(path.as_str()), "{p}");
+        assert_eq!(st.revision, rev, "{p}");
+        assert!(st.is_dirty(), "{p}");
+    }
+    let other = join(&dir, "other.png");
+    s.execute("file.saveACopy", json!({"path": other})).unwrap();
+    assert!(std::fs::metadata(&other).unwrap().len() > 0);
+    s.execute("file.saveACopy", json!({"path": path, "overwrite": true})).unwrap();
+    assert_ne!(std::fs::read(&path).unwrap(), bytes);
+    assert_eq!(s.active().unwrap().path.as_deref(), Some(path.as_str()));
+    assert!(s.active().unwrap().is_dirty());
+
+    // A document that was never saved has no file of its own: it copies anywhere, as before.
+    let mut fresh = session(4, 4, 8);
+    fresh.execute("file.saveACopy", json!({"path": path})).unwrap();
+    assert_eq!(fresh.active().unwrap().path, None);
+}
+
 /// `tgaBits` picks the Targa's bits per pixel (byte 16 of the header); unset, a document with an
 /// alpha channel is written as 32-bit, with the channel as the alpha.
 #[test]
@@ -179,6 +244,53 @@ fn save_a_copy_writes_the_dpx_bits_asked_for() {
         assert!(matches!(r, Err(EngineError::BadParams { .. })), "{bad}: {r:?}");
         assert!(!std::path::Path::new(&out).exists(), "{bad}: nothing written");
     }
+}
+
+/// `ddsCompression` picks the DDS FourCC (or none, uncompressed) and `ddsMipmaps` the mip count
+/// in the header; unset, an uncompressed texture without mipmaps. Bad values are refused before
+/// anything is written.
+#[test]
+fn save_a_copy_writes_the_dds_options_asked_for() {
+    let dir = tmp("dds-options");
+    let le32 = |b: &[u8], at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+    for (params, fourcc, mips) in [
+        (json!({}), [0; 4], 1),
+        (json!({"ddsCompression": "none", "ddsMipmaps": true}), [0; 4], 5),
+        (json!({"ddsCompression": "bc1"}), *b"DXT1", 1),
+        (json!({"ddsCompression": "DXT3", "ddsMipmaps": false}), *b"DXT3", 1),
+        (json!({"ddsCompression": "bc3", "ddsMipmaps": true}), *b"DXT5", 5),
+        (json!({"ddsCompression": null, "ddsMipmaps": null}), [0; 4], 1),
+    ] {
+        let mut s = session(16, 12, 8);
+        let out = join(&dir, "a.dds");
+        let mut p = params.clone();
+        p["path"] = json!(out);
+        s.execute("file.saveACopy", p).unwrap();
+        let bytes = std::fs::read(&out).unwrap();
+        assert_eq!((&bytes[..4], &bytes[84..88], le32(&bytes, 28)), (&b"DDS "[..], &fourcc[..], mips), "{params}");
+        assert_eq!(photocraft_io::import("a.dds", &bytes).unwrap().document.size, photocraft_geom::Size::new(16, 12), "{params}");
+    }
+    let mut s = session(8, 8, 8);
+    let state = |s: &Session| s.active().map(|st| (st.revision, st.path.clone(), st.is_dirty()));
+    let before = state(&s);
+    for bad in [json!({"ddsCompression": "bc7"}), json!({"ddsCompression": 1}), json!({"ddsMipmaps": "yes"}), json!({"ddsMipmaps": 1})] {
+        let out = join(&dir, "bad.dds");
+        let mut p = bad.clone();
+        p["path"] = json!(out);
+        let r = s.execute("file.saveACopy", p);
+        assert!(matches!(r, Err(EngineError::BadParams { .. })), "{bad}: {r:?}");
+        assert!(!std::path::Path::new(&out).exists(), "{bad}: nothing written");
+        assert_eq!(state(&s), before, "{bad}: the document is untouched");
+    }
+}
+
+#[test]
+fn dds_params_are_none_until_one_is_given() {
+    use photocraft_io::{DdsCompression, DdsOptions};
+    assert_eq!(dds_param(&json!({}), "file.saveAs").unwrap(), None);
+    assert_eq!(dds_param(&json!({"ddsCompression": null}), "file.saveAs").unwrap(), None);
+    assert_eq!(dds_param(&json!({"ddsMipmaps": true}), "file.saveAs").unwrap(), Some(DdsOptions { compression: DdsCompression::None, mipmaps: true }));
+    assert_eq!(dds_param(&json!({"ddsCompression": "bc2"}), "file.saveAs").unwrap(), Some(DdsOptions { compression: DdsCompression::Bc2, mipmaps: false }));
 }
 
 /// A `tgaBits` other than 24 or 32 is a bad parameter, reported before anything is written.
@@ -709,6 +821,74 @@ fn flatten_all_layer_effects_keeps_masks() {
     }
 }
 
+/// Flattens all layer effects on a red square carrying `fx` (in a document prepared by `setup`)
+/// and asserts the composite did not change: the bake uses the document's own context (#5719).
+fn assert_flatten_effects_is_a_no_op(depth: u32, setup: impl FnOnce(&mut Document), fx: photocraft_doc::Effect) {
+    let mut s = session(40, 40, depth);
+    s.execute("layer.new.layer", json!({})).unwrap();
+    s.execute("select.rect", json!({"x": 14, "y": 14, "width": 12, "height": 12})).unwrap();
+    s.execute("edit.fill", json!({"color": "#ff0000"})).unwrap();
+    s.execute("select.deselect", json!({})).unwrap();
+    let id = s.active().unwrap().active_layer.unwrap();
+    s.edit("fx", |doc, _| {
+        setup(doc);
+        let l = doc.layer_mut(id).unwrap();
+        l.effects.enabled = true;
+        l.effects.items.push(fx);
+        Ok(())
+    })
+    .unwrap();
+    let before = photocraft_compose::flatten(doc(&s));
+    assert_eq!(s.execute("file.scripts.flattenAllLayerEffects", json!({})).unwrap()["flattened"], 1);
+    let after = photocraft_compose::flatten(doc(&s));
+    for (i, (a, b)) in after.px.iter().zip(&before.px).enumerate() {
+        for k in 0..4 {
+            assert!((a[k] - b[k]).abs() < 0.02, "depth {depth}: pixel ({}, {}) changed: {b:?} -> {a:?}", i % 40, i / 40);
+        }
+    }
+}
+
+/// A Drop Shadow that uses Global Light is baked at the document's angle, not the default 120°.
+#[test]
+fn flatten_all_layer_effects_uses_the_documents_global_light() {
+    for depth in [8, 16, 32] {
+        let shadow = photocraft_doc::Effect::DropShadow(photocraft_doc::effects::Shadow {
+            common: photocraft_doc::effects::FxCommon::new(photocraft_color::BlendMode::Normal, 1.0),
+            color: photocraft_color::Color::rgb(0.0, 0.0, 1.0),
+            angle: 120.0,
+            use_global_light: true,
+            distance: 10.0,
+            spread: 0.0,
+            size: 0.0,
+            contour: photocraft_doc::effects::Contour::Linear,
+            anti_alias: false,
+            noise: 0.0,
+            knocks_out: true,
+        });
+        assert_flatten_effects_is_a_no_op(depth, |d| d.global_light.angle = 0.0, shadow);
+    }
+}
+
+/// A Pattern Overlay of a document pattern survives the bake instead of vanishing.
+#[test]
+fn flatten_all_layer_effects_keeps_a_pattern_overlay() {
+    for depth in [8, 16, 32] {
+        let mut tile = photocraft_raster::Surface::new(PixelFormat::new(ColorMode::Rgb, photocraft_color::SampleType::U8, true));
+        tile.fill_rect(Rect::new(0, 0, 2, 2), &[0.0, 1.0, 0.0, 1.0]);
+        let pat = photocraft_doc::Pattern::new("green", tile, 2, 2);
+        let overlay = photocraft_doc::Effect::PatternOverlay {
+            common: photocraft_doc::effects::FxCommon::new(photocraft_color::BlendMode::Normal, 1.0),
+            name: pat.name.clone(),
+            id: pat.id.clone(),
+            scale: 1.0,
+            angle: 0.0,
+            link: true,
+            phase: (0.0, 0.0),
+        };
+        assert_flatten_effects_is_a_no_op(depth, |d| d.patterns.push(pat), overlay);
+    }
+}
+
 #[test]
 fn layers_to_files_writes_each_visible_layer() {
     let dir = tmp("layers");
@@ -1033,7 +1213,7 @@ fn reveal_in_finder_reveals_the_documents_saved_path() {
     let path = "/tmp/pics/a.psd";
     s.active_mut().unwrap().path = Some(path.into());
     let r = s.execute("file.revealInFinder", json!({"dryRun": true})).unwrap();
-    let (program, args) = crate::layer_menu_cmds::reveal_command(path);
+    let (program, args) = crate::layer_menu_cmds::reveal_command(path).unwrap();
     assert_eq!(r["program"], json!(program));
     assert_eq!(r["args"], json!(args));
     // The tab menu names a background tab: the active document is not the one revealed.
@@ -1044,6 +1224,110 @@ fn reveal_in_finder_reveals_the_documents_saved_path() {
     assert_eq!(r["program"], json!(program));
     assert_eq!(r["args"], json!(args));
 }
+
+/// "Include All Subfolders" (AUTO-219-5, #3753): Batch and Image Processor take the images in
+/// subfolders too, each result keeping its subfolder under the output folder (so same-named files
+/// don't collide), and skip the output folder when it sits inside the input folder.
+#[test]
+fn batch_include_all_subfolders() {
+    let dir = tmp("batch-subfolders");
+    let input = join(&dir, "in");
+    for sub in ["sub/deeper", "z"] {
+        std::fs::create_dir_all(join(&input, sub)).unwrap();
+    }
+    png(&input, "a.png", 8, 8, "#ff0000");
+    png(&join(&input, "sub"), "b.png", 8, 8, "#00ff00");
+    png(&join(&input, "sub/deeper"), "a.png", 8, 8, "#0000ff");
+    png(&join(&input, "z"), "a.png", 8, 8, "#ffffff");
+    let mut s = Session::new();
+    // Default: the top level only, as before.
+    let out = join(&input, "batch");
+    let r = s.execute("file.automate.batch", json!({"steps": [], "input": input, "output": out, "format": "png"})).unwrap();
+    assert_eq!((r["files"].as_array().unwrap().len(), r["errors"].as_array().unwrap().len()), (1, 0), "{r}");
+    // With subfolders: every image, in folder order, results kept apart by subfolder; the output
+    // folder (inside the input folder, holding last run's a.png) is not an input.
+    let r = s
+        .execute(
+            "file.automate.batch",
+            json!({"steps": [["image.adjustments.invert", {}]], "input": input, "includeSubfolders": true, "output": out, "format": "png"}),
+        )
+        .unwrap();
+    assert!(r["errors"].as_array().unwrap().is_empty(), "{r}");
+    let files: Vec<String> = r["files"].as_array().unwrap().iter().map(|f| f.as_str().unwrap().replace('\\', "/")).collect();
+    let o = out.replace('\\', "/");
+    assert_eq!(files, vec![format!("{o}/a.png"), format!("{o}/sub/b.png"), format!("{o}/sub/deeper/a.png"), format!("{o}/z/a.png")]);
+    let deep = photocraft_io::import("a.png", &std::fs::read(join(&out, "sub/deeper/a.png")).unwrap()).unwrap().document;
+    let px = photocraft_compose::render(&deep, Rect::new(1, 1, 2, 2)).px[0];
+    assert!(px[0] > 0.99 && px[1] > 0.99 && px[2] < 0.01, "blue inverted to yellow: {px:?}");
+    std::fs::remove_dir_all(&out).unwrap();
+    // A naming template applies within each kept subfolder (output outside the input folder).
+    let named = join(&dir, "named");
+    let r = s
+        .execute("file.automate.batch", json!({"steps": [], "input": input, "includeSubfolders": true, "output": named, "format": "png", "naming": "{serial}"}))
+        .unwrap();
+    assert!(r["errors"].as_array().unwrap().is_empty(), "{r}");
+    let files: Vec<String> = r["files"].as_array().unwrap().iter().map(|f| f.as_str().unwrap().replace('\\', "/")).collect();
+    let n = named.replace('\\', "/");
+    assert_eq!(files, vec![format!("{n}/001.png"), format!("{n}/sub/002.png"), format!("{n}/sub/deeper/003.png"), format!("{n}/z/004.png")]);
+    // Image Processor shares the option (with its results out of the input folder).
+    let out = join(&dir, "jpg");
+    let r = s.execute("file.scripts.imageProcessor", json!({"input": input, "includeSubfolders": true, "output": out})).unwrap();
+    assert_eq!((r["files"].as_array().unwrap().len(), r["errors"].as_array().unwrap().len()), (4, 0), "{r}");
+    assert!(std::path::Path::new(&join(&out, "sub/deeper/a.jpg")).is_file());
+    // A wrong type is a parameter error, for both.
+    for bad in [json!("yes"), json!(1), json!([true])] {
+        for cmd in ["file.automate.batch", "file.scripts.imageProcessor"] {
+            let e = s.execute(cmd, json!({"steps": [], "input": input, "includeSubfolders": bad, "output": out})).unwrap_err();
+            assert!(matches!(e, EngineError::BadParams { .. }), "{cmd} {bad}: {e}");
+        }
+    }
+    // A missing input folder is an error, not a panic.
+    assert!(s.execute("file.automate.batch", json!({"steps": [], "input": join(&dir, "nope"), "includeSubfolders": true, "output": out})).is_err());
+}
+
+/// The subfolder walk stops at `MAX_SUBFOLDER_DEPTH` levels.
+#[test]
+fn batch_subfolder_walk_is_depth_limited() {
+    let dir = tmp("batch-subfolder-depth");
+    let mut deep = dir.clone();
+    for level in 1..=MAX_SUBFOLDER_DEPTH + 1 {
+        deep = join(&deep, "d");
+        std::fs::create_dir_all(&deep).unwrap();
+        if level >= MAX_SUBFOLDER_DEPTH {
+            std::fs::write(join(&deep, &format!("l{level}.png")), b"x").unwrap();
+        }
+    }
+    let found = list_images_tree(&dir, "", "test").unwrap();
+    let names: Vec<_> = found.iter().map(|i| file_name(&i.path)).collect();
+    assert_eq!(names, vec![format!("l{MAX_SUBFOLDER_DEPTH}.png")], "{found:?}");
+    assert_eq!(found[0].rel_dir.split('/').count(), MAX_SUBFOLDER_DEPTH);
+}
+
+/// A symlink back up the tree is walked once, not forever. Skipped where the platform doesn't
+/// let the test create directory symlinks (Windows without developer mode).
+#[test]
+fn batch_subfolder_walk_survives_symlink_loops() {
+    let dir = tmp("batch-subfolder-loop");
+    let sub = join(&dir, "sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::write(join(&dir, "a.png"), b"x").unwrap();
+    std::fs::write(join(&sub, "b.png"), b"x").unwrap();
+    let link = std::path::Path::new(&sub).join("loop");
+    #[cfg(unix)]
+    let made = std::os::unix::fs::symlink(&dir, &link);
+    #[cfg(windows)]
+    let made = std::os::windows::fs::symlink_dir(&dir, &link);
+    #[cfg(not(any(unix, windows)))]
+    let made: std::io::Result<()> = Err(std::io::Error::other("no symlinks"));
+    if made.is_err() {
+        eprintln!("skipped: cannot create a directory symlink here");
+        return;
+    }
+    let found = list_images_tree(&dir, "", "test").unwrap();
+    let names: Vec<_> = found.iter().map(|i| (i.rel_dir.as_str(), file_name(&i.path))).collect();
+    assert_eq!(names, vec![("", "a.png".to_string()), ("sub", "b.png".to_string())]);
+}
+
 #[test]
 fn batch_naming_validates_the_whole_plan_before_writing() {
     let dir = tmp("naming-invalid");

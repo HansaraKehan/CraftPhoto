@@ -258,9 +258,23 @@ fn props(node: roxmltree::Node<'_, '_>, layer: &mut Layer, index: usize, warning
     Ok(())
 }
 
+/// OpenRaster 0.0.6 defaults to isolated groups and makes `auto` explicitly pass-through.
+/// Older files used inference from the group's blend mode; keep that behavior when the
+/// version is absent or unrecognized, too. Compare the numeric core, not version strings.
+fn uses_explicit_group_isolation(version: Option<&str>) -> bool {
+    let Some(core) = version.and_then(|v| v.trim().split(['-', '+']).next()) else { return false };
+    let mut parts = core.split('.');
+    let number = |part: Option<&str>| part.and_then(|s| s.parse::<u32>().ok());
+    match (number(parts.next()), number(parts.next()), number(parts.next()), parts.next()) {
+        (Some(major), Some(minor), Some(patch), None) => [major, minor, patch] >= [0, 0, 6],
+        _ => false,
+    }
+}
+
 struct Reader<'a, 'c> {
     zip: ZipReader<'a>,
     ctl: &'c Interrupt<'c>,
+    explicit_group_isolation: bool,
     nodes: usize,
     budget: usize,
     warnings: Warnings,
@@ -325,10 +339,15 @@ impl Reader<'_, '_> {
                 "stack" => {
                     let mut layer = Layer::group("", Vec::new());
                     props(child, &mut layer, index, &mut self.warnings)?;
-                    // `auto` (the default) isolates only when something needs it: an
-                    // OpenRaster group without its own blend mode is a pass-through group.
-                    let isolate = child.attribute("isolation").map(str::trim) == Some("isolate");
-                    if !isolate && layer.blend == BlendMode::Normal {
+                    let isolation = child.attribute("isolation").map(str::trim);
+                    let pass_through = if self.explicit_group_isolation {
+                        // Since 0.0.6 only explicit `auto` passes through, ignoring the
+                        // group's composite-op. An omitted isolation means `isolate`.
+                        isolation == Some("auto")
+                    } else {
+                        isolation != Some("isolate") && layer.blend == BlendMode::Normal
+                    };
+                    if pass_through {
                         layer.blend = BlendMode::PassThrough;
                     }
                     let children = self.stack(child, depth + 1)?;
@@ -415,7 +434,15 @@ pub(crate) fn import(name: &str, bytes: &[u8], ctl: &Interrupt<'_>) -> Result<Im
         return Err(invalid("the canvas exceeds the 1 GiB pixel limit"));
     }
     let root = image.children().find(|n| n.has_tag_name("stack")).ok_or_else(|| invalid("stack.xml has no root <stack>"))?;
-    let mut reader = Reader { zip, ctl, nodes: 0, budget: MAX_PIXEL_BYTES, warnings: Warnings::default(), images: Vec::new() };
+    let mut reader = Reader {
+        zip,
+        ctl,
+        explicit_group_isolation: uses_explicit_group_isolation(image.attribute("version")),
+        nodes: 0,
+        budget: MAX_PIXEL_BYTES,
+        warnings: Warnings::default(),
+        images: Vec::new(),
+    };
     let nodes = reader.stack(root, 1)?;
     ctl.progress(0.8);
     let depth = document_depth(&reader.images);
@@ -538,6 +565,15 @@ impl Writer<'_> {
         attrs.push_str(&format!(" composite-op=\"{op}\""));
         if layer.locks.all || layer.locks.pixels {
             attrs.push_str(" edit-locked=\"true\"");
+        }
+        // OpenRaster's one edit lock reopens as Lock All; it has no position lock (#7018).
+        if layer.locks.pixels && !layer.locks.all {
+            self.warnings.layer(&layer.name, "Lock Image Pixels was saved as OpenRaster's edit lock; it reopens as Lock All");
+        }
+        // The Background's position lock is part of being the Background, not one the user set:
+        // every new document has it, and OpenRaster has no Background to keep it on.
+        if layer.locks.position && !layer.locks.all && !self.doc.is_background(layer.id) {
+            self.warnings.layer(&layer.name, "Lock Position is not saved to OpenRaster");
         }
         if layer.locks.transparency {
             attrs.push_str(" alpha-preserve=\"true\"");

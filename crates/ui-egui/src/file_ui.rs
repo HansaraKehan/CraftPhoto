@@ -55,8 +55,10 @@ fn form(app: &mut PhotocraftApp, command: &str, label: &str, fields: Value, choi
     json!({"dialog": app.ui.open_dialog(DialogKind::Command, f)})
 }
 
-/// File › Scripts › Browse… lists these script files (plus the JSON/text the engine parses).
-const SCRIPT_EXTENSIONS: &[&str] = &["psjs", "ccjs", "jsx", "js", "jsxbin", "json", "txt"];
+/// File › Scripts › Browse… lists Photoshop's script types (matching its filter, #2452) plus the
+/// JSON/text/droplet files the engine parses; selecting a Photoshop script gets the engine's
+/// "not Photoshop ExtendScript" error instead of hiding those files from the picker.
+const SCRIPT_EXTENSIONS: &[&str] = &["psjs", "ccjs", "jsx", "js", "jsxbin", "json", "txt", "pcdroplet"];
 
 /// Menu items fronted here (dialogs before the engine command). `None` when not ours.
 pub fn invoke(app: &mut PhotocraftApp, ctx: &egui::Context, id: &str, params: &Value) -> Option<Result<Value, String>> {
@@ -74,7 +76,7 @@ pub fn invoke(app: &mut PhotocraftApp, ctx: &egui::Context, id: &str, params: &V
             app.session.active()?;
             json!({"dialog": open_print(app)})
         }
-        "file.printOneCopy" if app.session.file_menu.last_print.is_none() => {
+        "file.printOneCopy" if photocraft_engine::print_cmds::last_print(&app.session).is_none() => {
             app.session.active()?;
             json!({"dialog": open_print(app)})
         }
@@ -104,7 +106,7 @@ pub fn invoke(app: &mut PhotocraftApp, ctx: &egui::Context, id: &str, params: &V
         "file.scripts.statistics" => json!({"dialog": crate::stack_dialog::open_statistics(app)}),
         "file.scripts.browse" => {
             return Some(app.pick_file_bytes_filtered(SCRIPT_EXTENSIONS, |app, name, bytes| {
-                let r = app.run("file.scripts.browse", json!({"script": String::from_utf8_lossy(&bytes)}));
+                let r = app.run("file.scripts.browse", json!({"name": name, "script": String::from_utf8_lossy(&bytes)}));
                 if r.is_ok() {
                     let template = "Ran script {name}";
                     app.ui.status = crate::i18n::fmt(tl!(template), &[("name", &name)]);
@@ -166,11 +168,12 @@ pub fn ok_label(f: &Map<String, Value>) -> Option<&'static str> {
     }
 }
 
-pub fn body(app: &mut PhotocraftApp, ui: &mut egui::Ui, f: &mut Map<String, Value>) {
+/// The body of Save for Web or Print (dialog `id`).
+pub fn body(app: &mut PhotocraftApp, ui: &mut egui::Ui, f: &mut Map<String, Value>, id: u64) {
     if f.contains_key("__web") {
         web_body(app, ui, f);
     } else {
-        print_body(app, ui, f);
+        print_body(app, ui, f, id);
     }
 }
 
@@ -727,7 +730,8 @@ pub fn open_print(app: &mut PhotocraftApp) -> u64 {
     // Asked once per opening: the Printer menu lists what the spooler knows now.
     let printers = app.session.execute("file.printers", json!({})).unwrap_or_default();
     f.insert("__systemPrinters".into(), printers["printers"].clone());
-    if let Some(Value::Object(m)) = app.session.file_menu.last_print.clone() {
+    // The settings of the last print, also from an earlier session (#7410).
+    if let Some(Value::Object(m)) = photocraft_engine::print_cmds::last_print(&app.session) {
         f.extend(m);
     }
     for (k, v) in [
@@ -766,6 +770,44 @@ pub fn open_print(app: &mut PhotocraftApp) -> u64 {
         }
     }
     app.ui.open_dialog(DialogKind::Command, f)
+}
+
+/// Whether the driver's paper, as `driver_page` took it, is wider than tall: the Orientation
+/// buttons show landscape then.
+fn driver_paper_is_wide(f: &Map<String, Value>) -> bool {
+    let side = |i: usize| f.get("paper").and_then(Value::as_array).and_then(|a| a.get(i)).and_then(Value::as_f64);
+    matches!((side(0), side(1)), (Some(w), Some(h)) if w > h)
+}
+
+/// The Orientation buttons: the driver settings (or the printer's own) turned portrait or
+/// landscape through `file.print.page`. An error stays on the dialog, with the settings left as
+/// they were.
+fn turn_driver(app: &mut PhotocraftApp, f: &mut Map<String, Value>, landscape: bool) {
+    let mut q = json!({"printer": s(f, "printer", ""), "orientation": if landscape { "landscape" } else { "portrait" }});
+    if let (Some(h), Some(o)) = (f.get("printerSettings").cloned(), q.as_object_mut()) {
+        o.insert("printerSettings".into(), h);
+    }
+    match app.session.execute("file.print.page", q) {
+        Ok(r) => take_turned_page(f, &r),
+        Err(e) => {
+            f.insert("__pageError".into(), json!(e.to_string()));
+        }
+    }
+}
+
+/// The turned settings and the paper they give, both from the one `file.print.page` answer, as
+/// `driver_page` takes a page: asking the driver again could fail and leave new settings with the
+/// old paper. An answer without both leaves the dialog as it was, with the reason shown.
+fn take_turned_page(f: &mut Map<String, Value>, r: &Value) {
+    let paper = r.get("paper").and_then(Value::as_array).and_then(|a| Some((a.first()?.as_f64()?, a.get(1)?.as_f64()?)));
+    let (Some(settings), Some((w, h))) = (r.get("printerSettings").and_then(Value::as_str), paper) else {
+        f.insert("__pageError".into(), json!("the printer did not report the turned page"));
+        return;
+    };
+    f.insert("printerSettings".into(), json!(settings));
+    f.insert("paper".into(), json!([w, h]));
+    f.insert("orientation".into(), json!("portrait"));
+    f.remove("__pageError");
 }
 
 /// Takes the paper from the printer's driver settings (Windows), as Photoshop does.
@@ -862,7 +904,22 @@ fn print_paper_controls(ui: &mut egui::Ui, f: &mut Map<String, Value>) {
     }
 }
 
-fn print_body(app: &mut PhotocraftApp, ui: &mut egui::Ui, f: &mut Map<String, Value>) {
+/// Save as PDF › Browse…: where to write the PDF, into Print dialog `id` once the file dialog
+/// answers. Without it the only way to save a PDF was to type a full path (#5328).
+fn browse_pdf(app: &mut PhotocraftApp, id: u64, suggested: &str) {
+    let r = app.pick_save(suggested, move |app, path| {
+        let d = app.ui.dialog_mut(id).ok_or("the dialog was closed")?;
+        d.fields.insert("output".into(), json!(path));
+        Ok(Value::Null)
+    });
+    if let Err(e) = r
+        && e != crate::file_dialog::CANCELLED
+    {
+        app.ui.status = e;
+    }
+}
+
+fn print_body(app: &mut PhotocraftApp, ui: &mut egui::Ui, f: &mut Map<String, Value>, id: u64) {
     let t = Tokens::get(ui.ctx());
     let Some(doc) = app.session.active().map(|d| d.doc.clone()) else { return };
     // PDF exports and previews retain editable paper on Windows too. Only a real native
@@ -882,6 +939,7 @@ fn print_body(app: &mut PhotocraftApp, ui: &mut egui::Ui, f: &mut Map<String, Va
         f.remove("__driverPageInitialized");
     }
     let p = params(f);
+    let mut browse = false;
     ui.horizontal_top(|ui| {
         // Page preview.
         ui.vertical(|ui| {
@@ -983,6 +1041,17 @@ fn print_body(app: &mut PhotocraftApp, ui: &mut egui::Ui, f: &mut Map<String, Va
                             Err(e) => {
                                 f.insert("__pageError".into(), json!(e.to_string()));
                             }
+                        }
+                    }
+                });
+                // Photoshop's Layout: Portrait / Landscape turn the driver settings, so the paper
+                // and the preview turn with them without opening Print Settings….
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(tl!("Orientation")).color(t.text_dim));
+                    let wide = driver_paper_is_wide(f);
+                    for (landscape, label) in [(false, "Portrait"), (true, "Landscape")] {
+                        if crate::widgets::pill_tab(ui, label, wide == landscape).clicked() && wide != landscape {
+                            turn_driver(app, f, landscape);
                         }
                     }
                 });
@@ -1131,12 +1200,20 @@ fn print_body(app: &mut PhotocraftApp, ui: &mut egui::Ui, f: &mut Map<String, Va
                 ui.label(egui::RichText::new(tl!("Don't also tick Mirror Image in Print Settings…: the two flips cancel out.")).color(t.text_dim).size(11.0));
             }
             head(ui, tl!("Save as PDF"));
-            let mut out = s(f, "output", "");
-            if ui.add(egui::TextEdit::singleline(&mut out).hint_text(tl!("(print to the printer)")).desired_width(300.0)).changed() {
-                f.insert("output".into(), json!(out));
-            }
+            ui.horizontal(|ui| {
+                let mut out = s(f, "output", "");
+                if ui.add(egui::TextEdit::singleline(&mut out).hint_text(tl!("(print to the printer)")).desired_width(240.0)).changed() {
+                    f.insert("output".into(), json!(out));
+                }
+                browse = ui.button(tl!("Browse…")).clicked();
+            });
         });
     });
+    if browse {
+        let current = s(f, "output", "");
+        let suggested = if current.is_empty() { std::path::Path::new(&doc.name).with_extension("pdf").to_string_lossy().into_owned() } else { current };
+        browse_pdf(app, id, &suggested);
+    }
 }
 
 fn print_confirm(app: &mut PhotocraftApp, f: &Map<String, Value>) -> Result<Value, String> {
@@ -1450,6 +1527,45 @@ mod tests {
         assert!(params(f).get("__printers").is_none());
     }
 
+    /// #7410: File › Print opens with the settings of the last print, also those remembered from
+    /// an earlier session (the preferences), before anything was printed in this one.
+    #[test]
+    fn print_dialog_opens_with_the_settings_remembered_from_an_earlier_session() {
+        let (mut app, _) = app();
+        app.session.prefs.edit(|p| {
+            p.dialogs.insert(
+                photocraft_engine::print_cmds::REMEMBERED.into(),
+                json!({"paper": "a5", "scale": 50, "orientation": "landscape", "intent": "perceptual"}),
+            );
+        });
+        let id = open_print(&mut app);
+        let f = &app.ui.dialog_mut(id).unwrap().fields;
+        assert_eq!((&f["paper"], &f["scale"], &f["orientation"], &f["intent"]), (&json!("a5"), &json!(50), &json!("landscape"), &json!("perceptual")));
+        assert_eq!(f["copies"], 1, "what wasn't remembered keeps its default");
+    }
+
+    /// #5328: Save as PDF has Browse…, which fills the field from a Save dialog (suggesting the
+    /// document's name as a PDF) rather than needing a typed path.
+    #[test]
+    fn save_as_pdf_browse_fills_the_output_from_a_save_dialog() {
+        use crate::file_dialog::{FileDialogAnswer, FileDialogRequest};
+        use egui_kittest::{Harness, kittest::Queryable};
+        let out = std::env::temp_dir().join(format!("pc-printui-browse-{}", std::process::id())).to_string_lossy().into_owned();
+        let (show, asked) = crate::file_dialog::fake(vec![Some(FileDialogAnswer::SaveTo(out.clone()))]);
+        let mut h = Harness::builder().with_size(egui::vec2(1440.0, 900.0)).with_max_steps(64).build_eframe(move |cc| {
+            PhotocraftApp::setup_context(&cc.egui_ctx, Default::default());
+            PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services { file_dialog: Some(show), ..Default::default() })
+        });
+        h.state_mut().run("file.new", json!({"width": 120, "height": 80, "name": "poster"})).unwrap();
+        let id = open_print(h.state_mut());
+        h.run_steps(3);
+        h.get_by_label("Browse…").click();
+        h.run_steps(4);
+        assert!(matches!(asked.borrow().as_slice(), [FileDialogRequest::Save { suggested }] if suggested.ends_with("poster.pdf")), "{:?}", asked.borrow());
+        // A name chosen without an extension gets the suggested one.
+        assert_eq!(h.state_mut().ui.dialog_mut(id).unwrap().fields["output"], json!(format!("{out}.pdf")));
+    }
+
     #[test]
     fn print_dialog_does_not_inherit_scripted_send_override() {
         for send in [false, true] {
@@ -1461,6 +1577,65 @@ mod tests {
             let id = r["dialog"].as_u64().unwrap();
             assert!(app.ui.dialog_mut(id).unwrap().fields.get("send").is_none());
             std::fs::remove_file(out).unwrap();
+        }
+    }
+
+    /// The Orientation buttons show the driver paper's shape: landscape when it is wider than tall.
+    #[test]
+    fn orientation_follows_the_driver_paper() {
+        let with = |paper: Value| {
+            let mut f = Map::new();
+            f.insert("paper".into(), paper);
+            f
+        };
+        assert!(driver_paper_is_wide(&with(json!([1191.14, 842.29]))));
+        assert!(!driver_paper_is_wide(&with(json!([842.29, 1191.14]))));
+        assert!(!driver_paper_is_wide(&with(json!("a3"))), "a named paper is not a driver page");
+        assert!(!driver_paper_is_wide(&Map::new()));
+    }
+
+    /// Turning a printer whose driver can't be asked keeps its settings and says why on the dialog.
+    #[test]
+    fn turning_without_a_driver_keeps_the_settings_and_shows_the_error() {
+        // Valid driver settings (a minimal DEVMODEW: 220 bytes, no private part), so the command
+        // gets past reading them and fails where it asks the (missing) printer for its page.
+        let mut dm = vec![0u8; 220];
+        dm[68..70].copy_from_slice(&220u16.to_le_bytes());
+        let hex: String = dm.iter().map(|b| format!("{b:02x}")).collect();
+        assert!(craft_print::rgb::DevMode::from_hex(&hex).is_ok());
+        let (mut app, _) = app();
+        let mut f = Map::new();
+        f.insert("printer".into(), json!("photocraft-no-such-printer"));
+        f.insert("printerSettings".into(), json!(hex));
+        f.insert("paper".into(), json!([595.28, 841.89]));
+        turn_driver(&mut app, &mut f, true);
+        assert_eq!(f.get("printerSettings"), Some(&json!(hex)));
+        assert_eq!(f.get("paper"), Some(&json!([595.28, 841.89])));
+        let error = f.get("__pageError").and_then(Value::as_str).unwrap_or_default();
+        // Reading bad settings fails with "printer settings are too short / damaged"; this must not.
+        assert!(!error.is_empty() && !error.contains("printer settings are"), "failed at the printer, not at reading the settings: {error}");
+    }
+
+    /// A turn takes the settings and the paper from the same answer, never one without the other.
+    #[test]
+    fn a_turn_takes_settings_and_paper_together() {
+        let fields = || {
+            let mut f = Map::new();
+            f.insert("printerSettings".into(), json!("old"));
+            f.insert("paper".into(), json!([595.28, 841.89]));
+            f.insert("__pageError".into(), json!("earlier"));
+            f
+        };
+        let mut f = fields();
+        take_turned_page(&mut f, &json!({"printerSettings": "new", "paper": [841.89, 595.28]}));
+        assert_eq!((f.get("printerSettings"), f.get("paper")), (Some(&json!("new")), Some(&json!([841.89, 595.28]))));
+        assert_eq!(f.get("orientation"), Some(&json!("portrait")), "the driver paper is already turned");
+        assert!(f.get("__pageError").is_none());
+        for partial in [json!({"printerSettings": "new"}), json!({"paper": [841.89, 595.28]}), json!({"printerSettings": "new", "paper": [841.89]})] {
+            let mut f = fields();
+            take_turned_page(&mut f, &partial);
+            assert_eq!((f.get("printerSettings"), f.get("paper")), (Some(&json!("old")), Some(&json!([595.28, 841.89]))), "{partial}");
+            assert!(f.get("__pageError").is_some(), "{partial}");
         }
     }
 }
@@ -1654,7 +1829,7 @@ mod web_playback_tests {
                 let doc = web_frame_document(&app.session.active().unwrap().doc, Some(frame)).unwrap();
                 let (proxy, _, _) = web_cmds::web_document(&doc, &json!({"width":16,"height":12}), &settings).unwrap();
                 let pixels = photocraft_compose::flatten(&proxy);
-                let optimized = web_cmds::optimize(&pixels.px, 16, photocraft_geom::Rect::new(0, 0, 16, 12), &settings, None, None, 72.0, true).unwrap();
+                let optimized = web_cmds::optimize(&pixels.px, 16, photocraft_geom::Rect::new(0, 0, 16, 12), &settings, None, None, None, 72.0, true).unwrap();
                 assert_eq!(&optimized.preview[..4], expected, "depth={depth} frame={frame}");
             }
         }

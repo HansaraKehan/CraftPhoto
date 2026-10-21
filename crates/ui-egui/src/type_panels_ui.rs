@@ -443,7 +443,7 @@ fn options_editor(app: &mut PhotocraftApp, ui: &mut egui::Ui, paragraph: bool, s
                 (tl!("Indent Right"), "end_indent_pt", "pt"),
                 (tl!("Space Before"), "space_before_pt", "pt"),
                 (tl!("Space After"), "space_after_pt", "pt"),
-                (tl!("Hyphenate"), "hyphenate", "bool"),
+                // Hyphenate is stored and round-trips to PSD, but layout never hyphenates (#6710).
             ];
             for &(label, key, kind) in rows {
                 let mut on = defined(&para_attrs, key);
@@ -768,7 +768,17 @@ fn spelling_window(app: &mut PhotocraftApp, ctx: &egui::Context) {
         .anchor(Align2::CENTER_CENTER, vec2(0.0, -40.0))
         .show(ctx, |ui| {
             ui.set_width(380.0);
-            ui.label(RichText::new(tl!("Check Spelling")).color(t.text).size(13.0).strong());
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(tl!("Check Spelling")).color(t.text).size(13.0).strong());
+                // The close box (#5496) is Done, as in Photoshop: every change is already made.
+                if crate::dialogs::CLOSE_BOX {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if crate::icons::button(ui, "x", 20.0, false, tl!("Close")).clicked() {
+                            act = Some("done");
+                        }
+                    });
+                }
+            });
             ui.add_space(6.0);
             ui.horizontal_top(|ui| {
                 ui.vertical(|ui| {
@@ -929,5 +939,55 @@ mod tests {
         assert_eq!(d.change_to, "The");
         // Headless calls with an action go to the engine.
         assert!(menu(&mut app, "edit.checkSpelling", &json!({"action": "list"})).is_none());
+    }
+
+    /// #5496: Check Spelling's close box is Done, as in Photoshop on Windows: the window closes
+    /// and the text keeps what it had. None on macOS.
+    #[test]
+    fn check_spellings_close_box_is_done() {
+        use egui_kittest::kittest::Queryable;
+        let mut app = app_with_text("Teh cat");
+        menu(&mut app, "edit.checkSpelling", &json!({})).unwrap().unwrap();
+        let revision = app.session.active().unwrap().revision;
+        // The fonts are set up after the harness's first frame: the window appears after it.
+        let spell = app.ui.type_panels.spell.take();
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1000.0, 700.0)).build_ui_state(|ui, app| windows(app, ui.ctx()), app);
+        PhotocraftApp::setup_context(&h.ctx, crate::theme::ThemeKind::ALL[0]);
+        h.state_mut().ui.type_panels.spell = spell;
+        h.run_steps(3);
+        if !crate::dialogs::CLOSE_BOX {
+            assert_eq!(h.query_all_by_label("Close").count(), 0, "no close box on macOS");
+            return;
+        }
+        let x = h.get_by_label("Close").rect();
+        let done = h.get_by_label("Done").rect();
+        assert!(x.bottom() <= done.top() && x.right() >= done.right(), "the × ends the title row: {x:?} over {done:?}");
+        h.hover_at(x.center());
+        h.drag_at(x.center());
+        h.drop_at(x.center());
+        h.run_steps(2);
+        assert!(h.state().ui.type_panels.spell.is_none(), "the × closed Check Spelling");
+        assert_eq!(h.state().session.active().unwrap().revision, revision, "and changed nothing");
+    }
+
+    #[test]
+    fn hyphenate_is_not_shown_in_paragraph_style_options() {
+        // #6710: layout never hyphenates; the style editor must not advertise it.
+        use egui_kittest::kittest::Queryable;
+        let mut app = app_with_text("Hi");
+        app.ui.type_panels.styles = true;
+        app.ui.type_panels.styles_tab = 1;
+        app.ui.type_panels.options = Some((true, 0));
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1000.0, 700.0)).build_ui_state(
+            |ui, app| {
+                if ui.ctx().fonts(|f| f.families().contains(&egui::FontFamily::Name("medium".into()))) {
+                    windows(app, ui.ctx());
+                }
+            },
+            app,
+        );
+        PhotocraftApp::setup_context(&h.ctx, Default::default());
+        h.run_steps(4);
+        assert!(h.query_by_label("Hyphenate").is_none());
     }
 }

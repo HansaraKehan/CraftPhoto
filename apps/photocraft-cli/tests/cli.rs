@@ -163,19 +163,29 @@ fn info_and_convert_report_decode_warnings() {
         gif.extend_from_slice(b"\x2C\0\0\0\0\x01\0\x01\0\0\x02\x02\x44\x01\0");
     }
     gif.push(0x3B);
+    // A GIF opens in Indexed Color (#7886), so `convert` to PNG also notes the palette PNG it
+    // writes, after the decode warning.
     let cases = [
-        ("whole.jpg", &jpeg[..], None),
-        ("half.jpg", &jpeg[..jpeg.len() / 2], Some("JPEG data ends early (the file is truncated or damaged); part of the image is missing")),
-        ("anim.gif", &gif[..], Some("only the first of 3 frames was imported")),
+        ("whole.jpg", &jpeg[..], None, None),
+        ("half.jpg", &jpeg[..jpeg.len() / 2], Some("JPEG data ends early (the file is truncated or damaged); part of the image is missing"), None),
+        ("anim.gif", &gif[..], Some("only the first of 3 frames was imported"), Some("written as an 8-bit palette PNG (2 colours)")),
     ];
-    for (name, bytes, warning) in cases {
+    for (name, bytes, warning, export) in cases {
         let file = d.join(name);
         std::fs::write(&file, bytes).unwrap();
         let (out, _) = ok(bin().arg("info").arg(&file).arg("--compact"));
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["warnings"], json!(warning.into_iter().collect::<Vec<_>>()), "{name}");
         let (_, err) = ok(bin().arg("convert").arg(&file).arg(d.join(format!("{name}.png"))));
-        assert_eq!(err.trim(), warning.map(|w| format!("warning: {w}")).unwrap_or_default(), "{name}");
+        let expected: Vec<String> = warning.into_iter().chain(export).map(|w| format!("warning: {w}")).collect();
+        assert_eq!(
+            err.trim(),
+            expected.join(
+                "
+"
+            ),
+            "{name}"
+        );
     }
     std::fs::remove_dir_all(d).unwrap();
 }
@@ -491,6 +501,39 @@ fn dpx_converts_both_ways_with_the_bits_asked_for() {
         assert_eq!(o.status.code(), Some(1), "--dpx-bits {bad}");
         assert!(String::from_utf8_lossy(&o.stderr).contains(&format!("bad --dpx-bits `{bad}`: expected 8, 10, 12 or 16")), "--dpx-bits {bad}");
         assert!(!out.exists(), "--dpx-bits {bad} wrote a file");
+    }
+}
+
+/// DDS converts both ways; `--dds-compression` picks the FourCC (bytes 84–87; none writes
+/// uncompressed pixels) and `--dds-mipmaps` the mip count (bytes 28–31). A compression that
+/// isn't none, bc1, bc2 or bc3 is refused and nothing is written (#1327).
+#[test]
+fn dds_converts_both_ways_with_the_compression_asked_for() {
+    let d = tmp("dds");
+    let a = d.join("a.png");
+    write_png(&a, 8, 4, 3);
+    for (args, fourcc, mips) in [
+        (&[][..], [0; 4], 1),
+        (&["--dds-compression", "bc1"][..], *b"DXT1", 1),
+        (&["--dds-compression", "DXT3", "--dds-mipmaps"][..], *b"DXT3", 4),
+        (&["--dds-compression", "bc3"][..], *b"DXT5", 1),
+        (&["--dds-mipmaps"][..], [0; 4], 4),
+    ] {
+        let out = d.join("a.dds");
+        ok(bin().arg("convert").arg(&a).arg(&out).args(args));
+        let bytes = std::fs::read(&out).unwrap();
+        let mip_count = u32::from_le_bytes(bytes[28..32].try_into().unwrap());
+        assert_eq!((&bytes[..4], &bytes[84..88], mip_count), (&b"DDS "[..], &fourcc[..], mips), "{args:?}");
+        let back = d.join("back.png");
+        ok(bin().arg("convert").arg(&out).arg(&back));
+        assert!(back.exists(), "{args:?}");
+    }
+    for bad in ["bc7", "dxt2", ""] {
+        let out = d.join("bad.dds");
+        let o = bin().arg("convert").arg(&a).arg(&out).args(["--dds-compression", bad]).output().unwrap();
+        assert_eq!(o.status.code(), Some(1), "--dds-compression {bad}");
+        assert!(String::from_utf8_lossy(&o.stderr).contains(&format!("bad --dds-compression `{bad}`")), "--dds-compression {bad}");
+        assert!(!out.exists(), "--dds-compression {bad} wrote a file");
     }
 }
 

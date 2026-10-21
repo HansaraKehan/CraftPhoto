@@ -644,13 +644,13 @@ fn mixer_brush(s: &mut Session, p: &Value) -> Result<Value> {
         mix: pct(p, "mix", bm.mix * 100.0),
         flow: pct(p, "flow", bm.flow * 100.0),
         sample_all_layers: flag(p, "sampleAllLayers", bm.sample_all_layers),
+        load_after_stroke: flag(p, "loadAfterStroke", bm.load_after_stroke),
+        clean_after_stroke: flag(p, "cleanAfterStroke", bm.clean_after_stroke),
     };
     let sample_all = m.sample_all_layers;
-    let (clean, load_after) = (flag(p, "cleanAfterStroke", true), flag(p, "loadAfterStroke", true));
+    let paint = color(p.get("color"), s.tools.foreground);
     let mut state = s.tools.mixer.clone();
-    if load_after || state.reservoir.is_none() {
-        state.load(color(p.get("color"), s.tools.foreground));
-    }
+    state.begin_stroke(paint);
     let id = if crate::channel_cmds::is_channel_target(p) { None } else { Some(layer_id(s, p)?) };
     let stroke = Stroke { brush, points: pts };
     let dmg = s.edit("Mixer Brush", |doc, _| {
@@ -672,11 +672,41 @@ fn mixer_brush(s: &mut Session, p: &Value) -> Result<Value> {
         let (surf, lock) = crate::channel_cmds::target_surface(doc, id, p)?;
         Ok(apply_mixer_stroke(surf, sample.as_ref(), &stroke, &m, &mut state, sel.as_ref(), lock))
     })?;
-    if clean {
-        state.clean();
-    }
+    state.end_stroke(paint, m.clean_after_stroke, m.load_after_stroke);
     s.tools.mixer = state;
     Ok(damage_json(s, dmg))
+}
+
+/// `brush.mixer.load`: Load Brush fills the Mixer Brush's reservoir with the color. The next stroke
+/// keeps that paint unless a different foreground is chosen first. Returns the paint the brush now
+/// carries.
+fn mixer_load(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "brush.mixer.load";
+    let paint = match p.get("color").filter(|v| !v.is_null()) {
+        None => Some(s.tools.foreground),
+        Some(Value::String(h)) => crate::commands::parse_hex(h),
+        Some(Value::Array(a)) => {
+            let c: Option<Vec<f32>> = a.iter().map(|x| x.as_f64().filter(|x| (0.0..=1.0).contains(x)).map(|x| x as f32)).collect();
+            match c.as_deref() {
+                Some(&[r, g, b]) => Some([r, g, b, 1.0]),
+                Some(&[r, g, b, a]) => Some([r, g, b, a]),
+                _ => None,
+            }
+        }
+        Some(_) => None,
+    };
+    let paint = paint.ok_or_else(|| bad(cmd, "`color` must be \"#rrggbb\" or [r, g, b, a?] in 0..1"))?;
+    s.tools.mixer.load(paint);
+    s.tools.mixer.color = Some(s.tools.foreground);
+    Ok(serde_json::to_value(&s.tools.mixer).unwrap_or_default())
+}
+
+/// `brush.mixer.clean`: Clean Brush empties the Mixer Brush. The next stroke starts empty unless
+/// a different color is chosen first. Returns the paint the brush now carries.
+fn mixer_clean(s: &mut Session, _: &Value) -> Result<Value> {
+    s.tools.mixer.clean();
+    s.tools.mixer.color = Some(s.tools.foreground);
+    Ok(serde_json::to_value(&s.tools.mixer).unwrap_or_default())
 }
 
 /// `paint.colorReplacement`'s stroke and settings. The replacement colour is the brush colour
@@ -793,13 +823,19 @@ fn presets_delete(s: &mut Session, p: &Value) -> Result<Value> {
     if s.tools.presets.len() == before {
         return Err(bad(cmd, format!("no brush preset named `{name}`")));
     }
-    if s.tools.current_preset.as_ref().is_some_and(|c| c.eq_ignore_ascii_case(&name)) {
+    forget_deleted_preset(s, &name);
+    Ok(json!({ "count": s.tools.presets.len() }))
+}
+
+/// After preset `name` was deleted (here or in Edit › Presets › Preset Manager): the current
+/// brush no longer comes from a preset, and the library is saved.
+pub(crate) fn forget_deleted_preset(s: &mut Session, name: &str) {
+    if s.tools.current_preset.as_ref().is_some_and(|c| c.eq_ignore_ascii_case(name)) {
         s.tools.current_preset = None;
         // The remembered brush names the preset it was picked from: the name went away.
         s.tools.brush_changed();
     }
     s.brush_presets_changed();
-    Ok(json!({ "count": s.tools.presets.len() }))
 }
 
 /// Overwrite an existing preset with the current brush (or the current brush plus a `brush`
@@ -863,9 +899,16 @@ fn define_from_selection(s: &mut Session, p: &Value) -> Result<Value> {
     }
     // Paint amount = darkness × alpha × selection (black = full paint, like Photoshop).
     let (w, h) = (area.width() as usize, area.height() as usize);
-    let mut v = vec![0.0f32; w * h];
+    // The sampled tip is one f32 buffer over the whole selection; a large selection must fail
+    // gracefully instead of aborting the process on allocation, so reserve it fallibly. The
+    // multiply is checked too: on a 32-bit target (wasm32) it can overflow where the rest of
+    // this command is already fallible.
+    let len = w.checked_mul(h).ok_or_else(|| crate::allocation::error("defining a brush from the selection", "requested size overflowed"))?;
+    let mut v = crate::allocation::filled(len, 0.0, "defining a brush from the selection")?;
     let sc = sel.channels();
-    let sv = sel.read_region(area);
+    // The selection mask is a second buffer of the same size; it must fail gracefully too
+    // (review of #5469), so read it through the fallible allocator.
+    let sv = crate::allocation::read_region(sel, area, "defining a brush from the selection")?;
     for y in 0..h {
         for x in 0..w {
             let c = surf.rgba(area.x0 + x as i32, area.y0 + y as i32);
@@ -873,11 +916,24 @@ fn define_from_selection(s: &mut Session, p: &Value) -> Result<Value> {
             v[y * w + x] = ((1.0 - l) * c[3] * sv[(y * w + x) * sc]).clamp(0.0, 1.0);
         }
     }
+    let (brush, tw, th) = sampled_brush(cmd, &v, w, h)?;
+    upsert(s, BrushPreset { name: name.clone(), brush: brush.clone(), builtin: false, group: String::new(), folder: Vec::new(), captures: Default::default() });
+    s.tools.brush = brush;
+    s.tools.current_preset = Some(name.clone());
+    s.tools.brush_changed();
+    Ok(json!({ "name": name, "width": tw, "height": th }))
+}
+
+/// A sampled-tip brush from a paint-amount map (`w`×`h`, row-major, 0 = no paint, 1 = full):
+/// cropped to the painted extent, at most [`MAX_TIP`] px a side. Shared by Define Brush Preset
+/// and importing an image file as a brush (`brush.presets.importImage`).
+pub(crate) fn sampled_brush(cmd: &str, v: &[f32], w: usize, h: usize) -> Result<(BrushSettings, u32, u32)> {
+    let at = |x: usize, y: usize| v.get(y * w + x).copied().unwrap_or(0.0);
     // Crop to the painted extent.
     let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0, 0);
     for y in 0..h {
         for x in 0..w {
-            if v[y * w + x] > 1e-4 {
+            if at(x, y) > 1e-4 {
                 x0 = x0.min(x);
                 y0 = y0.min(y);
                 x1 = x1.max(x + 1);
@@ -886,23 +942,19 @@ fn define_from_selection(s: &mut Session, p: &Value) -> Result<Value> {
         }
     }
     if x1 <= x0 || y1 <= y0 {
-        return Err(bad(cmd, "the selected pixels contain no paint (all white or transparent)"));
+        return Err(bad(cmd, "the pixels contain no paint (all white or transparent)"));
     }
     let (tw, th) = ((x1 - x0) as u32, (y1 - y0) as u32);
     if tw.max(th) > MAX_TIP {
-        return Err(bad(cmd, format!("selection too large for a brush tip ({tw}×{th}; max {MAX_TIP} px)")));
+        return Err(bad(cmd, format!("too large for a brush tip ({tw}×{th}; max {MAX_TIP} px)")));
     }
     let mut data = Vec::with_capacity((tw * th) as usize);
     for y in y0..y1 {
-        data.extend_from_slice(&v[y * w + x0..y * w + x1]);
+        data.extend((x0..x1).map(|x| at(x, y)));
     }
     let tip = GrayTile::from_f32(tw, th, &data);
     let brush = BrushSettings { tip: TipShape::Sampled(tip), size: tw.max(th) as f32, spacing: 0.25, pressure_size: false, ..BrushSettings::default() };
-    upsert(s, BrushPreset { name: name.clone(), brush: brush.clone(), builtin: false, group: String::new(), folder: Vec::new(), captures: Default::default() });
-    s.tools.brush = brush;
-    s.tools.current_preset = Some(name.clone());
-    s.tools.brush_changed();
-    Ok(json!({ "name": name, "width": tw, "height": th }))
+    Ok((brush, tw, th))
 }
 
 pub(crate) fn set_brush(s: &mut Session, p: &Value) -> Result<Value> {
@@ -1113,11 +1165,13 @@ pub fn specs() -> Vec<CommandSpec> {
         spec!(
             "paint.mixerBrush",
             "Mixer Brush",
-            r##"{"points":[…],"brush":{…}?,"preset":name?,"size":0.5..5000 px?,"wet":0..100=brush.mixer.wet,"load":0..100=brush.mixer.load,"mix":0..100=brush.mixer.mix,"flow":0..100=brush.mixer.flow,"color":"#rrggbb"?=foreground,"sampleAllLayers":bool=brush.mixer.sampleAllLayers,"cleanAfterStroke":bool=true,"loadAfterStroke":bool=true,"seed":u64?}"##,
+            r##"{"points":[…],"brush":{…}?,"preset":name?,"size":0.5..5000 px?,"wet":0..100=brush.mixer.wet,"load":0..100=brush.mixer.load,"mix":0..100=brush.mixer.mix,"flow":0..100=brush.mixer.flow,"color":"#rrggbb"?=foreground (a color other than the one recorded by the last stroke, load or clean loads it first; a load or clean records the foreground),"sampleAllLayers":bool=brush.mixer.sampleAllLayers,"cleanAfterStroke":bool=brush.mixer.cleanAfterStroke (empty the brush after the stroke),"loadAfterStroke":bool=brush.mixer.loadAfterStroke (load the brush with `color` after the stroke),"seed":u64?}"##,
             has_paintable,
             mixer_brush,
             true
         ),
+        spec!("brush.mixer.load", "Load Mixer Brush", r##"{"color":"#rrggbb"|[r,g,b,a?] 0..1?=foreground}"##, always, mixer_load, true),
+        spec!("brush.mixer.clean", "Clean Mixer Brush", "{}", always, mixer_clean, true),
         spec!(
             "paint.colorReplacement",
             "Color Replacement",

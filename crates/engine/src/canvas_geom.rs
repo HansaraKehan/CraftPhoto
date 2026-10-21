@@ -55,9 +55,15 @@ fn map_fill(a: &Affine, f: &mut Fill) {
     if let Fill::Gradient { angle, offset, .. } = f {
         *angle = map_angle(a, *angle);
         // The centre offset (a fraction of the frame) turns with the canvas: exact for 90° turns
-        // and flips, where the frame's sides swap with the axes.
+        // and flips, where the frame's sides swap with the axes. Scale (Image Size) resizes the
+        // frame too, so only each axis's direction applies.
+        let unit = |x: f64, y: f64| {
+            let n = x.hypot(y);
+            if n < EPS { (x, y) } else { (x / n, y / n) }
+        };
+        let ((m0, m1), (m2, m3)) = (unit(a.m[0], a.m[1]), unit(a.m[2], a.m[3]));
         let (ox, oy) = (f64::from(offset.0), f64::from(offset.1));
-        *offset = ((a.m[0] * ox + a.m[2] * oy) as f32, (a.m[1] * ox + a.m[3] * oy) as f32);
+        *offset = ((m0 * ox + m2 * oy) as f32, (m1 * ox + m3 * oy) as f32);
     }
 }
 
@@ -150,15 +156,24 @@ pub(crate) fn transform_doc_marks(doc: &mut Document, a: &Affine) {
     if m1.abs() < EPS && m2.abs() < EPS {
         g.horizontal.iter_mut().for_each(|y| *y = m3 * *y + ty);
         g.vertical.iter_mut().for_each(|x| *x = m0 * *x + tx);
+        // Colours are keyed by exact position, so they move by the same expressions.
+        for c in &mut g.colors {
+            c.position = if c.vertical { m0 * c.position + tx } else { m3 * c.position + ty };
+        }
     } else if m0.abs() < EPS && m3.abs() < EPS {
         // A horizontal guide at y becomes a vertical one at x' = m2·y + tx, and vice versa.
         let v: Vec<f64> = g.horizontal.iter().map(|y| m2 * y + tx).collect();
         let h: Vec<f64> = g.vertical.iter().map(|x| m1 * x + ty).collect();
         g.horizontal = h;
         g.vertical = v;
+        for c in &mut g.colors {
+            c.position = if c.vertical { m1 * c.position + ty } else { m2 * c.position + tx };
+            c.vertical = !c.vertical;
+        }
     } else {
         g.horizontal.clear();
         g.vertical.clear();
+        g.colors.clear();
     }
 }
 
@@ -238,7 +253,8 @@ impl Turn {
 }
 
 /// Every pixel surface a canvas turn moves: content, rendered caches (type, shape, smart object,
-/// fill), masks (layer, smart filter), alpha channels, Quick Mask and the selection.
+/// fill), stored video frames (current and original), masks (layer, smart filter), alpha
+/// channels, Quick Mask and the selection.
 fn remap_pixels(doc: &mut Document, map: &dyn Fn(i32, i32) -> (i32, i32)) {
     fn rec(layers: &mut [Layer], map: &dyn Fn(i32, i32) -> (i32, i32)) {
         let re = |s: &mut Surface| *s = remap_surface(s, map);
@@ -248,6 +264,10 @@ fn remap_pixels(doc: &mut Document, map: &dyn Fn(i32, i32) -> (i32, i32)) {
             }
             if let Some(fc) = &mut l.fill_cache {
                 re(&mut fc.surface);
+            }
+            // Frames away from the playhead come back on scrubbing; they turn with the canvas (#4956).
+            if let Some(v) = &mut l.video {
+                v.frames.iter_mut().chain(v.original_frames.iter_mut().flatten()).for_each(re);
             }
             match &mut l.content {
                 LayerContent::Raster(s) => re(s),

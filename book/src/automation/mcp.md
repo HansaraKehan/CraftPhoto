@@ -5,6 +5,9 @@
 - **Headless:** an in-process `Headless` session owns the engine and performs file I/O.
 - **Bridge:** `BridgeClient` forwards tools to a desktop application started with `photocraft --control <port>`.
 
+For a source checkout, first [install the CLI on PATH and register the server](../../../docs/mcp.md#install-and-register).
+The installed binary survives `cargo clean`; a symlink into `target/release` does not.
+
 Start the headless server with:
 
 ```sh

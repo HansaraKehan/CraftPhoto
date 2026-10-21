@@ -1,5 +1,4 @@
-//! Tool options remembered between launches (#2814), as Photoshop keeps each tool's options-bar
-//! settings across sessions.
+//! Selected tool and tool options remembered between launches, as in Photoshop (#2814).
 //!
 //! `Preferences::tool_options` holds the [`ToolOptions`] fields that differ from their defaults,
 //! so a default changed in a later release still reaches users who never touched that option.
@@ -10,7 +9,28 @@
 use serde_json::{Map, Value};
 
 use crate::PhotocraftApp;
-use crate::state::ToolOptions;
+use crate::state::{Tool, ToolOptions};
+
+/// Explicit choices override temporary pen and held-key tools, even when selecting the same tool.
+pub(crate) fn select(app: &mut PhotocraftApp, tool: Tool) {
+    app.stylus.tool_before_eraser = None;
+    app.ui.spring = None;
+    app.ui.tool = tool;
+}
+
+/// Temporary canvas overrides do not change `ui.tool`. Spring-loaded letters and the pen's
+/// eraser end do, so remember the tool they will return to instead. A different explicit choice
+/// (or beginning a type edit) owns the tool and stands, just as in `spring_tools::tick`.
+fn selected(app: &PhotocraftApp) -> Tool {
+    let tool = if app.ui.tool == Tool::Eraser { app.stylus.tool_before_eraser.unwrap_or(app.ui.tool) } else { app.ui.tool };
+    if let Some(s) = &app.ui.spring
+        && tool == s.tool
+        && app.ui.text_edit.is_none()
+    {
+        return s.previous;
+    }
+    tool
+}
 
 /// The options that differ from the defaults, as JSON (`Null` when none do).
 fn changed(o: &ToolOptions) -> Value {
@@ -21,11 +41,24 @@ fn changed(o: &ToolOptions) -> Value {
     if diff.is_empty() { Value::Null } else { Value::Object(diff) }
 }
 
-/// Remember the tool options in the preferences once the user lets go of the pointer. Cheap
-/// when nothing changed: one struct compare per frame. Run every frame, so options set by the
-/// control channel or a tool preset are remembered too.
+/// Remember the selected tool and its options once the user lets go of the pointer. Run every
+/// frame, so choices made through the control channel or a tool preset are remembered too.
 pub fn persist(app: &mut PhotocraftApp, ctx: &egui::Context) {
-    if ctx.input(|i| i.pointer.any_down()) || app.prefs_rt.tool_options.as_ref() == Some(&app.ui.tool_options) {
+    if ctx.input(|i| i.pointer.any_down()) {
+        return;
+    }
+    let tool = selected(app);
+    if app.prefs_rt.selected_tool != Some(tool) {
+        app.prefs_rt.selected_tool = Some(tool);
+        if let Ok(now) = serde_json::to_value(tool)
+            && app.session.prefs().selected_tool != now
+        {
+            app.session.prefs.edit(|p| p.selected_tool = now);
+            // prefs_ui::tick ran before the panels; ensure it can flush this new revision.
+            ctx.request_repaint();
+        }
+    }
+    if app.prefs_rt.tool_options.as_ref() == Some(&app.ui.tool_options) {
         return;
     }
     app.prefs_rt.tool_options = Some(app.ui.tool_options.clone());
@@ -35,8 +68,25 @@ pub fn persist(app: &mut PhotocraftApp, ctx: &egui::Context) {
     }
 }
 
-/// Restore the remembered tool options at launch, field by field over the current ones.
+/// Flush the final choice on normal exit, even if no further frame ran after the tool changed.
+pub(crate) fn save_on_exit(app: &mut PhotocraftApp) -> Result<(), String> {
+    persist(app, &egui::Context::default());
+    crate::prefs_ui::save_preferences(app)
+}
+
+/// Restore the selected tool before the first frame and its options field by field.
 pub fn restore(app: &mut PhotocraftApp) {
+    let saved = app.session.prefs().selected_tool.clone();
+    if !saved.is_null() {
+        match serde_json::from_value::<Tool>(saved) {
+            Ok(tool) => {
+                app.ui.tool = tool;
+                app.ui.remember_group_tool();
+            }
+            Err(err) => log::warn!("Preferences: ignoring the remembered selected tool: {err}"),
+        }
+    }
+    app.prefs_rt.selected_tool = Some(app.ui.tool);
     let saved = app.session.prefs().tool_options.clone();
     if let Some(saved) = saved.as_object()
         && let Ok(Value::Object(mut cur)) = serde_json::to_value(&app.ui.tool_options)

@@ -24,7 +24,7 @@
 
 use photocraft_color::{BlendMode, ColorMode, PixelFormat, SampleType};
 use photocraft_doc::{LayerMask, SmartFilter};
-use photocraft_geom::warp::{Warp, WarpStyle};
+use photocraft_geom::warp::{BezierMesh, Warp, WarpStyle};
 use photocraft_geom::{Affine, Rect as GeomRect};
 use photocraft_psd::Compression;
 use photocraft_psd::Rect as PsdRect;
@@ -289,6 +289,153 @@ fn known_params(class: &str, f: Option<&Descriptor>) -> Option<(&'static str, J)
     Some((k.command, params))
 }
 
+// ---------- Filter Gallery ----------
+//
+// Filter › Filter Gallery stores its effect stack in a `GEfc` filter (filterID `GEfc`). Photoshop
+// writes a single effect inline; Photopea writes a list (also for one effect):
+//
+// ```text
+// Fltr = GEfc { GEfk = GEft enum (the effect), <settings as long> }                          (Photoshop)
+// Fltr = GEfc { GEfs = [ GEfc { <settings as long>, GEfk = GEft enum, GELv = visible } ] }   (Photopea)
+// ```
+//
+// The list is in application order, like `filter.filterGallery`'s `effects`. The item's
+// `FrgC`/`BckC` are the colours the Sketch effects read. Only effects whose settings we know are
+// mapped; a stack with any other effect (or setting) stays an [`UNSUPPORTED_FILTER`].
+
+const GALLERY_CLASS: &str = "GEfc";
+const GALLERY_COMMAND: &str = "filter.filterGallery";
+const GALLERY_NAME: &str = "Filter Gallery...";
+
+/// One gallery effect: our filter key, Photoshop's `GEft` code and its settings (PSD key, our key).
+struct GalleryCode {
+    key: &'static str,
+    code: &'static str,
+    settings: &'static [(&'static str, &'static str)],
+}
+
+const GALLERY_EFFECTS: [GalleryCode; 1] = [GalleryCode { key: "chrome", code: "Chrm", settings: &[("Dtl ", "detail"), ("Smth", "smoothness")] }];
+
+/// An `RGBC` descriptor (0–255 channels) as straight `[r, g, b, a]`, 0–1.
+fn rgbc_colour(d: &Descriptor) -> Option<J> {
+    let c = |k: &str| px(d, k).map(|v| (v / 255.0).clamp(0.0, 1.0));
+    Some(json!([c("Rd  ")?, c("Grn ")?, c("Bl  ")?, 1.0]))
+}
+
+/// `filter.filterGallery` params for a `GEfc` filter item; `None` when an effect or setting is
+/// not modelled.
+fn gallery_params(item: &Descriptor, f: &Descriptor) -> Option<J> {
+    let list: Vec<&Descriptor> = match f.get("GEfs") {
+        Some(Value::List(list)) => list
+            .iter()
+            .map(|v| match v {
+                Value::Descriptor(e) => Some(e),
+                _ => None,
+            })
+            .collect::<Option<_>>()?,
+        Some(_) => return None,
+        None if f.get("GEfk").is_some() => vec![f],
+        None => return None,
+    };
+    let mut effects = Vec::with_capacity(list.len());
+    for e in list {
+        let code = enum_of(e, "GEfk")?;
+        let g = GALLERY_EFFECTS.iter().find(|g| g.code.as_bytes() == code)?;
+        let mut params = Map::new();
+        for (k, v) in &e.items {
+            if k.is("GEfk") || k.is("GELv") {
+                continue;
+            }
+            let (_, ours) = g.settings.iter().find(|(psd, _)| k.is(psd))?;
+            params.insert((*ours).into(), json!(int_value(v)?));
+        }
+        effects.push(json!({"filter": g.key, "params": params, "visible": bool_or(e, "GELv", true)}));
+    }
+    if effects.is_empty() {
+        return None;
+    }
+    let mut out = Map::new();
+    out.insert("effects".into(), J::Array(effects));
+    for (psd, ours) in [("FrgC", "foreground"), ("BckC", "background")] {
+        if let Some(c) = get_desc(item, psd).and_then(rgbc_colour) {
+            out.insert(ours.into(), c);
+        }
+    }
+    Some(J::Object(out))
+}
+
+fn colour_rgb(v: &J) -> Option<[f64; 3]> {
+    match v {
+        J::Array(a) => Some([a.first()?.as_f64()?, a.get(1)?.as_f64()?, a.get(2)?.as_f64()?]),
+        J::String(h) if h.len() == 7 && h.starts_with('#') => {
+            let ch = |j: usize| h.get(j..j + 2).and_then(|s| u8::from_str_radix(s, 16).ok()).map(|v| f64::from(v) / 255.0);
+            Some([ch(1)?, ch(3)?, ch(5)?])
+        }
+        _ => None,
+    }
+}
+
+/// A `[r, g, b(, a)]` (0–1) or `#rrggbb` colour param as an `RGBC` descriptor (0–255).
+fn colour_rgbc(v: Option<&J>, default: f64) -> Result<Value, String> {
+    let Some(v) = v else { return Ok(rgbc(default)) };
+    let rgb = colour_rgb(v).filter(|c| c.iter().all(|v| v.is_finite())).ok_or("a colour is not [r, g, b] or #rrggbb")?;
+    let c = |v: f64| Value::Double(v.clamp(0.0, 1.0) * 255.0);
+    Ok(Value::Descriptor(Descriptor::new("RGBC").with("Rd  ", c(rgb[0])).with("Grn ", c(rgb[1])).with("Bl  ", c(rgb[2]))))
+}
+
+/// The `filterFXList` item for a `filter.filterGallery` smart filter.
+fn gallery_item(f: &SmartFilter) -> Result<Descriptor, String> {
+    let p = &f.params;
+    if let Some(k) = p.as_object().and_then(|o| o.keys().find(|k| !is_meta(k) && !["effects", "foreground", "background"].contains(&k.as_str()))) {
+        return Err(format!("setting `{k}` has no PSD equivalent"));
+    }
+    let list = p.get("effects").and_then(J::as_array).ok_or("it has no effects")?;
+    let mut out = Vec::with_capacity(list.len());
+    for e in list {
+        let key = e.get("filter").and_then(J::as_str).ok_or("an effect has no `filter`")?;
+        let g = GALLERY_EFFECTS.iter().find(|g| g.key == key).ok_or_else(|| format!("gallery effect `{key}` has no PSD equivalent"))?;
+        let params = e.get("params").filter(|v| v.is_object()).unwrap_or(e);
+        if let Some(k) = params.as_object().and_then(|o| {
+            o.keys().find(|k| !is_meta(k) && !["filter", "params", "visible"].contains(&k.as_str()) && !g.settings.iter().any(|(_, ours)| ours == k))
+        }) {
+            return Err(format!("gallery setting `{key}.{k}` has no PSD equivalent"));
+        }
+        let defaults = photocraft_algo::GalleryFilter::from_key(key).map(photocraft_algo::GalleryEffect::new);
+        let settings: Vec<(&str, Value)> =
+            g.settings.iter().map(|(psd, ours)| (*psd, pi(params, ours, defaults.as_ref().map_or(0.0, |x| f64::from(x.get(ours)))))).collect();
+        out.push((g.code, settings, e.get("visible").and_then(J::as_bool).unwrap_or(true)));
+    }
+    let gallery = || {
+        let mut d = Descriptor::new(GALLERY_CLASS);
+        d.name = UnicodeString::new_nul("Filter Gallery");
+        d
+    };
+    // One visible effect: inline, as Photoshop writes it. Otherwise the effect list.
+    let fltr = match out.as_slice() {
+        [] => return Err("it has no effects".into()),
+        [(code, settings, true)] => settings.iter().fold(gallery().with("GEfk", enumv("GEft", code)), |d, (k, v)| d.with(k, v.clone())),
+        _ => {
+            let list = out
+                .into_iter()
+                .map(|(code, settings, visible)| {
+                    let d = settings.into_iter().fold(gallery(), |d, (k, v)| d.with(k, v));
+                    Value::Descriptor(d.with("GEfk", enumv("GEft", code)).with("GELv", Value::Boolean(visible)))
+                })
+                .collect();
+            gallery().with("GEfs", Value::List(list))
+        }
+    };
+    Ok(Descriptor::new("filterFX")
+        .with("Nm  ", Value::Text(UnicodeString::new_nul(GALLERY_NAME)))
+        .with("blendOptions", blend_options(f))
+        .with("enab", Value::Boolean(f.visible))
+        .with("hasoptions", Value::Boolean(true))
+        .with("FrgC", colour_rgbc(p.get("foreground"), 0.0)?)
+        .with("BckC", colour_rgbc(p.get("background"), 255.0)?)
+        .with("Fltr", Value::Descriptor(fltr))
+        .with("filterID", Value::Integer(code(b"GEfc"))))
+}
+
 /// Lowercase hex of `bytes`.
 fn to_hex(bytes: &[u8]) -> String {
     const H: &[u8; 16] = b"0123456789abcdef";
@@ -322,6 +469,7 @@ pub fn filter_from_item(item: &Descriptor) -> SmartFilter {
     let known = match class.as_deref() {
         Some(camera_raw::CLASS) => camera_raw::import_params(item).map(|p| (camera_raw::COMMAND, p)),
         Some(displace::CLASS) => displace::import_params(item).map(|p| (displace::COMMAND, p)),
+        Some(GALLERY_CLASS) => fltr.and_then(|f| gallery_params(item, f)).map(|p| (GALLERY_COMMAND, p)),
         c => c.and_then(|c| known_params(c, fltr)),
     };
     let (command, params) = match known {
@@ -473,6 +621,9 @@ pub fn item_for_filter(f: &SmartFilter) -> Result<Descriptor, String> {
         set(&mut d, "enab", Value::Boolean(f.visible));
         return Ok(d);
     }
+    if f.command == GALLERY_COMMAND {
+        return gallery_item(f);
+    }
     if f.command == UNSUPPORTED_FILTER {
         let raw = f.params.get("psd").and_then(J::as_str).and_then(from_hex).ok_or("its filter data is missing")?;
         let mut d = Descriptor::from_bytes(&raw).map_err(|e| format!("its filter data is unreadable ({e})"))?;
@@ -521,6 +672,16 @@ fn set(d: &mut Descriptor, key: &str, v: Value) {
     }
 }
 
+/// Replaces item `key` in place, or inserts it before item `before` (appends it without one).
+fn set_before(d: &mut Descriptor, key: &str, v: Value, before: &str) {
+    if let Some(e) = d.items.iter_mut().find(|(k, _)| k.is(key)) {
+        e.1 = v;
+        return;
+    }
+    let at = d.items.iter().position(|(k, _)| k.is(before)).unwrap_or(d.items.len());
+    d.items.insert(at, (Id::new(key), v));
+}
+
 /// Everything needed to write the placed-layer blocks of a smart object.
 #[derive(Clone, Debug)]
 pub struct PlacedSpec<'a> {
@@ -540,16 +701,17 @@ pub struct PlacedSpec<'a> {
 }
 
 /// Where the frame corners land (top-left, top-right, bottom-right, bottom-left), as x, y pairs.
-/// The frame is [`crate::blocks::placed_frame`] for an affine placement (the inverse of
-/// `parse_smart`), the source rect for a projective one (as `parse_smart_perspective` reads it).
-fn quad_points(s: &PlacedSpec<'_>) -> [f64; 8] {
+/// The frame is [`crate::blocks::placed_frame`] of `warp`, the warp the block stores, for an
+/// affine placement (the inverse of `parse_smart`), the source rect for a projective one (as
+/// `parse_smart_perspective` reads it).
+fn quad_points(s: &PlacedSpec<'_>, warp: Option<&Warp>) -> [f64; 8] {
     let (w, h) = s.size;
     let [a, b, c, d, e, f] = s.transform.m;
     let map = |x: f64, y: f64| match &s.perspective {
         Some(p) => photocraft_algo::transform::Homography(*p).apply(x, y),
         None => (a * x + c * y + e, b * x + d * y + f),
     };
-    let [x0, y0, x1, y1] = if s.perspective.is_some() { [0.0, 0.0, w, h] } else { crate::blocks::placed_frame(s.warp, w, h) };
+    let [x0, y0, x1, y1] = if s.perspective.is_some() { [0.0, 0.0, w, h] } else { crate::blocks::placed_frame(warp, w, h) };
     let mut out = [0.0; 8];
     for (i, (x, y)) in [(x0, y0), (x1, y0), (x1, y1), (x0, y1)].into_iter().enumerate() {
         (out[2 * i], out[2 * i + 1]) = map(x, y);
@@ -558,15 +720,15 @@ fn quad_points(s: &PlacedSpec<'_>) -> [f64; 8] {
 }
 
 /// The transform quad: the source corners (top-left, top-right, bottom-right, bottom-left).
-fn quad(s: &PlacedSpec<'_>) -> Value {
-    Value::List(quad_points(s).into_iter().map(Value::Double).collect())
+fn quad(s: &PlacedSpec<'_>, warp: Option<&Warp>) -> Value {
+    Value::List(quad_points(s, warp).into_iter().map(Value::Double).collect())
 }
 
 /// Has the placement moved from the quad a template descriptor stores (`Trnf`)?
-fn quad_moved(template: &Descriptor, s: &PlacedSpec<'_>) -> bool {
+fn quad_moved(template: &Descriptor, s: &PlacedSpec<'_>, warp: Option<&Warp>) -> bool {
     let Some(Value::List(pts)) = template.get("Trnf") else { return true };
     let old: Vec<f64> = pts.iter().filter_map(|v| crate::blocks::num(Some(v))).collect();
-    let new = quad_points(s);
+    let new = quad_points(s, warp);
     old.len() != 8 || old.iter().zip(new).any(|(a, b)| (a - b).abs() > 1e-6 * (1.0 + a.abs()))
 }
 
@@ -574,27 +736,33 @@ fn enumv(t: &str, v: &str) -> Value {
     Value::Enumerated { type_id: Id::new(t), value: Id::new(v) }
 }
 
-/// The `warp` descriptor (also the `PlLd` warp). Multi-patch meshes have no 1 × 1 envelope and
-/// are written as no warp, with a message.
-fn warp_desc(w: Option<&Warp>, size: (f64, f64), warnings: &mut Vec<String>) -> Value {
-    let none = Warp::none([0.0, 0.0, size.0, size.1]);
-    let mut w = w.unwrap_or(&none).clone();
-    let mesh = match (&w.style, &w.mesh) {
-        (WarpStyle::Custom, Some(m)) if m.points.len() == 16 => Some(m.clone()),
-        (WarpStyle::Custom, _) => {
-            warnings.push("a custom warp with more than one patch was written to PSD without its warp".into());
-            w = none.clone();
-            None
-        }
-        _ => None,
-    };
+/// The mesh of a split warp: a custom warp of more than one patch, which `SoLd` stores as
+/// `quiltWarp` and `PlLd` can't store.
+fn split_mesh(w: Option<&Warp>) -> Option<&BezierMesh> {
+    w.filter(|w| w.style == WarpStyle::Custom).and_then(|w| w.mesh.as_ref()).filter(|m| m.points.len() != 16 && m.is_valid())
+}
+
+/// The warp `SoLd` stores: none, with a message, for a split warp of more patches along a side
+/// than a `quiltWarp` is read with, so its corners are framed by the source rect as on reopen.
+fn sold_warp<'a>(w: Option<&'a Warp>, warnings: &mut Vec<String>) -> Option<&'a Warp> {
+    let too_big = split_mesh(w).is_some_and(|m| m.us.len().max(m.vs.len()) > crate::blocks::QUILT_MAX_PATCHES + 1);
+    if too_big {
+        warnings.push(format!("a split warp of more than {} patches along a side was written to PSD without its warp", crate::blocks::QUILT_MAX_PATCHES));
+        return None;
+    }
+    w
+}
+
+/// Style, bend, distortions, axis, bounds and order: the keys a `warp` and a `quiltWarp`
+/// descriptor share, in Photoshop's order.
+fn warp_head(class: &str, w: &Warp) -> Descriptor {
     let [x0, y0, x1, y1] = w.bounds;
     let bounds = Descriptor::new("classFloatRect")
         .with("Top ", Value::Double(y0))
         .with("Left", Value::Double(x0))
         .with("Btom", Value::Double(y1))
         .with("Rght", Value::Double(x1));
-    let mut d = Descriptor::new("warp")
+    Descriptor::new(class)
         .with("warpStyle", enumv("warpStyle", w.style.psd_name()))
         .with("warpValue", Value::Double(w.bend))
         .with("warpPerspective", Value::Double(w.h_distort))
@@ -602,17 +770,72 @@ fn warp_desc(w: Option<&Warp>, size: (f64, f64), warnings: &mut Vec<String>) -> 
         .with("warpRotate", enumv("Ornt", if w.vertical { "Vrtc" } else { "Hrzn" }))
         .with("bounds", Value::Descriptor(bounds))
         .with("uOrder", Value::Integer(4))
-        .with("vOrder", Value::Integer(4));
+        .with("vOrder", Value::Integer(4))
+}
+
+/// The control points of a custom warp: an object array of their x and y.
+fn mesh_points(m: &BezierMesh) -> Value {
+    let body = Descriptor::new("rationalPoint")
+        .with("Hrzn", Value::UnitFloats { unit: *b"#Pxl", values: m.points.iter().map(|p| p[0]).collect() })
+        .with("Vrtc", Value::UnitFloats { unit: *b"#Pxl", values: m.points.iter().map(|p| p[1]).collect() });
+    Value::ObjectArray(ObjectArray { prefix: m.points.len() as u32, body })
+}
+
+/// The `warp` descriptor (also the `PlLd` warp). A split warp is written as no warp: `SoLd`
+/// keeps it in `quiltWarp` ([`quilt_desc`]), next to this `warpNone`, as Photoshop does. A
+/// custom warp without a usable mesh is written as no warp, with a message.
+fn warp_desc(w: Option<&Warp>, size: (f64, f64), warnings: &mut Vec<String>) -> Value {
+    let none = Warp::none([0.0, 0.0, size.0, size.1]);
+    let mut w = w.unwrap_or(&none).clone();
+    let mesh = match (&w.style, &w.mesh) {
+        (WarpStyle::Custom, Some(m)) if m.points.len() == 16 => Some(m.clone()),
+        (WarpStyle::Custom, Some(m)) if m.is_valid() => {
+            w = none.clone();
+            None
+        }
+        (WarpStyle::Custom, _) => {
+            warnings.push("a custom warp without a valid mesh was written to PSD without its warp".into());
+            w = none.clone();
+            None
+        }
+        _ => None,
+    };
+    let mut d = warp_head("warp", &w);
     if let Some(m) = mesh {
-        let body = Descriptor::new("rationalPoint")
-            .with("Hrzn", Value::UnitFloats { unit: *b"#Pxl", values: m.points.iter().map(|p| p[0]).collect() })
-            .with("Vrtc", Value::UnitFloats { unit: *b"#Pxl", values: m.points.iter().map(|p| p[1]).collect() });
-        d = d.with(
-            "customEnvelopeWarp",
-            Value::Descriptor(Descriptor::new("customEnvelopeWarp").with("meshPoints", Value::ObjectArray(ObjectArray { prefix: 16, body }))),
-        );
+        d = d.with("customEnvelopeWarp", Value::Descriptor(Descriptor::new("customEnvelopeWarp").with("meshPoints", mesh_points(&m))));
     }
     Value::Descriptor(d)
+}
+
+/// The `quiltWarp` descriptor of a split warp, in Photoshop's layout: `deformNumCols` ×
+/// `deformNumRows` control points, and the patch boundaries (`quiltSliceX` / `quiltSliceY`) at
+/// the knots across the warp's box. The imported `quiltWarp` (`old`) gives its own slices where
+/// they still bound the mesh's patches, so their units and padding stay Photoshop's.
+fn quilt_desc(w: &Warp, mesh: &BezierMesh, old: Option<&Descriptor>) -> Value {
+    let old_env = old.and_then(|q| get_desc(q, "customEnvelopeWarp"));
+    let [x0, y0, x1, y1] = w.bounds;
+    let slices = |key: &str, knots: &[f64], lo: f64, hi: f64| {
+        if let Some(env) = old_env
+            && crate::blocks::quilt_knots(env, key, knots.len() - 1).as_deref() == Some(knots)
+            && let Some(v) = env.get(key)
+        {
+            return v.clone();
+        }
+        let (lo, hi) = if (hi - lo).is_finite() && hi > lo { (lo, hi) } else { (0.0, 1.0) };
+        let values: Vec<f64> = knots.iter().map(|u| lo + u * (hi - lo)).collect();
+        let prefix = values.len() as u32;
+        Value::ObjectArray(ObjectArray { prefix, body: Descriptor::new("UntF").with(key, Value::UnitFloats { unit: *b"#Pxl", values }) })
+    };
+    let envelope = Descriptor::new("customEnvelopeWarp")
+        .with("quiltSliceX", slices("quiltSliceX", &mesh.us, x0, x1))
+        .with("quiltSliceY", slices("quiltSliceY", &mesh.vs, y0, y1))
+        .with("meshPoints", mesh_points(mesh));
+    Value::Descriptor(
+        warp_head("quiltWarp", w)
+            .with("deformNumRows", Value::Integer(mesh.ny() as i32))
+            .with("deformNumCols", Value::Integer(mesh.nx() as i32))
+            .with("customEnvelopeWarp", Value::Descriptor(envelope)),
+    )
 }
 
 fn ratio(n: i32, d: i32) -> Value {
@@ -628,20 +851,36 @@ fn pad4(mut v: Vec<u8>) -> Vec<u8> {
 
 /// `SoLd` block data. With `template` (the imported descriptor) every key it has is kept and only
 /// the placed id (for a duplicate), transform (when it moved), warp and filter stack are rewritten;
-/// otherwise a fresh descriptor in Photoshop's key order.
+/// otherwise a fresh descriptor in Photoshop's key order. A split warp goes in `quiltWarp`.
 pub fn sold_bytes(template: Option<&Descriptor>, s: &PlacedSpec<'_>, warnings: &mut Vec<String>) -> Vec<u8> {
-    let warp = warp_desc(s.warp, s.size, warnings);
+    let stored = sold_warp(s.warp, warnings);
+    let warp = warp_desc(stored, s.size, warnings);
+    let split = stored.zip(split_mesh(stored));
     let d = match template {
         Some(t) => {
             let mut d = t.clone();
             if text_of(t, "placed").as_deref() != Some(s.placed) {
                 set(&mut d, "placed", Value::Text(UnicodeString::new_nul(s.placed)));
             }
-            if quad_moved(t, s) {
-                set(&mut d, "Trnf", quad(s));
-                set(&mut d, "nonAffineTransform", quad(s));
+            if quad_moved(t, s, stored) {
+                set(&mut d, "Trnf", quad(s, stored));
+                set(&mut d, "nonAffineTransform", quad(s, stored));
             }
             set(&mut d, "warp", warp);
+            // `quiltWarp` is read before `warp`, so the imported one stays only while it still
+            // says what the layer's warp is (unchanged, or unreadable while the layer has none);
+            // otherwise it is rewritten, or dropped for a warp that isn't split.
+            let old = get_desc(t, "quiltWarp");
+            let kept = old.is_some_and(|q| match crate::blocks::warp_of(q) {
+                Some(w) => w.as_ref() == stored,
+                None => s.warp.is_none(),
+            });
+            if !kept {
+                match split {
+                    Some((w, m)) => set_before(&mut d, "quiltWarp", quilt_desc(w, m, old), "warp"),
+                    None => d.items.retain(|(k, _)| !k.is("quiltWarp")),
+                }
+            }
             match &s.filter_fx {
                 Some(fx) => set(&mut d, "filterFX", Value::Descriptor(fx.clone())),
                 None => d.items.retain(|(k, _)| !k.is("filterFX")),
@@ -660,8 +899,12 @@ pub fn sold_bytes(template: Option<&Descriptor>, s: &PlacedSpec<'_>, warnings: &
                 .with("frameCount", Value::Integer(1))
                 .with("Annt", Value::Integer(16))
                 .with("Type", Value::Integer(2))
-                .with("Trnf", quad(s))
-                .with("nonAffineTransform", quad(s))
+                .with("Trnf", quad(s, stored))
+                .with("nonAffineTransform", quad(s, stored));
+            if let Some((w, m)) = split {
+                d = d.with("quiltWarp", quilt_desc(w, m, None));
+            }
+            let mut d = d
                 .with("warp", warp)
                 .with("Sz  ", Value::Descriptor(Descriptor::new("Pnt ").with("Wdth", Value::Double(s.size.0)).with("Hght", Value::Double(s.size.1))))
                 .with("Rslt", unit(b"#Rsl", s.dpi));
@@ -679,8 +922,9 @@ pub fn sold_bytes(template: Option<&Descriptor>, s: &PlacedSpec<'_>, warnings: &
 }
 
 /// `PlLd` block data (`plcL` version 3): the legacy placed-layer record Photoshop writes next to
-/// `SoLd`.
+/// `SoLd`. It has no split warp: it stores none, its corners framed by the source rect.
 pub fn plld_bytes(s: &PlacedSpec<'_>, warnings: &mut Vec<String>) -> Vec<u8> {
+    let warp = s.warp.filter(|_| split_mesh(s.warp).is_none());
     let mut out = b"plcL".to_vec();
     out.extend_from_slice(&3u32.to_be_bytes());
     let id = s.idnt.as_bytes();
@@ -690,7 +934,7 @@ pub fn plld_bytes(s: &PlacedSpec<'_>, warnings: &mut Vec<String>) -> Vec<u8> {
     for v in [1i32, 1, 16, 2] {
         out.extend_from_slice(&v.to_be_bytes());
     }
-    if let Value::List(q) = quad(s) {
+    if let Value::List(q) = quad(s, warp) {
         for v in q {
             if let Value::Double(x) = v {
                 out.extend_from_slice(&x.to_be_bytes());
@@ -698,7 +942,7 @@ pub fn plld_bytes(s: &PlacedSpec<'_>, warnings: &mut Vec<String>) -> Vec<u8> {
         }
     }
     out.extend_from_slice(&0u32.to_be_bytes());
-    let Value::Descriptor(w) = warp_desc(s.warp, s.size, warnings) else { return pad4(out) };
+    let Value::Descriptor(w) = warp_desc(warp, s.size, warnings) else { return pad4(out) };
     out.extend(VersionedDescriptor::new(w).to_bytes());
     pad4(out)
 }
@@ -733,6 +977,45 @@ pub fn mask_from_item(item: &FilterEffectsItem, sample: SampleType, stack: &Filt
         return Ok(None);
     }
     Ok(Some(LayerMask { surface, enabled: stack.mask_enabled, linked: stack.mask_linked, density: 1.0, feather: 0.0 }))
+}
+
+/// The unfiltered placed pixels of an `FEid` item (the inverse of [`feid_item`]), in `fmt`: colour
+/// channels from slot 0, transparency from the last slot (opaque without it). `None` when the
+/// item has no colour planes, its depth isn't `fmt`'s, or a plane doesn't decode.
+pub fn unfiltered_from_item(item: &FilterEffectsItem, fmt: PixelFormat) -> Option<Surface> {
+    let depth = u16::try_from(item.depth).ok()?;
+    if u32::from(crate::pixels::psd_depth(fmt.sample)) != item.depth || !fmt.alpha {
+        return None;
+    }
+    let (w, h) = item.rect.size().ok()?;
+    let n = w.checked_mul(h)?;
+    let cc = fmt.mode.color_channels();
+    let mut planes = Vec::with_capacity(cc + 1);
+    for slot in (0..cc).chain(std::iter::once(item.slots.len().saturating_sub(1))) {
+        planes.push(match item.slots.get(slot).and_then(Option::as_ref) {
+            Some(p) => Some(p.decode(w, h, depth).ok()?),
+            None if slot < cc => return None,
+            None => None,
+        });
+    }
+    let refs: Vec<Option<&[u8]>> = planes.iter().map(|p| p.as_deref()).collect();
+    let mut fill = vec![crate::pixels::zero_sample(fmt.sample); cc];
+    // Without a transparency plane the pixels are opaque (a native-endian full sample).
+    fill.push(match fmt.sample {
+        SampleType::U8 => vec![u8::MAX],
+        SampleType::U16 => u16::MAX.to_ne_bytes().to_vec(),
+        SampleType::F32 => 1.0f32.to_ne_bytes().to_vec(),
+    });
+    let mut invert = vec![fmt.mode == ColorMode::Cmyk; cc];
+    invert.push(false);
+    let mut bytes = crate::pixels::interleave(&refs, &fill, n, fmt.sample, &invert);
+    if fmt.mode == ColorMode::Lab && fmt.sample == SampleType::U16 {
+        crate::pixels::lab16_chroma(&mut bytes, cc + 1, true);
+    }
+    let mut surface = Surface::new(fmt);
+    surface.write_interleaved(GeomRect::new(item.rect.left, item.rect.top, item.rect.right, item.rect.bottom), &bytes);
+    surface.prune();
+    Some(surface)
 }
 
 /// An `FEid` item for a smart object with filters: the unfiltered placed pixels Photoshop
@@ -913,6 +1196,161 @@ mod tests {
         assert_eq!(filter_from_item(&odd).command, UNSUPPORTED_FILTER);
     }
 
+    /// A Filter Gallery item as Photopea writes it (Chrome, Detail 12, Smoothness 4).
+    fn gallery_item_with(effects: Vec<Descriptor>) -> Descriptor {
+        let rgb =
+            |v: f64| Value::Descriptor(Descriptor::new("RGBC").with("Rd  ", Value::Double(v)).with("Grn ", Value::Double(v)).with("Bl  ", Value::Double(v)));
+        Descriptor::new("filterFX")
+            .with("Nm  ", Value::Text(UnicodeString::new_nul("Filtergalerie")))
+            .with("blendOptions", Value::Descriptor(Descriptor::new("blendOptions").with("Opct", unit(b"#Prc", 100.0)).with("Md  ", enumv("BlnM", "normal"))))
+            .with("enab", Value::Boolean(true))
+            .with("hasoptions", Value::Boolean(true))
+            .with("FrgC", rgb(0.0))
+            .with("BckC", rgb(255.0))
+            .with("Fltr", Value::Descriptor(Descriptor::new("GEfc").with("GEfs", Value::List(effects.into_iter().map(Value::Descriptor).collect()))))
+            .with("filterID", Value::Integer(code(b"GEfc")))
+    }
+
+    fn chrome(detail: i32, smoothness: i32, visible: bool) -> Descriptor {
+        Descriptor::new("GEfc")
+            .with("Dtl ", Value::Integer(detail))
+            .with("Smth", Value::Integer(smoothness))
+            .with("GEfk", enumv("GEft", "Chrm"))
+            .with("GELv", Value::Boolean(visible))
+    }
+
+    #[test]
+    fn filter_gallery_chrome_imports_as_editable_gallery() {
+        let f = filter_from_item(&gallery_item_with(vec![chrome(12, 4, true), chrome(3, 9, false)]));
+        assert_eq!(f.command, "filter.filterGallery");
+        assert_eq!(
+            f.params,
+            json!({
+                "effects": [
+                    {"filter": "chrome", "params": {"detail": 12, "smoothness": 4}, "visible": true},
+                    {"filter": "chrome", "params": {"detail": 3, "smoothness": 9}, "visible": false},
+                ],
+                "foreground": [0.0, 0.0, 0.0, 1.0],
+                "background": [1.0, 1.0, 1.0, 1.0],
+            })
+        );
+        // Written back and read again: unchanged, also when re-blended and hidden.
+        let mut g = f.clone();
+        g.blend = BlendMode::Multiply;
+        g.opacity = 0.5;
+        g.visible = false;
+        let d = item_for_filter(&g).unwrap();
+        assert_eq!(filter_from_item(&Descriptor::from_bytes(&d.to_bytes()).unwrap()), g);
+        let fltr = get_desc(&d, "Fltr").unwrap();
+        assert!(fltr.class_id.is("GEfc"));
+        assert_eq!(int(&d, "filterID"), Some(code(b"GEfc")));
+    }
+
+    /// A single effect as Photoshop 27 writes it: inline in `Fltr`, no `GEfs` list or `GELv`.
+    fn photoshop_chrome(detail: i32, smoothness: i32) -> Descriptor {
+        let rgb =
+            |v: f64| Value::Descriptor(Descriptor::new("RGBC").with("Rd  ", Value::Double(v)).with("Grn ", Value::Double(v)).with("Bl  ", Value::Double(v)));
+        let mut fltr =
+            Descriptor::new("GEfc").with("GEfk", enumv("GEft", "Chrm")).with("Dtl ", Value::Integer(detail)).with("Smth", Value::Integer(smoothness));
+        fltr.name = UnicodeString::new_nul("Filter Gallery");
+        Descriptor::new("filterFX")
+            .with("Nm  ", Value::Text(UnicodeString::new_nul("Filter Gallery...")))
+            .with("blendOptions", Value::Descriptor(Descriptor::new("blendOptions").with("Opct", unit(b"#Prc", 100.0)).with("Md  ", enumv("BlnM", "Nrml"))))
+            .with("enab", Value::Boolean(true))
+            .with("hasoptions", Value::Boolean(true))
+            .with("FrgC", rgb(255.0))
+            .with("BckC", rgb(0.0))
+            .with("Fltr", Value::Descriptor(fltr))
+            .with("filterID", Value::Integer(code(b"GEfc")))
+    }
+
+    #[test]
+    fn filter_gallery_photoshop_inline_effect_imports_and_writes_back_inline() {
+        let item = photoshop_chrome(10, 4);
+        let f = filter_from_item(&item);
+        assert_eq!(f.command, "filter.filterGallery");
+        assert_eq!(
+            f.params,
+            json!({
+                "effects": [{"filter": "chrome", "params": {"detail": 10, "smoothness": 4}, "visible": true}],
+                "foreground": [1.0, 1.0, 1.0, 1.0],
+                "background": [0.0, 0.0, 0.0, 1.0],
+            })
+        );
+        // Written back in Photoshop's own layout.
+        let d = item_for_filter(&f).unwrap();
+        assert_eq!(get_desc(&d, "Fltr"), get_desc(&item, "Fltr"));
+        assert_eq!((get_desc(&d, "FrgC"), get_desc(&d, "BckC")), (get_desc(&item, "FrgC"), get_desc(&item, "BckC")));
+        assert_eq!(filter_from_item(&Descriptor::from_bytes(&d.to_bytes()).unwrap()), f);
+        // A hidden single effect needs the list (only it has a visibility flag).
+        let mut hidden = f.clone();
+        hidden.params["effects"][0]["visible"] = json!(false);
+        let d = item_for_filter(&hidden).unwrap();
+        assert!(get_desc(&d, "Fltr").unwrap().get("GEfs").is_some());
+        assert_eq!(filter_from_item(&d), hidden);
+        // Inline effects we don't model stay verbatim.
+        let mut odd = photoshop_chrome(10, 4);
+        set(&mut odd, "Fltr", Value::Descriptor(Descriptor::new("GEfc").with("GEfk", enumv("GEft", "Ctot")).with("Dtl ", Value::Integer(1))));
+        assert_eq!(filter_from_item(&odd).command, UNSUPPORTED_FILTER);
+        let mut extra = photoshop_chrome(10, 4);
+        set(&mut extra, "Fltr", Value::Descriptor(Descriptor::new("GEfc").with("GEfk", enumv("GEft", "Chrm")).with("Xtra", Value::Integer(1))));
+        assert_eq!(filter_from_item(&extra).command, UNSUPPORTED_FILTER);
+    }
+
+    #[test]
+    fn gallery_table_matches_the_gallery_filters() {
+        for g in &GALLERY_EFFECTS {
+            let f = photocraft_algo::GalleryFilter::from_key(g.key).unwrap();
+            let keys: Vec<&str> = f.params().iter().map(|p| p.key).collect();
+            for (_, ours) in g.settings {
+                assert!(keys.contains(ours), "{}.{ours}", g.key);
+            }
+        }
+    }
+
+    #[test]
+    fn filter_gallery_written_with_defaults_and_colours() {
+        let f = sf("filter.filterGallery", json!({"effects": [{"filter": "chrome"}], "foreground": "#ff0000", "background": [0.0, 0.0, 1.0, 1.0]}));
+        let back = filter_from_item(&item_for_filter(&f).unwrap());
+        assert_eq!(back.params["effects"][0]["params"], json!({"detail": 4, "smoothness": 7}));
+        assert_eq!(back.params["foreground"], json!([1.0, 0.0, 0.0, 1.0]));
+        assert_eq!(back.params["background"], json!([0.0, 0.0, 1.0, 1.0]));
+    }
+
+    #[test]
+    fn filter_gallery_we_dont_model_is_kept_verbatim() {
+        // Another effect, an extra setting, a wrong-typed setting, no effects, a non-list.
+        let other = Descriptor::new("GEfc").with("GEfk", enumv("GEft", "Ctot")).with("GELv", Value::Boolean(true));
+        let extra = chrome(4, 7, true).with("Xtra", Value::Integer(1));
+        let typed = Descriptor::new("GEfc").with("Dtl ", Value::Double(4.0)).with("GEfk", enumv("GEft", "Chrm"));
+        for effects in [vec![chrome(4, 7, true), other], vec![extra], vec![typed], vec![]] {
+            let item = gallery_item_with(effects);
+            let f = filter_from_item(&item);
+            assert_eq!(f.command, UNSUPPORTED_FILTER);
+            assert_eq!(item_for_filter(&f).unwrap(), item);
+        }
+        let odd = Descriptor::new("filterFX").with("Fltr", Value::Descriptor(Descriptor::new("GEfc").with("GEfs", Value::Integer(3))));
+        assert_eq!(filter_from_item(&odd).command, UNSUPPORTED_FILTER);
+        let bare = Descriptor::new("filterFX").with("filterID", Value::Integer(code(b"GEfc")));
+        assert_eq!(filter_from_item(&bare).command, UNSUPPORTED_FILTER);
+    }
+
+    #[test]
+    fn filter_gallery_without_psd_equivalent_is_reported() {
+        for p in [
+            json!({"effects": [{"filter": "cutout"}]}),
+            json!({"effects": [{"filter": "chrome", "params": {"sparkle": 1}}]}),
+            json!({"effects": [{"params": {}}]}),
+            json!({"effects": []}),
+            json!({}),
+            json!({"effects": [{"filter": "chrome"}], "list": true}),
+            json!({"effects": [{"filter": "chrome"}], "foreground": "red"}),
+            json!(null),
+        ] {
+            assert!(item_for_filter(&sf("filter.filterGallery", p.clone())).is_err(), "{p}");
+        }
+    }
+
     #[test]
     fn unwritable_filters_are_reported_not_fatal() {
         let stack = FilterStack {
@@ -1009,14 +1447,14 @@ mod tests {
         let mut w = Vec::new();
         let mut spec = PlacedSpec { idnt: "id", placed: "pl", transform: t, perspective: None, size: (20.0, 10.0), dpi: 72.0, warp: None, filter_fx: None };
         let template = parse_sold(&sold_bytes(None, &spec, &mut w)).expect("parses").descriptor;
-        assert!(!quad_moved(&template, &spec), "same placement");
+        assert!(!quad_moved(&template, &spec, spec.warp), "same placement");
         spec.transform = Affine { m: [1.0, 0.0, 0.0, 1.0, 3.5, 4.0] };
-        assert!(quad_moved(&template, &spec), "moved half a pixel");
+        assert!(quad_moved(&template, &spec, spec.warp), "moved half a pixel");
         spec.transform = t;
         spec.perspective =
             photocraft_algo::transform::Homography::rect_to_quad([0.0, 0.0, 20.0, 10.0], [[3.0, 4.0], [23.0, 4.0], [20.0, 12.0], [3.0, 14.0]]).map(|h| h.0);
-        assert!(quad_moved(&template, &spec), "one corner moved (Distort)");
-        assert!(quad_moved(&Descriptor::new("null"), &spec), "no stored quad");
+        assert!(quad_moved(&template, &spec, spec.warp), "one corner moved (Distort)");
+        assert!(quad_moved(&Descriptor::new("null"), &spec, spec.warp), "no stored quad");
     }
 
     /// Corrupted placed-layer data and filter descriptors never panic: they parse to something
@@ -1072,13 +1510,15 @@ mod tests {
         let mut custom = BezierMesh::identity(bounds, 1, 1);
         custom.points[15] = [67.0, 30.0];
         let mut multi = Warp::preset(WarpStyle::Custom, 0.0, bounds);
-        multi.mesh = Some(BezierMesh::identity(bounds, 2, 2));
+        let mut split = BezierMesh::identity(bounds, 2, 2);
+        split.points[8][1] += 4.0;
+        multi.mesh = Some(split);
         let mut arc = Warp::preset(WarpStyle::Arc, 40.0, bounds);
         arc.vertical = true;
         arc.h_distort = 10.0;
         let mut c = Warp::preset(WarpStyle::Custom, 0.0, bounds);
         c.mesh = Some(custom);
-        for (w, back) in [(Some(arc.clone()), Some(arc)), (Some(c.clone()), Some(c)), (Some(multi), None), (None, None)] {
+        for (w, back) in [(Some(arc.clone()), Some(arc)), (Some(c.clone()), Some(c)), (Some(multi.clone()), Some(multi)), (None, None)] {
             let mut warnings = Vec::new();
             let spec = PlacedSpec {
                 idnt: "i",
@@ -1092,8 +1532,214 @@ mod tests {
             };
             let sold = sold_bytes(None, &spec, &mut warnings);
             assert_eq!(crate::blocks::parse_placed_warp(b"SoLd", &sold), back);
-            assert_eq!(warnings.len(), usize::from(w.is_some() && back.is_none()));
+            assert!(warnings.is_empty(), "{warnings:?}");
         }
+    }
+
+    /// A placed layer over a 50 × 25 source, at `transform`, with `warp`.
+    fn placed<'a>(transform: Affine, warp: Option<&'a Warp>) -> PlacedSpec<'a> {
+        PlacedSpec { idnt: "i", placed: "p", transform, perspective: None, size: (50.0, 25.0), dpi: 72.0, warp, filter_fx: None }
+    }
+
+    /// A 3 × 2 patch split warp over the 50 × 25 source with one interior control point pulled.
+    fn split_warp() -> Warp {
+        use photocraft_geom::warp::BezierMesh;
+        let mut mesh = BezierMesh::identity([0.0, 0.0, 50.0, 25.0], 3, 2);
+        mesh.points[10 * 3 + 4][1] += 3.0;
+        Warp::custom(mesh, [0.0, 0.0, 50.0, 25.0])
+    }
+
+    /// An imported `soLD` descriptor holding `warp` as Photoshop writes a split warp: a
+    /// `quiltWarp` whose outer slices sit 0.6 px past the source, before a `warpNone` `warp`.
+    fn photoshop_template(warp: &Warp) -> Descriptor {
+        let mesh = warp.mesh.as_ref().expect("a mesh");
+        let slices = |k: &str, knots: &[f64], len: f64| {
+            let n = knots.len() - 1;
+            let values = knots
+                .iter()
+                .enumerate()
+                .map(|(i, u)| {
+                    if i == 0 {
+                        -0.6
+                    } else if i == n {
+                        len + 0.6
+                    } else {
+                        u * len
+                    }
+                })
+                .collect::<Vec<_>>();
+            let prefix = values.len() as u32;
+            Value::ObjectArray(ObjectArray { prefix, body: Descriptor::new("UntF").with(k, Value::UnitFloats { unit: *b"#Pxl", values }) })
+        };
+        let Value::Descriptor(plain) = warp_desc(None, (50.0, 25.0), &mut Vec::new()) else { panic!("a descriptor") };
+        let mut quilt = plain.clone();
+        quilt.class_id = Id::new("quiltWarp");
+        set(&mut quilt, "warpStyle", enumv("warpStyle", "warpCustom"));
+        let points = Descriptor::new("rationalPoint")
+            .with("Hrzn", Value::UnitFloats { unit: *b"#Pxl", values: mesh.points.iter().map(|p| p[0]).collect() })
+            .with("Vrtc", Value::UnitFloats { unit: *b"#Pxl", values: mesh.points.iter().map(|p| p[1]).collect() });
+        let envelope = Descriptor::new("customEnvelopeWarp")
+            .with("quiltSliceX", slices("quiltSliceX", &mesh.us, 50.0))
+            .with("quiltSliceY", slices("quiltSliceY", &mesh.vs, 25.0))
+            .with("meshPoints", Value::ObjectArray(ObjectArray { prefix: mesh.points.len() as u32, body: points }));
+        quilt = quilt
+            .with("deformNumRows", Value::Integer(mesh.ny() as i32))
+            .with("deformNumCols", Value::Integer(mesh.nx() as i32))
+            .with("customEnvelopeWarp", Value::Descriptor(envelope));
+        let mut d = sold_descriptor(&sold_bytes(None, &placed(Affine::IDENTITY, None), &mut Vec::new())).expect("a descriptor");
+        let at = d.items.iter().position(|(k, _)| k.is("warp")).expect("a warp key");
+        d.items.insert(at, (Id::new("quiltWarp"), Value::Descriptor(quilt)));
+        d
+    }
+
+    fn sold_of(d: Descriptor) -> Vec<u8> {
+        let mut out = b"soLD".to_vec();
+        out.extend_from_slice(&4u32.to_be_bytes());
+        out.extend(VersionedDescriptor::new(d).to_bytes());
+        out
+    }
+
+    fn quilt_of(d: &Descriptor) -> Option<&Descriptor> {
+        get_desc(d, "quiltWarp")
+    }
+
+    /// A split warp of more patches along a side than a `quiltWarp` is read with (Warp Grid 64,
+    /// then one more split) is written as no warp, with a message, framed by the source rect, so
+    /// the layer reopens where it was. Before, its `quiltWarp` was refused on reopen while `Trnf`
+    /// still framed its control box: the layer came back stretched and shifted.
+    #[test]
+    fn a_split_warp_past_the_quilt_limit_keeps_its_placement() {
+        use photocraft_geom::warp::BezierMesh;
+        let mut mesh = BezierMesh::identity([0.0, 0.0, 50.0, 25.0], crate::blocks::QUILT_MAX_PATCHES, 1);
+        assert!(mesh.split_u(0.005));
+        mesh.points[0] = [-10.0, -5.0];
+        let warp = Warp::custom(mesh, [0.0, 0.0, 50.0, 25.0]);
+        let transform = Affine { m: [2.0, 0.0, 0.0, 2.0, 120.0, 210.0] };
+        let mut warnings = Vec::new();
+        let sold = sold_bytes(None, &placed(transform, Some(&warp)), &mut warnings);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(crate::blocks::parse_smart(b"SoLd", &sold).1, transform);
+        assert_eq!(crate::blocks::parse_placed_warp(b"SoLd", &sold), None);
+        assert!(quilt_of(&sold_descriptor(&sold).expect("a descriptor")).is_none());
+        // Over an imported split warp, the stale `quiltWarp` goes and the placement holds.
+        let template = photoshop_template(&split_warp());
+        let mut warnings = Vec::new();
+        let sold = sold_bytes(Some(&template), &placed(transform, Some(&warp)), &mut warnings);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(crate::blocks::parse_smart(b"SoLd", &sold).1, transform);
+        assert!(quilt_of(&sold_descriptor(&sold).expect("a descriptor")).is_none());
+        // So does one this reader can't read, which Photoshop would still apply.
+        let mut template = photoshop_template(&split_warp());
+        let Some((_, Value::Descriptor(q))) = template.items.iter_mut().find(|(k, _)| k.is("quiltWarp")) else { panic!("a quiltWarp") };
+        set(q, "deformNumRows", Value::Integer(0));
+        let sold = sold_bytes(Some(&template), &placed(transform, Some(&warp)), &mut Vec::new());
+        assert!(quilt_of(&sold_descriptor(&sold).expect("a descriptor")).is_none());
+        // At the limit the split warp is still written.
+        let mut mesh = BezierMesh::identity([0.0, 0.0, 50.0, 25.0], crate::blocks::QUILT_MAX_PATCHES, 1);
+        mesh.points[0] = [-10.0, -5.0];
+        let warp = Warp::custom(mesh, [0.0, 0.0, 50.0, 25.0]);
+        let mut warnings = Vec::new();
+        let sold = sold_bytes(None, &placed(transform, Some(&warp)), &mut warnings);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(crate::blocks::parse_smart(b"SoLd", &sold).1, transform);
+        assert_eq!(crate::blocks::parse_placed_warp(b"SoLd", &sold), Some(warp));
+    }
+
+    /// A split (multi-patch) custom warp is written as Photoshop writes it, a `quiltWarp` before a
+    /// `warpNone` `warp`, and reads back with its mesh and its transform. Before, the warp was
+    /// written as none while `Trnf` was still the image of its control-point box, so the layer
+    /// came back stretched and shifted.
+    #[test]
+    fn split_warp_round_trips_through_sold() {
+        use photocraft_geom::warp::BezierMesh;
+        let mut mesh = BezierMesh::identity([0.0, 0.0, 50.0, 25.0], 2, 1);
+        mesh.points[0] = [-10.0, -5.0];
+        let warp = Warp::custom(mesh, [0.0, 0.0, 50.0, 25.0]);
+        let transform = Affine { m: [2.0, 0.0, 0.0, 2.0, 120.0, 210.0] };
+        let mut warnings = Vec::new();
+        let sold = sold_bytes(None, &placed(transform, Some(&warp)), &mut warnings);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(crate::blocks::parse_smart(b"SoLd", &sold).1, transform);
+        assert_eq!(crate::blocks::parse_placed_warp(b"SoLd", &sold), Some(warp));
+        let d = sold_descriptor(&sold).expect("a descriptor");
+        let at = |key: &str| d.items.iter().position(|(k, _)| k.is(key));
+        assert!(at("quiltWarp").expect("a quiltWarp") < at("warp").expect("a warp"));
+        let plain = get_desc(&d, "warp").expect("a warp");
+        assert_eq!(enum_of(plain, "warpStyle"), Some(&b"warpNone"[..]));
+        assert!(plain.get("customEnvelopeWarp").is_none());
+        let quilt = quilt_of(&d).expect("a quiltWarp");
+        assert!(quilt.class_id.is("quiltWarp"));
+        assert_eq!((quilt.get("deformNumCols"), quilt.get("deformNumRows")), (Some(&Value::Integer(7)), Some(&Value::Integer(4))));
+        let env = get_desc(quilt, "customEnvelopeWarp").expect("an envelope");
+        let prefix = |k: &str| match env.get(k) {
+            Some(Value::ObjectArray(a)) => Some(a.prefix),
+            _ => None,
+        };
+        assert_eq!((prefix("quiltSliceX"), prefix("quiltSliceY"), prefix("meshPoints")), (Some(3), Some(2), Some(28)));
+    }
+
+    /// A template's split warp is replaced along with its `warp`: a warp changed to Arc, to none,
+    /// to one patch or to another mesh reads back as changed, not as the imported split warp.
+    #[test]
+    fn a_replaced_split_warp_does_not_come_back() {
+        use photocraft_geom::warp::BezierMesh;
+        let bounds = [0.0, 0.0, 50.0, 25.0];
+        let split = split_warp();
+        let template = photoshop_template(&split);
+        let arc = Warp::preset(WarpStyle::Arc, 30.0, bounds);
+        let mut one = BezierMesh::identity(bounds, 1, 1);
+        one.points[5][0] += 2.0;
+        let one = Warp::custom(one, bounds);
+        let mut resplit = BezierMesh::identity(bounds, 2, 2);
+        resplit.points[8][1] += 4.0;
+        let resplit = Warp::custom(resplit, bounds);
+        for w in [Some(arc), None, Some(one), Some(resplit)] {
+            let mut warnings = Vec::new();
+            let sold = sold_bytes(Some(&template), &placed(Affine::IDENTITY, w.as_ref()), &mut warnings);
+            assert_eq!(crate::blocks::parse_placed_warp(b"SoLd", &sold), w);
+            let d = sold_descriptor(&sold).expect("a descriptor");
+            assert_eq!(quilt_of(&d).is_some(), w.as_ref().is_some_and(|w| w.mesh.as_ref().is_some_and(|m| m.points.len() > 16)), "{w:?}");
+            assert!(warnings.is_empty(), "{warnings:?}");
+        }
+    }
+
+    /// An imported split warp that nothing changed keeps Photoshop's `quiltWarp` as stored when
+    /// the layer is rewritten for something else (here a move); a mesh edited on the same grid
+    /// keeps Photoshop's slices.
+    #[test]
+    fn an_imported_split_warp_keeps_photoshop_s_quilt() {
+        let template = photoshop_template(&split_warp());
+        let read = crate::blocks::parse_placed_warp(b"SoLd", &sold_of(template.clone())).expect("the split warp");
+        let moved = Affine { m: [1.0, 0.0, 0.0, 1.0, 4.0, 0.0] };
+        let sold = sold_bytes(Some(&template), &placed(moved, Some(&read)), &mut Vec::new());
+        let d = sold_descriptor(&sold).expect("a descriptor");
+        assert_eq!(d.get("quiltWarp"), template.get("quiltWarp"));
+        assert_eq!(crate::blocks::parse_smart(b"SoLd", &sold).1, moved);
+        let mut edited = read.clone();
+        if let Some(m) = edited.mesh.as_mut() {
+            m.points[12][0] += 1.5;
+        }
+        let sold = sold_bytes(Some(&template), &placed(Affine::IDENTITY, Some(&edited)), &mut Vec::new());
+        assert_eq!(crate::blocks::parse_placed_warp(b"SoLd", &sold), Some(edited));
+        let slices = |d: &Descriptor| {
+            let env = get_desc(quilt_of(d)?, "customEnvelopeWarp")?;
+            Some((env.get("quiltSliceX").cloned(), env.get("quiltSliceY").cloned()))
+        };
+        assert_eq!(slices(&sold_descriptor(&sold).expect("a descriptor")), slices(&template));
+    }
+
+    /// The legacy `PlLd` record has no split warp: it stores none, with its corners framed by the
+    /// source rect, so a reader of `PlLd` alone places the layer where its transform puts it.
+    #[test]
+    fn plld_of_a_split_warp_is_framed_by_the_source() {
+        let warp = split_warp();
+        let transform = Affine { m: [2.0, 0.0, 0.0, 2.0, 120.0, 210.0] };
+        let mut warnings = Vec::new();
+        let plld = plld_bytes(&placed(transform, Some(&warp)), &mut warnings);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(crate::blocks::parse_plld_warp(&plld), crate::blocks::PlldWarp::None);
+        let (_, corners) = crate::blocks::parse_plld(&plld).expect("a record");
+        assert_eq!(crate::blocks::plld_transform(&corners, Some((50.0, 25.0)), None).0, transform);
     }
 
     /// Export writes `Trnf` as the image of the custom warp's control-point box, the inverse of
@@ -1115,7 +1761,7 @@ mod tests {
         assert_eq!(q, [100.0, 200.0, 240.0, 200.0, 240.0, 260.0, 100.0, 260.0]);
         assert_eq!(p.transform, transform);
         // The imported quad reads as unmoved, so the template's `Trnf` is kept as stored.
-        assert!(!quad_moved(&p.descriptor, &spec));
+        assert!(!quad_moved(&p.descriptor, &spec, spec.warp));
     }
 
     #[test]

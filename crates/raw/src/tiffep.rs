@@ -78,6 +78,18 @@ fn nikon_maker_note<'a>(t: &Tiff<'a>, ifds: &[Ifd]) -> Option<(Tiff<'a>, Ifd)> {
     Some((inner, ifd))
 }
 
+/// ExifTool's public Nikon tag documentation: legacy 0x93, or a u16 at offset
+/// 10 of MakerNotes0x51. The latter is used by Z6/Z7, despite TIFF Compression
+/// remaining 34713 even for uncompressed sensor data.
+fn nikon_compression(nikon: Option<&(Tiff<'_>, Ifd)>) -> Option<u32> {
+    let (t, m) = nikon?;
+    t.tag_uint(m, 0x0093).or_else(|| {
+        let b = t.raw(m.get(0x0051)?)?;
+        let v: [u8; 2] = b.get(10..12)?.try_into().ok()?;
+        Some(u32::from(if t.le { u16::from_le_bytes(v) } else { u16::from_be_bytes(v) }))
+    })
+}
+
 /// Four levels listed in R, G, G, B order, placed at their 2×2 CFA positions
 /// (data parity).
 pub(crate) fn rggb_by_position(cfa: &Cfa, v: &[f64]) -> Option<[f32; 4]> {
@@ -130,7 +142,12 @@ pub(crate) fn decode(t: &Tiff, format: RawFormat, limits: &Limits) -> Result<Sen
     let plane = if craw {
         sony::read_craw(t, &raw, limits)?
     } else if format == RawFormat::Nef && t.tag_uint(&raw, tag::COMPRESSION) == Some(nefc::NIKON_COMPRESSION) {
-        nefc::read_compressed(t, &raw, nikon.as_ref(), limits)?
+        match nikon_compression(nikon.as_ref()) {
+            Some(6) => nefc::read_packed(t, &raw, 12, limits)?,
+            Some(10) => nefc::read_packed(t, &raw, 14, limits)?,
+            Some(13 | 14) => return Err(RawError::unsupported("Nikon High Efficiency / High Efficiency* NEF")),
+            _ => nefc::read_compressed(t, &raw, nikon.as_ref(), limits)?,
+        }
     } else {
         read_plane(t, &raw, limits, JpegLayout::Quads)?
     };
@@ -195,6 +212,17 @@ pub(crate) fn decode(t: &Tiff, format: RawFormat, limits: &Limits) -> Result<Sen
     .filter(|m| m.iter().all(|v| (0.25..8.0).contains(v)));
     // DNG-style DefaultCropOrigin / DefaultCropSize (some vendors write them in the raw IFD).
     let mut crop = full;
+    // Nikon's documented CropArea (0x45) is left, top, width, height in sensor
+    // coordinates. Z6/Z7/D780 record their image borders here; do not infer a
+    // crop from a scaled JPEG or apply a body's dimensions to another mode.
+    if let Some((n, m)) = &nikon
+        && let [x, y, w, h] = n.tag_uints(m, 0x0045).as_slice()
+    {
+        let r = Rect::new(*x as usize, *y as usize, *w as usize, *h as usize);
+        if !r.is_empty() && r.intersect(&full) == r {
+            crop = r;
+        }
+    }
     if let ([ox, oy], [cw, ch]) = (t.tag_floats(&raw, tag::DEFAULT_CROP_ORIGIN).as_slice(), t.tag_floats(&raw, tag::DEFAULT_CROP_SIZE).as_slice()) {
         let f = |v: f64| if v.is_finite() && v >= 0.0 { v.round() as usize } else { 0 };
         let r = Rect::new(f(*ox), f(*oy), f(*cw), f(*ch)).intersect(&full);

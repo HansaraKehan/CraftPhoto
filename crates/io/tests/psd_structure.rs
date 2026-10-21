@@ -178,6 +178,144 @@ fn fallback_modes_import_flattened() {
 }
 
 #[test]
+fn palette_and_duotone_modes_are_written_in_their_own_mode() {
+    // Indexed Color and Bitmap are written flat in their own mode (palette / 1 bit); a Duotone
+    // keeps the ink data it was imported with over its grey plate. Same image, same mode data.
+    for mode in [ColorMode::Indexed, ColorMode::Bitmap, ColorMode::Duotone] {
+        let depth = testgen::mode_depths(mode)[0];
+        let f = testgen::merged_only(Version::Psd, mode, depth, Compression::Rle, 9, 5);
+        let (d, _) = psd_to_document(&f);
+        let out = export(&d, "x.psd", &ExportOptions::default()).unwrap();
+        assert!(out.warnings.iter().all(|w| !w.contains("written as")), "{mode:?}: {:?}", out.warnings);
+        let back = PsdFile::from_bytes(&out.bytes).unwrap();
+        assert_eq!((back.header.color_mode, back.header.depth, back.header.channels), (mode, f.header.depth, 1), "{mode:?}");
+        assert_eq!(back.composite_rgba8().unwrap(), f.composite_rgba8().unwrap(), "{mode:?}");
+        if mode != ColorMode::Bitmap {
+            assert_eq!(back.color_mode_data, f.color_mode_data, "{mode:?}");
+        }
+    }
+}
+
+#[test]
+fn indexed_psd_keeps_the_table_length_and_transparent_entry() {
+    use photocraft_doc::ColorTable;
+    let mut d = photocraft_doc::Document::with_background(
+        "i",
+        photocraft_doc::Size::new(4, 2),
+        photocraft_color::ColorMode::Rgb,
+        photocraft_color::SampleType::U8,
+        photocraft_color::Color::rgba(1.0, 0.0, 0.0, 1.0),
+    );
+    d.mode = photocraft_color::ColorMode::Indexed;
+    d.color_table = Some(ColorTable { colors: vec![[0, 0, 0], [255, 0, 0], [0, 0, 255]], transparent: Some(2) });
+    let out = export(&d, "x.psd", &ExportOptions::default()).unwrap();
+    let f = PsdFile::from_bytes(&out.bytes).unwrap();
+    assert_eq!(f.header.color_mode, ColorMode::Indexed);
+    assert_eq!(f.resource(1046).map(|r| r.data.clone()), Some(vec![0, 3]));
+    assert_eq!(f.resource(1047).map(|r| r.data.clone()), Some(vec![0, 2]));
+    assert_eq!(f.decode_merged().unwrap(), vec![1; 8], "every pixel is entry 1 (red)");
+    let (back, _) = psd_to_document(&f);
+    assert_eq!(back.color_table, d.color_table);
+}
+
+/// A 4x2 document filled with `fill` in Indexed Color mode with `colors` and `transparent`.
+fn indexed_doc(fill: photocraft_color::Color, colors: Vec<[u8; 3]>, transparent: Option<u8>) -> photocraft_doc::Document {
+    let mut d = photocraft_doc::Document::with_background(
+        "i",
+        photocraft_doc::Size::new(4, 2),
+        photocraft_color::ColorMode::Rgb,
+        photocraft_color::SampleType::U8,
+        fill,
+    );
+    d.mode = photocraft_color::ColorMode::Indexed;
+    d.color_table = Some(photocraft_doc::ColorTable { colors, transparent });
+    d
+}
+
+#[test]
+fn indexed_psd_never_writes_an_opaque_pixel_as_the_transparent_entry() {
+    // The transparent entry duplicates opaque black (common in PNG-8 files) and comes first.
+    let d = indexed_doc(photocraft_color::Color::rgba(0.0, 0.0, 0.0, 1.0), vec![[0, 0, 0], [0, 0, 0], [255, 255, 255]], Some(0));
+    let f = PsdFile::from_bytes(&export(&d, "x.psd", &ExportOptions::default()).unwrap().bytes).unwrap();
+    assert_eq!(f.decode_merged().unwrap(), vec![1; 8], "opaque black is entry 1, not the transparent entry 0");
+}
+
+#[test]
+fn indexed_psd_transparency_survives_a_round_trip() {
+    let d = indexed_doc(photocraft_color::Color::rgba(1.0, 0.0, 0.0, 0.0), vec![[255, 0, 0], [255, 255, 255]], Some(1));
+    let out = export(&d, "x.psd", &ExportOptions::default()).unwrap();
+    let f = PsdFile::from_bytes(&out.bytes).unwrap();
+    assert_eq!(f.decode_merged().unwrap(), vec![1; 8]);
+    let back = import("x.psd", &out.bytes).unwrap().document;
+    let s = back.layers[0].surface().unwrap();
+    let px = s.read_region(back.bounds());
+    assert!(px.chunks_exact(s.channels()).all(|p| p.last() == Some(&0.0)), "transparent pixels came back opaque");
+    assert!(!back.layers[0].locks.transparency);
+}
+
+#[test]
+fn indexed_psd_without_a_transparent_entry_flattens_over_white() {
+    let d = indexed_doc(photocraft_color::Color::rgba(0.0, 0.0, 0.0, 0.0), vec![[0, 0, 0], [255, 255, 255]], None);
+    let f = PsdFile::from_bytes(&export(&d, "x.psd", &ExportOptions::default()).unwrap().bytes).unwrap();
+    assert_eq!(f.decode_merged().unwrap(), vec![1; 8], "empty areas are white, as Photoshop flattens them");
+}
+
+#[test]
+fn indexed_psd_keeps_the_icc_profile() {
+    // Bytes 16..20 of a profile name its colour space; only an RGB one describes the table.
+    let profile = |space: &[u8; 4]| {
+        let mut p = vec![7u8; 132];
+        p[16..20].copy_from_slice(space);
+        p
+    };
+    for (space, kept) in [(b"RGB ", true), (b"GRAY", false)] {
+        let mut d = indexed_doc(photocraft_color::Color::rgba(1.0, 0.0, 0.0, 1.0), vec![[255, 0, 0]], None);
+        d.icc_profile = Some(std::sync::Arc::new(profile(space)));
+        let f = PsdFile::from_bytes(&export(&d, "x.psd", &ExportOptions::default()).unwrap().bytes).unwrap();
+        assert_eq!(f.header.color_mode, ColorMode::Indexed);
+        assert_eq!(f.resource(1039).map(|r| r.data.clone()), kept.then(|| profile(space)));
+    }
+}
+
+#[test]
+fn indexed_document_whose_only_entry_is_transparent_is_not_written_as_indexed() {
+    // Every opaque pixel would have to take the transparent entry and vanish: written as RGB.
+    let d = indexed_doc(photocraft_color::Color::rgba(1.0, 0.0, 0.0, 1.0), vec![[255, 0, 0]], Some(0));
+    let out = export(&d, "x.psd", &ExportOptions::default()).unwrap();
+    let f = PsdFile::from_bytes(&out.bytes).unwrap();
+    assert_eq!(f.header.color_mode, ColorMode::Rgb, "{:?}", out.warnings);
+    assert_eq!(&f.composite_rgba8().unwrap().data[..4], &[255, 0, 0, 255]);
+}
+
+#[test]
+fn indexed_and_bitmap_documents_with_channels_keep_them() {
+    // PhotoCraft does not read extra channels of a palette-mode PSD back, so these documents keep
+    // the RGB / Grayscale file that holds their alpha channels and Quick Mask.
+    for mode in [photocraft_color::ColorMode::Indexed, photocraft_color::ColorMode::Bitmap] {
+        let mut d = indexed_doc(photocraft_color::Color::rgba(1.0, 1.0, 1.0, 1.0), vec![[255, 255, 255]], None);
+        d.mode = mode;
+        let alpha = || photocraft_doc::AlphaChannel::new("Alpha 1", photocraft_raster::Surface::new(photocraft_color::PixelFormat::GRAY8));
+        d.channels.push(alpha());
+        d.quick_mask = Some(alpha());
+        let out = export(&d, "x.psd", &ExportOptions::default()).unwrap();
+        let back = import("x.psd", &out.bytes).unwrap().document;
+        assert_eq!((back.channels.len(), back.quick_mask.is_some()), (1, true), "{mode:?}: {:?}", out.warnings);
+    }
+}
+
+#[test]
+fn layerless_psd_never_keeps_psb_only_block_signatures() {
+    for mode in [photocraft_color::ColorMode::Indexed, photocraft_color::ColorMode::Bitmap, photocraft_color::ColorMode::Multichannel] {
+        let mut d = indexed_doc(photocraft_color::Color::rgba(1.0, 1.0, 1.0, 1.0), vec![[255, 255, 255]], None);
+        d.mode = mode;
+        d.metadata.psd_global_blocks.push((*b"8B64", *b"FMsk", std::sync::Arc::new(vec![0; 12])));
+        let f = PsdFile::from_bytes(&export(&d, "x.psd", &ExportOptions::default()).unwrap().bytes).unwrap();
+        assert!(f.global_blocks.iter().any(|b| &b.key == b"FMsk"), "{mode:?}");
+        assert!(f.global_blocks.iter().all(|b| &b.signature == b"8BIM"), "{mode:?}");
+    }
+}
+
+#[test]
 fn multichannel_imports_ink_channels() {
     for depth in testgen::mode_depths(ColorMode::Multichannel) {
         let f = testgen::merged_only(Version::Psd, ColorMode::Multichannel, *depth, Compression::Rle, 9, 5);

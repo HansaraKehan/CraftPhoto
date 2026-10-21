@@ -8,6 +8,12 @@
 //! `"dryRun": true` reports the backend command without spooling; a PDF is kept only at an
 //! explicit output path. Shared spooler transport files are private and automatically removed.
 //!
+//! Where `lp` is not on the path (a Flatpak has none), the job goes to CUPS over IPP in-process
+//! (`photocraft-ipp`, through the sandbox's `--socket=cups`), and when no print server or no
+//! printer is reachable, to the app's spooler, the XDG Print portal (`Session::print_spooler`;
+//! `PHOTOCRAFT_PRINT_PORTAL=1` prefers it, `=0` removes it). `"printServer"` names a server for
+//! one job and always takes the IPP route; `file.printers` lists the queues (#2728).
+//!
 //! Paths to Illustrator writes the document's paths as an Adobe Illustrator 3 compatible
 //! PostScript file (`m`/`L`/`C` path construction, `n`/`N` unpainted closed/open paths, `*u`/`*U`
 //! compound paths), following the public PostScript Language Reference and the AI3 format notes.
@@ -29,6 +35,192 @@ fn bad(cmd: &str, msg: impl Into<String>) -> EngineError {
 }
 fn other(e: impl std::fmt::Display) -> EngineError {
     EngineError::Other(e.to_string())
+}
+
+// ---------- Spooling ----------
+
+/// A rendered page on its way to the printer: what the IPP route and the app's spooler need.
+#[derive(Debug, Clone)]
+pub struct PrintJob {
+    pub pdf: Vec<u8>,
+    /// The printer asked for; `None` means the default.
+    pub printer: Option<String>,
+    pub copies: u32,
+    /// The queue entry's name: the document's.
+    pub title: String,
+    /// A print server named in the request (`printServer`), else the system's.
+    pub server: Option<String>,
+    /// The page size in points, as laid out (landscape already applied).
+    pub paper: (f64, f64),
+    pub landscape: bool,
+}
+
+/// A spooler's work: the job in, where it went out.
+pub type SpoolFn = std::sync::Arc<dyn Fn(&PrintJob) -> std::result::Result<String, String> + Send + Sync>;
+
+/// A further route to the printer, installed by the app on `Session::print_spooler`: the XDG
+/// Print portal, which shows the system print dialog from inside a sandbox. It takes the jobs
+/// no other route can (no print server reachable, no printer set up), or every job when
+/// `preferred`.
+#[derive(Clone)]
+pub struct Spooler {
+    /// Reported as the job's `backend`.
+    pub name: &'static str,
+    pub preferred: bool,
+    /// Returns where the job went ("the system print dialog").
+    pub run: SpoolFn,
+}
+
+/// Why the IPP route could not spool: no route at all (the app's spooler may have one), or a
+/// failure on a route that exists (a wrong printer name, a rejected job).
+enum SpoolError {
+    NoRoute(String),
+    Failed(String),
+}
+
+/// Sends the job and says where it went and through what. A named print server takes the IPP
+/// route. Otherwise: the app's spooler when it is preferred; else `craft-print` (`lp`, or the
+/// Windows spooler) when it is there; else CUPS over IPP; and the app's spooler when that had
+/// no route either. A route that exists but fails (an unknown printer, a refused job) is an
+/// error, never a fall-through.
+fn spool_job(spooler: Option<&Spooler>, job: &PrintJob, lp: &craft_print::Job) -> Result<(String, String)> {
+    let app = |sp: &Spooler| (sp.run)(job).map(|m| (m, sp.name.to_string())).map_err(other);
+    if job.server.is_none() {
+        if let Some(sp) = spooler.filter(|sp| sp.preferred) {
+            return app(sp);
+        }
+        if let Some(name) = system_spooler() {
+            require_windows_pdf()?;
+            return craft_print::submit(&job.pdf, lp).map(|m| (m, name.to_string())).map_err(other);
+        }
+    }
+    match cups_spool(job) {
+        Ok(m) => Ok((m, "ipp".into())),
+        Err(SpoolError::NoRoute(why)) => match spooler {
+            Some(sp) => app(sp),
+            None => Err(other(why)),
+        },
+        Err(SpoolError::Failed(why)) => Err(other(why)),
+    }
+}
+
+/// The spooler `craft-print` can talk to, as the job's `backend` name: `lp` when CUPS' command
+/// is on the path, the Windows spooler on Windows. `None` in a sandbox without `lp` and in the
+/// browser.
+fn system_spooler() -> Option<&'static str> {
+    match craft_print::backend()? {
+        craft_print::Backend::WindowsPdf => Some("windows"),
+        craft_print::Backend::Cups => {
+            let path = std::env::var_os("PATH")?;
+            std::env::split_paths(&path).any(|dir| dir.join("lp").is_file()).then_some("lp")
+        }
+    }
+}
+
+/// The printer a job goes to: the one asked for when the server knows it, else the default,
+/// else the only one; otherwise an error that names what there is.
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "windows")))]
+fn resolve_printer(requested: Option<&str>, default: Option<&str>, printers: &[photocraft_ipp::Printer]) -> std::result::Result<String, SpoolError> {
+    let names: Vec<&str> = printers.iter().map(|p| p.name.as_str()).collect();
+    let known = |n: &str| names.iter().find(|k| k.eq_ignore_ascii_case(n)).map(|k| (*k).to_string());
+    if let Some(r) = requested {
+        let choices = if names.is_empty() { "none".to_string() } else { names.join(", ") };
+        return known(r).ok_or_else(|| SpoolError::Failed(format!("no printer called `{r}`; the print server knows: {choices}")));
+    }
+    if printers.is_empty() {
+        return Err(SpoolError::NoRoute("no printer is set up on this computer; add one in the system settings, or print to PDF".into()));
+    }
+    if let Some(d) = default.and_then(known) {
+        return Ok(d);
+    }
+    match names.as_slice() {
+        [only] => Ok((*only).to_string()),
+        _ => Err(SpoolError::Failed(format!("no default printer; choose one in the Printer field: {}", names.join(", ")))),
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "windows")))]
+fn cups_server(named: Option<&str>) -> std::result::Result<photocraft_ipp::Endpoint, SpoolError> {
+    match named {
+        Some(server) => {
+            let ep = photocraft_ipp::Endpoint::parse(server);
+            if !ep.reachable() {
+                return Err(SpoolError::Failed(format!("no print server at {ep}")));
+            }
+            Ok(ep)
+        }
+        None => photocraft_ipp::Endpoint::detect()
+            .ok_or_else(|| SpoolError::NoRoute("no print server: CUPS is not running, or not reachable from this sandbox; print to PDF instead".into())),
+    }
+}
+
+/// The IPP route: the job to the system's (or the named) CUPS server.
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "windows")))]
+fn cups_spool(job: &PrintJob) -> std::result::Result<String, SpoolError> {
+    let failed = |e: photocraft_ipp::Error| SpoolError::Failed(e.to_string());
+    let ep = cups_server(job.server.as_deref())?;
+    let printers = photocraft_ipp::printers(&ep).map_err(failed)?;
+    let default = printers.iter().find(|p| p.is_default).map(|p| p.name.clone());
+    let printer = resolve_printer(job.printer.as_deref(), default.as_deref(), &printers)?;
+    let is_class = printers.iter().any(|p| p.name == printer && p.is_class);
+    let user = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_else(|_| "photocraft".into());
+    let id = photocraft_ipp::print_job(
+        &ep,
+        &photocraft_ipp::Job { printer: &printer, is_class, title: &job.title, user: &user, copies: job.copies, document: &job.pdf, format: "application/pdf" },
+    )
+    .map_err(failed)?;
+    Ok(format!("job {id} on {printer}"))
+}
+
+/// No IPP route here: a named server is a failure, the system's a missing route (the app's
+/// spooler may have one).
+#[cfg(any(target_arch = "wasm32", target_os = "windows"))]
+fn cups_spool(job: &PrintJob) -> std::result::Result<String, SpoolError> {
+    let why = if cfg!(target_arch = "wasm32") {
+        "printing needs the desktop app"
+    } else {
+        "a print server over IPP is not available on Windows yet; print to PDF instead"
+    };
+    match job.server {
+        Some(_) => Err(SpoolError::Failed(why.into())),
+        None => Err(SpoolError::NoRoute(why.into())),
+    }
+}
+
+/// `file.printers`: the printers the system's (or `printServer`'s) print server knows, with the default. From
+/// `craft-print` (`lpstat`, the Windows spooler) where that is the route; over IPP for a named
+/// server and where there is no `lp` (a sandbox).
+fn system_printers(_s: &mut Session, p: &Value) -> Result<Value> {
+    let named = p.get("printServer").and_then(Value::as_str).filter(|v| !v.is_empty());
+    if named.is_none() && system_spooler().is_some() {
+        let list = craft_print::printers();
+        let default = list.iter().find(|p| p.default).map(|p| p.name.clone());
+        let printers: Vec<Value> = list.into_iter().map(|p| json!({"name": p.name, "default": p.default})).collect();
+        return Ok(json!({"server": Value::Null, "default": default, "printers": printers}));
+    }
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "windows")))]
+    {
+        let ep = match cups_server(named) {
+            Ok(ep) => ep,
+            Err(SpoolError::NoRoute(why) | SpoolError::Failed(why)) => {
+                return Ok(json!({"server": Value::Null, "default": Value::Null, "printers": [], "note": why}));
+            }
+        };
+        let list = photocraft_ipp::printers(&ep).map_err(other)?;
+        let default = list.iter().find(|p| p.is_default).map(|p| p.name.clone());
+        let printers: Vec<Value> = list
+            .iter()
+            .map(|p| {
+                json!({"name": p.name, "info": p.info, "state": match p.state { 4 => "printing", 5 => "stopped", _ => "idle" }, "acceptingJobs": p.accepting_jobs, "default": p.is_default, "class": p.is_class})
+            })
+            .collect();
+        Ok(json!({"server": ep.to_string(), "default": default, "printers": printers}))
+    }
+    #[cfg(not(all(not(target_arch = "wasm32"), not(target_os = "windows"))))]
+    {
+        let _ = named;
+        Ok(json!({"server": Value::Null, "default": Value::Null, "printers": [], "note": "listing printers is not available on this platform yet"}))
+    }
 }
 
 // ---------- PDF ----------
@@ -343,6 +535,7 @@ fn do_print(s: &mut Session, p: &Value, cmd: &str) -> Result<Value> {
     let params = p.clone();
     let worker_params = params.clone();
     let command = cmd.to_string();
+    let spooler = s.print_spooler.clone();
     if send && !dry {
         // Session::execute remains synchronous; the desktop's Session::start snapshots here
         // and runs PDF composition and the potentially slow driver on a worker.
@@ -352,7 +545,7 @@ fn do_print(s: &mut Session, p: &Value, cmd: &str) -> Result<Value> {
             false,
             move |ctx| {
                 ctx.progress(0.0, "Print");
-                render_and_spool(&doc, &worker_params, &command)
+                render_and_spool(&doc, &worker_params, &command, spooler.as_ref())
             },
             move |s, result| {
                 remember_print(s, &params);
@@ -370,13 +563,13 @@ fn do_print(s: &mut Session, p: &Value, cmd: &str) -> Result<Value> {
             },
         );
     }
-    let result = render_and_spool(&doc, p, cmd)?;
+    let result = render_and_spool(&doc, p, cmd, spooler.as_ref())?;
     remember_print(s, p);
     crate::automate_cmds::fire_event(s, "print");
     Ok(result)
 }
 
-fn render_and_spool(doc: &Document, p: &Value, cmd: &str) -> Result<Value> {
+fn render_and_spool(doc: &Document, p: &Value, cmd: &str, spooler: Option<&Spooler>) -> Result<Value> {
     let PrintLayout { paper: (pw, ph), rect: (x, y, w, h), scale, marks, emulsion_down } = layout(doc, p, cmd)?;
     let (img, color) = print_image(doc, p, cmd)?;
     let description = p
@@ -394,7 +587,12 @@ fn render_and_spool(doc: &Document, p: &Value, cmd: &str) -> Result<Value> {
     // Sending follows the shared command contract; fuzz tests explicitly request dryRun.
     // The worker returns its result before repeat settings and hooks are applied once.
     let handling = p.get("colorHandling").and_then(Value::as_str).unwrap_or("printerManages");
-    if cfg!(windows) && send && !dry && output.is_none() && native_rgb_compatible(&page, handling) {
+    // A named print server always takes the IPP route and a preferred app spooler takes every
+    // job (the route order in `spool_job`), on Windows too: neither may enter the native path
+    // below, which would print on the local default printer instead.
+    let named_server = p.get("printServer").and_then(Value::as_str).is_some_and(|v| !v.is_empty());
+    let skip_native = named_server || spooler.is_some_and(|sp| sp.preferred);
+    if cfg!(windows) && !skip_native && send && !dry && output.is_none() && native_rgb_compatible(&page, handling) {
         require_printing_enabled()?;
         let printed = print_windows(&page, p, &doc.name, copies)?;
         return Ok(json!({
@@ -402,10 +600,11 @@ fn render_and_spool(doc: &Document, p: &Value, cmd: &str) -> Result<Value> {
             "copies": copies, "command": Value::Null, "sent": true, "spooler": printed, "color": color,
         }));
     }
-    if cfg!(windows) && send && !dry && output.is_none() && printer_settings(p)?.is_some() {
+    if cfg!(windows) && !skip_native && send && !dry && output.is_none() && printer_settings(p)?.is_some() {
         return Err(other("the selected color profile or page text requires PDF printing. Save as PDF, or clear Print Settings to use PDF printing."));
     }
     let pdf = print_pdf(&page);
+    let pdf_len = pdf.len();
     let job = craft_print::Job {
         printer: p.get("printer").and_then(Value::as_str).filter(|v| !v.is_empty()).map(str::to_string),
         copies,
@@ -425,14 +624,54 @@ fn render_and_spool(doc: &Document, p: &Value, cmd: &str) -> Result<Value> {
     };
     let mut sent = false;
     let mut spool = Value::Null;
+    let mut backend = Value::Null;
     if send && !dry {
         require_printing_enabled()?;
-        spool = json!(craft_print::submit(&pdf, &job).map_err(other)?);
+        let print_job = PrintJob {
+            printer: job.printer.clone(),
+            copies,
+            title: doc.name.clone(),
+            server: p.get("printServer").and_then(Value::as_str).filter(|v| !v.is_empty()).map(str::to_string),
+            paper: (pw, ph),
+            landscape: p.get("orientation").and_then(Value::as_str) == Some("landscape"),
+            pdf,
+        };
+        let (where_, via) = spool_job(spooler, &print_job, &job)?;
+        spool = json!(where_);
+        backend = json!(via);
         sent = true;
     }
     Ok(
-        json!({"pdf": pdf_path, "bytes": pdf.len(), "paper": [pw, ph], "imageRect": [x, y, w, h], "emulsionDown": emulsion_down, "scale": scale * 100.0, "copies": copies, "command": command, "sent": sent, "spooler": spool, "color": color}),
+        json!({"pdf": pdf_path, "bytes": pdf_len, "paper": [pw, ph], "imageRect": [x, y, w, h], "emulsionDown": emulsion_down, "scale": scale * 100.0, "copies": copies, "command": command, "sent": sent, "spooler": spool, "backend": backend, "color": color}),
     )
+}
+
+/// Windows prints a PDF through Windows.Data.Pdf.dll, which the apps delay-load (see their
+/// `build.rs`) so a Windows image without it still starts. Calling into it when it cannot load
+/// would abort the process, so check that it loads first (#5884).
+fn require_windows_pdf() -> Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        let root = std::env::var_os("SystemRoot").unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
+        if !windows_pdf_loads(&windows_pdf_dll(std::path::Path::new(&root))) {
+            return Err(other(
+                "printing this page needs the Windows PDF component (Windows.Data.Pdf.dll), which is missing or cannot load. Save as PDF and print it from another app, or print an RGB image without page text or labels to print directly.",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_pdf_dll(system_root: &std::path::Path) -> std::path::PathBuf {
+    system_root.join("System32").join("Windows.Data.Pdf.dll")
+}
+
+/// Loads the DLL rather than checking the file exists: one that is present but cannot load (a
+/// dependency stripped too) would still abort at the delay-load stub.
+#[cfg(target_os = "windows")]
+fn windows_pdf_loads(dll: &std::path::Path) -> bool {
+    dll.to_str().is_some_and(|p| winsafe::HINSTANCE::LoadLibrary(p).is_ok())
 }
 
 /// Keep CMYK output profiles and page text on the existing PDF composition path. GDI currently
@@ -444,7 +683,11 @@ fn native_rgb_compatible(page: &PrintPage, handling: &str) -> bool {
         && page.label.as_deref().is_none_or(str::is_empty)
 }
 
-/// Print One Copy repeats these.
+/// Where the settings of the last print are kept in Preferences' remembered dialog settings.
+pub const REMEMBERED: &str = "file.print";
+
+/// Print One Copy repeats these, and Print opens with them. They are kept in the preferences as
+/// well, so they survive a relaunch, as Photoshop's do (#7410).
 fn remember_print(s: &mut Session, p: &Value) {
     let mut remembered = p.clone();
     if let Some(o) = remembered.as_object_mut() {
@@ -453,7 +696,29 @@ fn remember_print(s: &mut Session, p: &Value) {
         // Output and dry-run choices are not remembered, so a send override must not survive them.
         o.remove("send");
     }
+    let kept = remembered.clone();
+    s.prefs.edit(|prefs| {
+        prefs.dialogs.insert(REMEMBERED.into(), kept);
+    });
     s.file_menu.last_print = Some(remembered);
+}
+
+/// Drops the `printer` of the settings `q` (and its driver settings) when the print server lists
+/// printers but not that one, so the job goes to the default printer. An empty list can't tell.
+fn drop_vanished_printer(q: &mut Value, listed: &[&str]) {
+    let Some(name) = q.get("printer").and_then(Value::as_str).filter(|n| !n.is_empty()) else { return };
+    if listed.is_empty() || listed.iter().any(|l| l.eq_ignore_ascii_case(name)) {
+        return;
+    }
+    if let Some(o) = q.as_object_mut() {
+        o.remove("printer");
+        o.remove("printerSettings");
+    }
+}
+
+/// The settings of the last print: this session's, else those remembered from an earlier one.
+pub fn last_print(s: &Session) -> Option<Value> {
+    s.file_menu.last_print.clone().or_else(|| s.prefs().dialogs.get(REMEMBERED).filter(|v| v.is_object()).cloned())
 }
 
 /// The `printer` parameter, or the system's default printer.
@@ -470,6 +735,61 @@ fn printer_settings(p: &Value) -> Result<Option<craft_print::rgb::DevMode>> {
         Some(hex) => craft_print::rgb::DevMode::from_hex(hex).map(Some).map_err(|e| bad("file.print", e.to_string())),
         None => Ok(None),
     }
+}
+
+/// `dmFields` and `dmOrientation` in DEVMODEW (wingdi.h: after the 32-wchar device name and four
+/// header words), and the `dmFields` bit that says `dmOrientation` is set.
+const DM_FIELDS_AT: usize = 72;
+const DM_ORIENTATION_AT: usize = 76;
+const DM_ORIENTATION: u32 = 0x1;
+/// `DMORIENT_PORTRAIT` and `DMORIENT_LANDSCAPE`.
+const DMORIENT_PORTRAIT: i16 = 1;
+const DMORIENT_LANDSCAPE: i16 = 2;
+
+/// Driver settings turned to portrait or landscape, as Photoshop's Layout buttons turn them:
+/// `dmOrientation` set and flagged in `dmFields`, every other byte (the driver's private settings
+/// included) kept. The driver validates the result when it lays out the page, as it does for
+/// settings from Print Settings….
+pub fn turned_settings(settings: &craft_print::rgb::DevMode, landscape: bool) -> Result<craft_print::rgb::DevMode> {
+    let mut b = settings.as_bytes().to_vec();
+    let short = || other("printer settings are too short to hold an orientation");
+    let fields: [u8; 4] = b.get(DM_FIELDS_AT..DM_FIELDS_AT + 4).and_then(|s| s.try_into().ok()).ok_or_else(short)?;
+    let fields = u32::from_le_bytes(fields) | DM_ORIENTATION;
+    b.get_mut(DM_FIELDS_AT..DM_FIELDS_AT + 4).ok_or_else(short)?.copy_from_slice(&fields.to_le_bytes());
+    let orientation = if landscape { DMORIENT_LANDSCAPE } else { DMORIENT_PORTRAIT };
+    b.get_mut(DM_ORIENTATION_AT..DM_ORIENTATION_AT + 2).ok_or_else(short)?.copy_from_slice(&orientation.to_le_bytes());
+    craft_print::rgb::DevMode::from_bytes(b).map_err(other)
+}
+
+/// Whether a driver page of `driver` points is the layout's `paper` turned the other way round
+/// (within the 2 pt the driver and layout may differ by): then turning the driver settings, not
+/// choosing another paper, makes them agree. A square paper is never turned.
+fn turned_paper(driver: (f64, f64), paper: (f64, f64)) -> bool {
+    let near = |a: f64, b: f64| (a - b).abs() <= 2.0;
+    let same = near(driver.0, paper.0) && near(driver.1, paper.1);
+    !same && near(driver.0, paper.1) && near(driver.1, paper.0)
+}
+
+/// The driver settings and page for printing a layout of `paper` points on `printer`: the given
+/// settings (or the printer's own) as they are, or turned to the layout's orientation when the
+/// driver has that paper the other way round. A landscape layout so prints landscape with portrait
+/// Print Settings, as a script or another app asking for landscape expects.
+fn settings_for_layout(
+    printer: &str,
+    settings: Option<craft_print::rgb::DevMode>,
+    paper: (f64, f64),
+) -> Result<(Option<craft_print::rgb::DevMode>, craft_print::rgb::Page)> {
+    let page = craft_print::rgb::page(printer, settings.as_ref()).map_err(other)?;
+    if !turned_paper(page.paper, paper) {
+        return Ok((settings, page));
+    }
+    let base = match settings {
+        Some(s) => s,
+        None => craft_print::rgb::default_settings(printer).map_err(other)?,
+    };
+    let turned = turned_settings(&base, paper.0 > paper.1)?;
+    let page = craft_print::rgb::page(printer, Some(&turned)).map_err(other)?;
+    Ok((Some(turned), page))
 }
 
 /// The page's image as 8-bit RGB rows (gray expanded), mirrored for Emulsion Down.
@@ -506,8 +826,7 @@ pub fn page_rect_top_left(page: &PrintPage) -> (f64, f64, f64, f64) {
 /// PDF-only (no font/text layout in the GDI path yet).
 fn print_windows(page: &PrintPage, p: &Value, title: &str, copies: u32) -> Result<Value> {
     let printer = printer_name(p)?;
-    let settings = printer_settings(p)?;
-    let device_page = craft_print::rgb::page(&printer, settings.as_ref()).map_err(other)?;
+    let (settings, device_page) = settings_for_layout(&printer, printer_settings(p)?, page.paper)?;
     if (device_page.paper.0 - page.paper.0).abs() > 2.0 || (device_page.paper.1 - page.paper.1).abs() > 2.0 {
         return Err(other("the driver paper or orientation differs from the print layout; choose the matching paper in Print Settings before printing"));
     }
@@ -544,11 +863,31 @@ fn printers(_: &mut Session, _: &Value) -> Result<Value> {
 }
 
 fn printer_page(_: &mut Session, p: &Value) -> Result<Value> {
+    // Checked before the printer, so a bad value is the error whether or not a printer answers.
+    let landscape = match p.get("orientation").filter(|v| !v.is_null()) {
+        None => None,
+        Some(v) => match v.as_str() {
+            Some("portrait") => Some(false),
+            Some("landscape") => Some(true),
+            _ => return Err(bad("file.print.page", "orientation is \"portrait\" or \"landscape\"")),
+        },
+    };
     let printer = printer_name(p)?;
-    let pg = craft_print::rgb::page(&printer, printer_settings(p)?.as_ref()).map_err(other)?;
-    Ok(
-        json!({"printer": printer, "paper": [pg.paper.0, pg.paper.1], "printable": [pg.printable.0, pg.printable.1, pg.printable.2, pg.printable.3], "dpi": [pg.dpi.0, pg.dpi.1]}),
-    )
+    let mut settings = printer_settings(p)?;
+    if let Some(landscape) = landscape {
+        let base = match settings {
+            Some(s) => s,
+            None => craft_print::rgb::default_settings(&printer).map_err(other)?,
+        };
+        settings = Some(turned_settings(&base, landscape)?);
+    }
+    let pg = craft_print::rgb::page(&printer, settings.as_ref()).map_err(other)?;
+    let mut out = json!({"printer": printer, "paper": [pg.paper.0, pg.paper.1], "printable": [pg.printable.0, pg.printable.1, pg.printable.2, pg.printable.3], "dpi": [pg.dpi.0, pg.dpi.1]});
+    // The turned settings, to pass on as `printerSettings` (the Print dialog's Orientation does).
+    if let (Some(_), Some(s), Some(o)) = (landscape, settings, out.as_object_mut()) {
+        o.insert("printerSettings".into(), json!(s.to_hex()));
+    }
+    Ok(out)
 }
 
 /// Set once by test harnesses (the panic hunt) so no command in the process can reach a printer.
@@ -573,21 +912,18 @@ fn require_printing_enabled() -> Result<()> {
     }
 }
 
-/// The printers the system spooler knows (Print's Printer menu): CUPS queues and driverless
-/// destinations on macOS and Linux, `Win32_Printer` on Windows, none in the browser.
-fn system_printers(_: &mut Session, _: &Value) -> Result<Value> {
-    let list = craft_print::printers();
-    let default = list.iter().find(|p| p.default).map(|p| p.name.clone());
-    let printers: Vec<Value> = list.into_iter().map(|p| json!({"name": p.name, "default": p.default})).collect();
-    Ok(json!({"printers": printers, "default": default}))
-}
-
 fn print(s: &mut Session, p: &Value) -> Result<Value> {
     do_print(s, p, "file.print")
 }
 
 fn print_one_copy(s: &mut Session, p: &Value) -> Result<Value> {
-    let mut q = s.file_menu.last_print.clone().unwrap_or_else(|| json!({}));
+    let mut q = last_print(s).unwrap_or_else(|| json!({}));
+    // A printer remembered from an earlier session may be gone: then the default takes the job,
+    // as the Print dialog falls back (#7410). A list that can't be read decides nothing.
+    if let Ok(listed) = system_printers(s, &q) {
+        let names: Vec<&str> = listed["printers"].as_array().into_iter().flatten().filter_map(|p| p["name"].as_str()).collect();
+        drop_vanished_printer(&mut q, &names);
+    }
     if let (Some(o), Some(extra)) = (q.as_object_mut(), p.as_object()) {
         for (k, v) in extra {
             o.insert(k.clone(), v.clone());
@@ -602,8 +938,15 @@ fn print_one_copy(s: &mut Session, p: &Value) -> Result<Value> {
 fn package(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "file.package";
     let dir = p.get("dir").and_then(Value::as_str).filter(|v| !v.is_empty()).ok_or_else(|| bad(cmd, "missing \"dir\" (where to create the package folder)"))?;
+    // The copies are relinked by absolute path: a relative one would be resolved against the
+    // package document's folder, not the working directory `dir` is relative to.
+    // `folder`, `document` and `links` are built on it with `join`, so it is spelt the same way:
+    // `/` throughout, not a native prefix with `/` after it.
+    let dir = std::path::absolute(dir).map_or_else(|_| dir.to_string(), |d| d.to_string_lossy().into_owned());
+    let dir = crate::file_cmds::forward_slashes(dir);
     let d = s.active().ok_or(EngineError::NoDocument)?;
     let doc = (*d.doc).clone();
+    let document = d.path.clone();
     let name = stem(&d.path.clone().unwrap_or_else(|| doc.name.clone()));
     // The native format keeps external links; our PSD writer has no `lnkE` (external linked
     // file) support yet, so a PSD package would embed or flatten them.
@@ -612,7 +955,7 @@ fn package(s: &mut Session, p: &Value) -> Result<Value> {
         Some(f) => return Err(bad(cmd, format!("unknown package format `{f}` (pcraft|psd|psb)"))),
         None => "pcraft".into(),
     };
-    let folder = join(dir, &crate::file_cmds::sanitize(&name));
+    let folder = join(&dir, &crate::file_cmds::sanitize(&name));
     let links_dir = join(&folder, "Links");
     // Copy every linked file once; relink the copy of the document to the copies.
     let mut copied: Vec<(String, String)> = Vec::new();
@@ -629,7 +972,12 @@ fn package(s: &mut Session, p: &Value) -> Result<Value> {
                     fname = format!("{}-{}", copied.len(), fname);
                 }
                 let t = join(&links_dir, &fname);
-                match read_file(path) {
+                // A path that is not followed is packaged as missing, like a file that is gone.
+                let Ok(file) = crate::doc_path::resolve_in(path, document.as_deref().map(std::path::Path::new)) else {
+                    missing.push(path.clone());
+                    continue;
+                };
+                match read_file(&file.to_string_lossy()) {
                     Ok(bytes) => {
                         write_file(&t, &bytes)?;
                         copied.push((path.clone(), t.clone()));
@@ -750,7 +1098,7 @@ pub fn specs() -> Vec<CommandSpec> {
             CommandSpec { id: $id, label: $label, menu: $menu, shortcut: $sc, params: $params, enabled: $enabled, journal: true, run: $run }
         };
     }
-    const PRINT_PARAMS: &str = r##"{"printerSettings":hex? (Windows driver settings),"printer":name? (default printer),"copies":1..999=1,"paper":"letter|legal|tabloid|a3|a4|a5|4x6|5x7"|[w,h] pt="letter","orientation":"portrait|landscape"="portrait","center":bool=true,"top":in?,"left":in?,"scale":%=100,"scaleToFit":bool=false,"colorHandling":"printerManages|photocraftManages|noColorManagement"="printerManages","printerProfile":profile? (photocraftManages),"intent":"perceptual|relative|saturation|absolute"="relative","bpc":bool=true,"cornerCropMarks":bool,"centerCropMarks":bool,"registrationMarks":bool,"description":bool,"labels":bool,"emulsionDown":bool=false (mirror the page left to right, for sublimation and other transfer printing),"output":pdf path? (print to PDF; then "send" defaults to false),"send":bool?,"dryRun":bool=false (render the PDF, report the backend command, don't spool; write a PDF only at an explicit output path)} → {pdf:path|null (null without explicit output), imageRect, command:diagnostic array|null, sent}"##;
+    const PRINT_PARAMS: &str = r##"{"printerSettings":hex? (Windows driver settings),"printer":name? (default printer),"copies":1..999=1,"paper":"letter|legal|tabloid|a3|a4|a5|4x6|5x7"|[w,h] pt="letter","orientation":"portrait|landscape"="portrait","center":bool=true,"top":in?,"left":in?,"scale":%=100,"scaleToFit":bool=false,"colorHandling":"printerManages|photocraftManages|noColorManagement"="printerManages","printerProfile":profile? (photocraftManages),"intent":"perceptual|relative|saturation|absolute"="relative","bpc":bool=true,"cornerCropMarks":bool,"centerCropMarks":bool,"registrationMarks":bool,"description":bool,"labels":bool,"emulsionDown":bool=false (mirror the page left to right, for sublimation and other transfer printing),"output":pdf path? (print to PDF; then "send" defaults to false),"send":bool?,"printServer":"host[:port]|socket path"? (default: the system's CUPS; a named server is always printed to over IPP),"dryRun":bool=false (render the PDF, report the backend command, don't spool; write a PDF only at an explicit output path)} → {pdf:path|null (null without explicit output), imageRect, command:diagnostic array|null, sent, spooler:where the job went|null, backend:"lp|windows|ipp|portal"|null}"##;
 
     vec![
         spec!("file.print", "Print…", &["File"], Some("Cmd+P"), PRINT_PARAMS, native_doc, print),
@@ -769,7 +1117,7 @@ pub fn specs() -> Vec<CommandSpec> {
             label: "Printer Page",
             menu: &[],
             shortcut: None,
-            params: r##"{"printer":name? (default printer),"printerSettings":hex?} → {printer, paper: [w,h] pt, printable: [x,y,w,h] pt from the top-left, dpi: [x,y]} (Windows)"##,
+            params: r##"{"printer":name? (default printer),"printerSettings":hex?,"orientation":"portrait|landscape"? (turn the settings, or the printer's own, that way)} → {printer, paper: [w,h] pt, printable: [x,y,w,h] pt from the top-left, dpi: [x,y], printerSettings: hex (only with orientation: the turned settings)} (Windows)"##,
             enabled: |_| Ok(()),
             journal: false,
             run: printer_page,

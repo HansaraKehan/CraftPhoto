@@ -132,3 +132,32 @@ fn reveal_survives_odd_documents() {
     h.state_mut().sync_views();
     h.run_steps(3);
 }
+#[test]
+fn layers_scroll_position_survives_document_switches() {
+    for theme in [ThemeKind::ProMedium, ThemeKind::Studio] {
+        let (app, inner, _, _, _) = tall_doc();
+        let mut h = harness(app, theme);
+        h.state_mut().run("layer.select", json!({"layer": inner.0})).unwrap();
+        h.run_steps(4);
+        let before = row(&h, "Deep inside").unwrap();
+        assert!(in_view(&h, before));
+
+        // A short second document clamps its own scroll offset to zero. That must
+        // not erase the first document's position or trigger a selection change.
+        h.state_mut().run("file.new", json!({"width": 20, "height": 20})).unwrap();
+        h.state_mut().sync_views();
+        h.run_steps(4);
+        for _ in 0..3 {
+            h.state_mut().session.set_active(0);
+            h.state_mut().sync_views();
+            h.run_steps(4);
+            assert_eq!(h.state().session.active().unwrap().active_layer, Some(inner));
+            let restored = row(&h, "Deep inside").unwrap();
+            assert!(in_view(&h, restored), "{theme:?}: restored bottom row: {restored:?}");
+            assert!((restored.top() - before.top()).abs() < 0.5, "{theme:?}: restored exact scroll position");
+            h.state_mut().session.set_active(1);
+            h.state_mut().sync_views();
+            h.run_steps(4);
+        }
+    }
+}

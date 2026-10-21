@@ -540,6 +540,9 @@
 # Field Blur pins (#3373)
 	No pin selected	Nenhum alfinete selecionado
 	Click the image to add a pin; drag a pin to move it, or its ring to change its blur. Delete removes the selected pin.	Clique na imagem para adicionar um alfinete; arraste um alfinete para movê-lo ou o anel dele para alterar o desfoque. Delete remove o alfinete selecionado.
+	Drag the handles on the outline to resize and turn it, the square to round its corners, and the dots inside to set where the blur starts.	Arraste as alças do contorno para redimensionar e girar, o quadrado para arredondar os cantos e os pontos internos para definir onde o desfoque começa.
+	Drag the pin to move the band, or its ring to change its blur. Drag the solid lines to widen the sharp band, the dashed lines to set the transition, and the dots to turn it.	Arraste o alfinete para mover a faixa ou o anel para alterar o desfoque. Arraste as linhas contínuas para alargar a faixa nítida, as tracejadas para definir a transição e os pontos para girá-la.
+	Drag the handles on the outline to resize and turn it; the ring sets the blur angle.	Arraste as alças do contorno para redimensionar e girar; o anel define o ângulo de desfoque.
 	Iris Blur…	Desfoque de íris…
 	Tilt-Shift…	Tilt-shift…
 	Path Blur…	Desfoque de demarcador…
@@ -966,7 +969,6 @@
 	Contiguous	Contíguo
 	Contrast	Contraste
 	Control:	Controle:
-	Convert document's colors to the working space	Converter as cores do documento para o espaço de trabalho
 	Convert to sRGB	Converter para sRGB
 	Copies	Cópias
 	Copper	Cobre
@@ -1023,6 +1025,7 @@
 	Delete Group	Excluir grupo
 	Delete Layer Mask	Excluir máscara de camada
 	Delete Layers	Excluir camadas
+	Add Shortcut	Adicionar atalho
 	Delete Shortcut	Excluir atalho
 	Delete Timeline	Excluir linha do tempo
 	Delete Tool Preset	Excluir predefinição de ferramenta
@@ -1543,7 +1546,6 @@
 	Use Default	Usar padrão
 	Use Legacy	Usar legado
 	Use Measurement Scale	Usar escala de medida
-	Use the embedded profile (instead of the working space)	Usar o perfil incorporado (em vez do espaço de trabalho)
 	Variables bind a layer's visibility, text or pixels to a named data slot.	As variáveis vinculam a visibilidade, o texto ou os pixels de uma camada a um campo de dados nomeado.
 	Vertical scale	Escala vertical
 	Vibrance	Vibração
@@ -1860,6 +1862,8 @@
 	Camera Raw Defaults	Padrões do Camera Raw
 	Canvas border	Borda da tela de pintura
 	Show canvas dots	Mostrar pontos da tela de pintura
+	Clip thumbnails to layer bounds	Recortar miniaturas aos limites da camada
+	Clip Thumbnails to Layer Bounds	Recortar miniaturas aos limites da camada
 	Canvas color	Cor da tela de pintura
 	Canvas custom color	Cor personalizada da tela de pintura
 	Color picker	Seletor de cores
@@ -2046,7 +2050,8 @@
 	Expand group  ({key}-click: all groups)	Expandir grupo  ({key}-clique: todos os grupos)
 	Fade steps	Etapas de atenuação
 	Hide the layer's effects  ({key}-click: all layers)	Ocultar os efeitos da camada  ({key}-clique: todas as camadas)
-	Import Brushes… (.abr)	Importar pincéis… (.abr)
+	Import Brushes… (.abr or image)	Importar pincéis… (.abr ou imagem)
+	Import Brush from Image…	Importar pincel de imagem…
 	Move Group Down	Mover grupo para baixo
 	Move Group Up	Mover grupo para cima
 	Reset the brush to the defaults	Redefinir o pincel para os padrões
@@ -2107,6 +2112,11 @@
 	Apply the pen's tilt and rotation to the tip shape	Aplicar a inclinação e a rotação da caneta à forma da ponta
 	Mixer Brush	Pincel misturador
 	Wet	Molhado
+	Current Brush Load	Carga atual do pincel
+	Load Brush	Carregar pincel
+	Clean Brush	Limpar pincel
+	Load the brush after each stroke	Carregar o pincel após cada traço
+	Clean the brush after each stroke	Limpar o pincel após cada traço
 	Mix	Mistura
 	Wetness Jitter	Variação da umidade
 	Mix Jitter	Variação da mistura
@@ -2156,7 +2166,6 @@
 	Cancelled opening {name}	Abertura de {name} cancelada
 	The document “{name}” does not have an embedded {mode} profile.	O documento “{name}” não tem um perfil {mode} incorporado.
 	The document “{name}” has an embedded color profile that does not match the current {mode} working space.	O documento “{name}” tem um perfil de cores incorporado que não corresponde ao espaço de trabalho {mode} atual.
-	Embedded: {embedded}	Incorporado: {embedded}
 	Working: {working}	Espaço de trabalho: {working}
 	Developing {name}	Revelando {name}
 	Cancelled {label}	{label} cancelado
@@ -2861,7 +2870,6 @@ cameraRaw	Whites	Brancos
 	Redrawing	Redesenhando
 	This redraw took {seconds} s on the CPU.	Este redesenho na CPU levou {seconds} s.
 	Edits that change the whole document, such as a layer's blend mode, opacity or visibility, redraw all of it.	Edições que mudam o documento inteiro, como modo de mesclagem, opacidade ou visibilidade de uma camada, redesenham tudo.
-	Its layers don't fit the GPU memory budget. Raising Memory usage in Preferences › Performance raises the budget, up to a quarter of this computer's memory.	As camadas não cabem no orçamento de memória da GPU. Aumentar Uso de memória em Preferências › Desempenho eleva o orçamento, até um quarto da memória deste computador.
 	The GPU compositor wasn't used: {reason}	O compositor de GPU não foi usado: {reason}
 fontWeight	Thin	Fina
 fontWeight	ExtraLight	Extrafina
@@ -2925,6 +2933,8 @@ fontWeight	Italic	Itálico
 	Color Picker (Layer Style Color)	Seletor de cores (cor do estilo de camada)
 	Auto Hide Notifications	Ocultar notificações automaticamente
 	Notification Duration (seconds)	Duração da notificação (segundos)
+	Bundle Arrow-Key Nudges	Agrupar deslocamentos com as setas
+	Nudge Bundle Pause (ms)	Pausa para agrupar deslocamentos (ms)
 	Appearance Mode	Modo de aparência
 	Dark Theme	Tema escuro
 	Light Theme	Tema claro
@@ -3049,7 +3059,27 @@ cameraData	Lens	Lente
 	Snap to Origin	Ajustar à origem
 	Search settings…	Pesquisar configurações…
 	No matching settings	Nenhuma configuração encontrada
+# Edit › Content-Aware Fill workspace
+	Sampling Brush Tool	Ferramenta Pincel de amostragem
+	Sampling Area Overlay	Sobreposição da área de amostragem
+	Show Sampling Area	Mostrar área de amostragem
+	Indicates	Indica
+	Sampling Area	Área de amostragem
+	Excluded Area	Área excluída
+	Sampling Area Options	Opções da área de amostragem
+	Rectangular	Retangular
+	Fill Settings	Configurações de preenchimento
+	Rotation Adaptation	Adaptação de rotação
+	Very High	Muito alta
+	Full	Completa
+	Mirror	Espelhar
+	Output Settings	Configurações de saída
+	Output To	Saída para
+	New Layer	Nova camada
+	Duplicate Layer	Duplicar camada
+	Contract	Contrair
 	Loading fonts…	Carregando fontes…
+	Response curve	Curva de resposta
 	Tool	Ferramenta
 	Simulate Pressure	Simular pressão
 	Stroke Path…	Traçar demarcador…
@@ -3067,7 +3097,6 @@ curves	Smooth	Suavizar
 	Smooth the curve values	Suavizar os valores da curva
 	Drag to draw the curve · {key}-click draws a straight line	Arraste para desenhar a curva · {key}-clique traça uma linha reta
 	Grid Size:	Tamanho da grade:
-	New Layer	Nova camada
 	Vanishing Point: click four corners to create a plane	Ponto de fuga: clique em quatro cantos para criar um plano
 	Vanishing Point is not active	Ponto de fuga não está ativo
 	Apply Vanishing Point ({key})	Aplicar ponto de fuga ({key})
@@ -3112,7 +3141,6 @@ layerLabel	No Color	Sem cor
 	Clear Selection	Limpar seleção
 	Invert Selection	Inverter seleção
 	Select Inverse	Inverter seleção
-	Contract	Contrair
 	Sample Size	Tamanho da amostra
 	Strength	Intensidade
 	Gamma	Gama
@@ -3139,7 +3167,6 @@ layerLabel	No Color	Sem cor
 	Workspaces	Áreas de trabalho
 	Show All	Mostrar tudo
 	Hidden	Oculto
-	Duplicate Layer	Duplicar camada
 	Ungroup	Desagrupar
 	Lock Transparent Pixels	Bloquear pixels transparentes
 	Lock Image Pixels	Bloquear pixels da imagem
@@ -3899,6 +3926,7 @@ layerLabel	No Color	Sem cor
 	Remove after each stroke	Remover após cada traço
 	Apply the removal ({key})	Aplicar a remoção ({key})
 	Strokes to remove: {n} (Enter applies, Esc cancels)	Traços a remover: {n} (Enter aplica, Esc cancela)
+	Show home recent files	Mostrar arquivos recentes na tela inicial
 	Clear Brush Controls	Limpar controles de pincel
 	Reset All Locked Settings	Redefinir todas as configurações bloqueadas
 	Copy Texture to Other Tools	Copiar textura para outras ferramentas
@@ -3925,6 +3953,9 @@ layerLabel	No Color	Sem cor
 	Action playback stopped	Reprodução da ação interrompida
 	Step {step} is waiting for its dialog	A etapa {step} está aguardando sua caixa de diálogo
 @plural	{n} action|{n} actions	{n} ação|{n} ações
+	Background (Default)	Plano de fundo (padrão)
+# Batch / Image Processor
+	Include All Subfolders	Incluir todas as subpastas
 	Auto Add/Delete	Adicionar/excluir automaticamente
 
 # Native Windows printing qualification
@@ -3934,3 +3965,84 @@ layerLabel	No Color	Sem cor
 	Sent to {printer}	Enviado para {printer}
 	set in Print Settings…	definido nas configurações de impressão…
 	ICO is limited to 256 × 256 pixels	ICO é limitado a 256 × 256 pixels
+# Embedded Profile Mismatch: profile names beside the choices, Remember this choice
+	Use the embedded profile ({profile})	Usar o perfil incorporado ({profile})
+	Convert to the working space ({profile})	Converter para o espaço de trabalho ({profile})
+	Remember this choice for future images	Lembrar esta escolha para as próximas imagens
+	Turn the prompt back on with Ask On Mismatch in Edit › Color Settings.	Reative a pergunta com Ask On Mismatch em Editar › Configurações de cores.
+	Button Mode	Modo de botão
+	Button Mode On	Modo de botão ativado
+
+# Darken / Lighten Interface (⇧⌘F1 / ⇧⌘F2)
+	Darken Interface	Escurecer interface
+	Lighten Interface	Clarear interface
+# Bevel & Emboss Technique.
+	Technique	Técnica
+	Chisel Hard	Cinzel duro
+	Chisel Soft	Cinzel suave
+	Open color-less EXR as ACEScg	Abrir EXR sem espaço de cor como ACEScg
+
+# View › Guides › right-click a guide
+	Edit Selected Guides	Editar guias selecionadas
+	Clear Selected Guides	Limpar guias selecionadas
+	Pasting from other apps is unavailable	Colar de outros aplicativos não está disponível
+	PhotoCraft can't reach the system clipboard in this session. On Wayland, a Flatpak sandbox hides the protocol that images from other apps are read through.	O PhotoCraft não consegue acessar a área de transferência do sistema nesta sessão. No Wayland, a sandbox do Flatpak oculta o protocolo pelo qual as imagens de outros aplicativos são lidas.
+	To paste from other apps, start PhotoCraft under XWayland: `{command}`	Para colar de outros aplicativos, execute o PhotoCraft no XWayland: `{command}`
+	Nothing to paste: PhotoCraft can't read the system clipboard here	Nada para colar: o PhotoCraft não consegue ler a área de transferência do sistema aqui
+	Delete this set	Excluir este conjunto
+	New Set…	Novo conjunto…
+	PhotoCraft Defaults	Padrões do PhotoCraft
+	Save a list of these shortcuts as a web page	Salvar uma lista destes atalhos como página da web
+	Save the changes to this set	Salvar as alterações neste conjunto
+	Save these shortcuts as a .kys file	Salvar estes atalhos como arquivo .kys
+	Save these shortcuts as a new set	Salvar estes atalhos como um novo conjunto
+	Set deleted.	Conjunto excluído.
+	Set saved.	Conjunto salvo.
+	Set:	Conjunto:
+	Summarize…	Resumir…
+	There are too many sets: delete one first.	Há conjuntos demais: exclua um primeiro.
+	set name	nome do conjunto
+	{set} (modified)	{set} (modificado)
+	Show file name in title	Exibir nome do arquivo no título
+	Accept and Go to Conflict	Aceitar e ir para o conflito
+	Changes undone.	Alterações desfeitas.
+	Choose a new shortcut for this command, or leave it without one.	Escolha um novo atalho para este comando ou deixe-o sem atalho.
+	Put this command's shortcuts back as they were	Restaurar os atalhos deste comando como estavam
+	Take the shortcut from the other command and select it	Tirar o atalho do outro comando e selecioná-lo
+	Undo Changes	Desfazer alterações
+	{shortcut} is reserved by the system and can't be assigned.	{shortcut} é reservado pelo sistema e não pode ser atribuído.
+	Low-Latency Drawing (vsync off, applies at next launch)	Desenho de baixa latência (sem sincronização vertical, aplicado na próxima inicialização)
+# Free Transform: a new layer while the box is open (#5859)
+	Free Transform is still being applied; try again when it has finished.	A Transformação livre ainda está sendo aplicada; tente novamente quando terminar.
+	The transform couldn't be applied.	Não foi possível aplicar a transformação.
+# Preferences › Performance › GPU Memory; the status bar and slow-redraw notice
+	Its layers need {needed} of GPU memory; the budget leaves them {budget}.	As camadas precisam de {needed} de memória da GPU; o orçamento lhes deixa {budget}.
+	Set GPU Memory in Preferences › Performance to what your graphics card can hold, at most 3/8 of its memory. Automatic follows Memory Usage, within a quarter of this computer's memory and 3/8 of the card's, and doesn't count the document against a card whose memory is known. The status bar shows GPU Memory Full while they don't fit.	Ajuste Memória da GPU em Preferências › Desempenho para o que sua placa de vídeo comporta, no máximo 3/8 da memória dela. Automático segue Uso de memória, dentro de um quarto da memória deste computador e 3/8 da memória da placa, e não desconta o documento de uma placa cuja memória é conhecida. Enquanto não couberem, a barra de status mostra Memória da GPU cheia.
+	GPU Memory Full	Memória da GPU cheia
+	The layers need {needed} of GPU memory and may hold {budget}, so edits that redraw the whole document do it on the CPU. Click to set GPU Memory.	As camadas precisam de {needed} de memória da GPU e podem ocupar {budget}, então as edições que redesenham o documento inteiro fazem isso na CPU. Clique para ajustar Memória da GPU.
+	GPU memory budget: {budget}	Orçamento de memória da GPU: {budget}
+	This document's layers: {needed} of {budget} for layers	Camadas deste documento: {needed} de {budget} para camadas
+	This document's layers need {needed} but may hold {budget}: whole-document redraws use the CPU	As camadas deste documento precisam de {needed} mas podem ocupar {budget}: o documento inteiro é redesenhado na CPU
+	GPU Memory (MB, 0 = Automatic)	Memória da GPU (MB, 0 = Automático)
+	{name} was changed by another app after it was opened or saved here.	{name} foi alterado por outro app depois de ser aberto ou salvo aqui.
+	Replace it with this document, or cancel and use File › Save As to keep both.	Substitua-o por este documento, ou cancele e use Arquivo › Salvar como para manter os dois.
+	Decrease Brush Size	Diminuir tamanho do pincel
+	Increase Brush Size	Aumentar tamanho do pincel
+	Decrease Brush Hardness	Diminuir dureza do pincel
+	Increase Brush Hardness	Aumentar dureza do pincel
+	Memory Usage	Uso de memória
+	Per-document RAM limit (MB)	Limite de RAM por documento (MB)
+	Installed RAM: {ram} MB; this limit: {percent}%	RAM instalada: {ram} MB; este limite: {percent}%
+	Limits each open document's pixels plus History. Oldest undo states are discarded when the limit is exceeded.	Limita os pixels mais o Histórico de cada documento aberto. Os estados de desfazer mais antigos são descartados ao exceder o limite.
+	Applies immediately when saved. Memory is not reserved in advance.	Aplica-se ao salvar. A memória não é reservada antecipadamente.
+	With GPU Memory set to Automatic, this also limits the GPU layer budget. That budget is capped at one quarter of installed RAM and, when known, three eighths of the graphics card's memory, with a 512 MB minimum. Raising this limit beyond those caps does not increase the GPU budget.	Com Memória GPU Automática, também limita o orçamento GPU. O teto é um quarto da RAM e, se conhecido, três oitavos da memória da placa, mínimo 512 MB. Aumentar o limite não aumenta o orçamento GPU.
+	Use	Usar
+	In Front	Na frente
+	Behind	Atrás
+
+# DDS Options (#1327)
+	DDS Options	Opções de DDS
+	Generate Mipmaps	Gerar mipmaps
+
+# Graphics Adapter preference (#1885)
+	GPU adapter	Adaptador de GPU

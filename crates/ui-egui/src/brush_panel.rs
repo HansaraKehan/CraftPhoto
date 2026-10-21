@@ -249,7 +249,6 @@ fn section_list(app: &mut PhotocraftApp, ui: &mut egui::Ui, b: &mut BrushSetting
         ui.set_width(150.0);
         ui.spacing_mut().item_spacing.y = 1.0;
         let (br_rect, br_resp) = ui.allocate_exact_size(vec2(150.0, 23.0), Sense::click());
-        br_resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, tl!("Brushes")));
         if br_resp.hovered() {
             ui.painter().rect_filled(br_rect, t.radius_sm, t.hover);
         }

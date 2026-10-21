@@ -81,6 +81,7 @@ fn put_ustr(out: &mut Vec<u8>, s: &str) {
 
 // ---------- descriptor helpers (versions 7/8 and the v6 tail) ----------
 
+/// A number as `i64`; float casts saturate (NaN reads as 0).
 fn d_int(d: &Descriptor, key: &str) -> Option<i64> {
     match d.get(key)? {
         Value::Integer(v) => Some(i64::from(*v)),
@@ -88,6 +89,20 @@ fn d_int(d: &Descriptor, key: &str) -> Option<i64> {
         Value::Double(v) => Some(*v as i64),
         Value::UnitFloat { value, .. } => Some(*value as i64),
         _ => None,
+    }
+}
+
+/// A coordinate, clamped to the `i32` range instead of wrapping.
+fn d_i32(d: &Descriptor, key: &str) -> Option<i32> {
+    d_int(d, key).map(|v| v.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32)
+}
+
+/// An id. A 32-bit `long` holds the id's bits (ids past `i32::MAX` are written negative); any
+/// other number outside the `u32` range is no id at all rather than a wrapped one.
+fn d_u32(d: &Descriptor, key: &str) -> Option<u32> {
+    match d.get(key)? {
+        Value::Integer(v) => Some(*v as u32),
+        _ => u32::try_from(d_int(d, key)?).ok(),
     }
 }
 
@@ -111,7 +126,7 @@ fn d_bool(d: &Descriptor, key: &str) -> bool {
 
 fn d_bounds(d: &Descriptor, key: &str) -> Option<[i32; 4]> {
     let Value::Descriptor(b) = d.get(key)? else { return None };
-    let g = |k: &str| d_int(b, k).unwrap_or(0) as i32;
+    let g = |k: &str| d_i32(b, k).unwrap_or(0);
     // top, left, bottom, right
     Some([g("Top "), g("Left"), g("Btom"), g("Rght")])
 }
@@ -143,10 +158,10 @@ fn slice_from_descriptor(d: &Descriptor) -> SliceRecord {
         _ => [0; 4],
     };
     SliceRecord {
-        id: d_int(d, "sliceID").unwrap_or(0) as u32,
-        group_id: d_int(d, "groupID").unwrap_or(0) as u32,
+        id: d_u32(d, "sliceID").unwrap_or(0),
+        group_id: d_u32(d, "groupID").unwrap_or(0),
         origin: d_enum(d, "origin").map_or(2, |s| origin_from(&s)),
-        layer_id: d_int(d, "layerID").map(|v| v as u32),
+        layer_id: d_u32(d, "layerID"),
         name: d_text(d, "Nm  "),
         kind: d_enum(d, "Type").map_or(1, |s| kind_from(&s)),
         // Descriptor bounds are top/left/bottom/right; records use left/top/right/bottom.
@@ -161,10 +176,10 @@ fn slice_from_descriptor(d: &Descriptor) -> SliceRecord {
         vertical_align: 0,
         color,
         outsets: [
-            d_int(d, "topOutset").unwrap_or(0) as i32,
-            d_int(d, "leftOutset").unwrap_or(0) as i32,
-            d_int(d, "bottomOutset").unwrap_or(0) as i32,
-            d_int(d, "rightOutset").unwrap_or(0) as i32,
+            d_i32(d, "topOutset").unwrap_or(0),
+            d_i32(d, "leftOutset").unwrap_or(0),
+            d_i32(d, "bottomOutset").unwrap_or(0),
+            d_i32(d, "rightOutset").unwrap_or(0),
         ],
     }
 }
@@ -261,8 +276,10 @@ impl SlicesResource {
         {
             for v in items {
                 let Value::Descriptor(d) = v else { continue };
+                // An entry without a usable id belongs to no slice (not to slice 0).
+                let Some(id) = d_u32(d, "sliceID") else { continue };
                 let extra = slice_from_descriptor(d);
-                if let Some(s) = slices.iter_mut().find(|s| s.id == extra.id) {
+                if let Some(s) = slices.iter_mut().find(|s| s.id == id) {
                     s.outsets = extra.outsets;
                 }
             }
@@ -433,6 +450,33 @@ mod tests {
         assert_eq!(back.slices[2].layer_id, Some(7));
         assert_eq!(back.slices[2].kind, 0);
         assert_eq!(back.slices[2].outsets, [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn out_of_range_descriptor_numbers_do_not_wrap() {
+        // sliceID 2^32+1 used to read as slice 1 and take that slice's outsets.
+        let wide = |key: &str| Descriptor::new("slice").with("sliceID", Value::LargeInteger((1 << 32) + 1)).with(key, Value::Integer(9));
+        let mut plain = sample();
+        for s in &mut plain.slices {
+            s.outsets = [0; 4];
+        }
+        let mut bytes = plain.to_bytes();
+        VersionedDescriptor::new(Descriptor::new("null").with("slices", Value::List(vec![Value::Descriptor(wide("topOutset"))]))).write(&mut bytes);
+        let back = SlicesResource::from_bytes(&bytes).unwrap();
+        assert!(back.slices.iter().all(|s| s.outsets == [0; 4]), "{:?}", back.slices);
+
+        // Descriptor form: ids out of the u32 range fall back to 0, coordinates clamp.
+        let d = wide("leftOutset")
+            .with("layerID", Value::LargeInteger(-1))
+            .with("bottomOutset", Value::LargeInteger(1 << 40))
+            .with("rightOutset", Value::Double(-1e12))
+            .with("bounds", Value::Descriptor(Descriptor::new("Rct1").with("Top ", Value::LargeInteger((1 << 32) + 5))));
+        let s = slice_from_descriptor(&d);
+        assert_eq!((s.id, s.layer_id), (0, None));
+        assert_eq!(s.outsets, [0, 9, i32::MAX, i32::MIN]);
+        assert_eq!(s.rect[1], i32::MAX);
+        // A 32-bit long keeps the id's bits, as `to_descriptor_bytes` writes ids past i32::MAX.
+        assert_eq!(slice_from_descriptor(&Descriptor::new("slice").with("sliceID", Value::Integer(-1))).id, u32::MAX);
     }
 
     #[test]

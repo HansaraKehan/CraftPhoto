@@ -270,6 +270,8 @@ pub(crate) fn adjust_as_smart_filter(s: &mut Session, kind: &str, label: &str, p
     if !smart {
         return Ok(false);
     }
+    // A pixel or full lock refuses the smart filter, as for `filter.*` on a smart object.
+    crate::commands::check_pixels_unlocked(&s.active().ok_or(EngineError::NoDocument)?.doc, id)?;
     // The recorded params are the command's own, minus the engine's private `__kind` key.
     let mut params = p.clone();
     if let Value::Object(m) = &mut params {
@@ -296,6 +298,18 @@ fn has_doc(s: &Session) -> std::result::Result<(), String> {
 /// Image › Adjustments run as a smart filter (`image.adjustments.<kind>` recorded on a smart
 /// object): the adjustment applied to a copy of `surf`. `None` for kinds or params it can't run.
 pub(crate) fn adjust_as_filter(kind: &str, p: &Value, surf: &Surface) -> Option<Surface> {
+    // A Color Lookup filter re-reads its LUT `file`, a path stored in the document: followed only
+    // as `doc_path` allows, else the filter can't run (like a missing file).
+    let resolved;
+    let p = match p.get("file").and_then(Value::as_str).filter(|f| kind == "colorLookup" && !f.is_empty()) {
+        Some(file) => {
+            let mut q = p.clone();
+            q["file"] = json!(crate::doc_path::resolve(file).ok()?.to_str()?);
+            resolved = q;
+            &resolved
+        }
+        None => p,
+    };
     let mut out = surf.clone();
     if kind == "shadowsHighlights" {
         let sh = shadows_highlights_params(p);
@@ -335,7 +349,7 @@ fn shadows_highlights_params(p: &Value) -> ShadowsHighlights {
 
 fn replace_color(s: &mut Session, p: &Value) -> Result<Value> {
     const CMD: &str = "image.adjustments.replaceColor";
-    let c = crate::commands::color_param(p, "color", s.tools.foreground);
+    let c = crate::commands::color_param(CMD, p, "color", s.tools.foreground)?;
     let fuzz = num(p, "fuzziness", 40.0).clamp(0.0, 200.0);
     let (h, sat, l) = (num(p, "hue", 0.0).clamp(-180.0, 180.0), num(p, "saturation", 0.0).clamp(-100.0, 100.0), num(p, "lightness", 0.0).clamp(-100.0, 100.0));
     // Localized Color Clusters, as in Select › Color Range: the colour only matches within Range

@@ -263,7 +263,8 @@ fn can_align(s: &Session) -> std::result::Result<(), String> {
     let d = doc_state(s)?;
     match d.selected_layers().len() {
         0 => Err("no layer selected".into()),
-        // Photoshop aligns a single layer to the canvas (or to an active selection); 2+ align to each other.
+        // Photoshop aligns to an active selection however many layers are selected; without one,
+        // a single layer aligns to the canvas and 2+ align to each other.
         _ => Ok(()),
     }
 }
@@ -884,9 +885,9 @@ pub(crate) fn note_inert_insert(s: &mut Session, id: LayerId) {
     }
 }
 
-/// Report the pixels an edit from `before` that added layers changed ([`step_damage`]), for
-/// commands made of more than one edit, so the canvas recomposites only where the new layers
-/// draw instead of the whole document.
+/// Report the pixels a command made of more than one edit changed since `before` ([`step_damage`]),
+/// so the canvas recomposites only where its new layers draw instead of the whole document.
+/// A single [`Session::edit`] already reports its own damage: don't call this after one (#5695).
 pub(crate) fn note_insert(s: &mut Session, before: &Document) {
     let Some(st) = s.active_mut() else { return };
     st.last_damage = step_damage(before, &st.doc);
@@ -961,8 +962,9 @@ fn align(s: &mut Session, p: &Value, kind: &str) -> Result<Value> {
             "canvas" => doc.bounds(),
             "selection" => doc.selection.as_ref().map(|m| m.content_bounds()).ok_or_else(|| EngineError::Other("there is no selection to align to".into()))?,
             "auto" | "layers" => match (&doc.selection, sel.len()) {
-                // Photoshop: one layer plus an active selection aligns to the selection bounds.
-                (Some(m), 1) if to == "auto" => m.content_bounds(),
+                // Photoshop: with an active selection, the layers align to its bounds (Layer › Align
+                // Layers to Selection), however many are selected.
+                (Some(m), _) if to == "auto" && !m.content_bounds().is_empty() => m.content_bounds(),
                 // One layer with no selection aligns to the canvas (otherwise it would align to itself).
                 (None, 1) if to == "auto" => doc.bounds(),
                 _ => items.iter().fold(Rect::EMPTY, |a, (_, b)| a.union(b)),
@@ -1312,6 +1314,12 @@ fn merge_layers(s: &mut Session) -> Result<Value> {
         let fmt = PixelFormat::new(fmt.mode, fmt.sample, true);
         let mut merged = Layer::raster(top.name.clone(), fmt);
         merged.locks = top.locks;
+        merged.label = top.label;
+        // Clipped layers of one chain merge into a layer still clipped to their base. Clipped
+        // layers of different chains don't: the result, at the top one's slot, would clip the
+        // lower chain's pixels to the upper chain's base.
+        let base = crate::clip_group::base_of(doc, top_id);
+        merged.clipped = base.is_some() && solo.layers.iter().all(|l| l.clipped && crate::clip_group::base_of(doc, l.id) == base);
         *crate::pixels_mut(&mut merged)? = crate::pixels::composite_layers_uncropped(&solo, fmt);
         let mid = merged.id;
         // Hidden selected layers are discarded, as in Photoshop.
@@ -1378,7 +1386,6 @@ pub fn delete_selected(s: &mut Session) -> Result<Value> {
 /// this path, #2777).
 pub fn duplicate_selected(s: &mut Session, in_place: bool, label: &str) -> Result<Value> {
     let sel = selected(s);
-    let before = s.active().ok_or(EngineError::NoDocument)?.doc.clone();
     let old_active = s.active().and_then(|d| d.active_layer);
     let (copies, active) = s.edit(label, |doc, active| {
         let mut copies = Vec::new();
@@ -1400,7 +1407,6 @@ pub fn duplicate_selected(s: &mut Session, in_place: bool, label: &str) -> Resul
         *active = a;
         Ok((copies, a))
     })?;
-    note_insert(s, &before);
     let out = copies.iter().map(|l| l.0).collect::<Vec<_>>();
     reselect(s, copies, active);
     Ok(json!({"layers": out, "layer": active.map(|l| l.0)}))
@@ -1431,7 +1437,7 @@ pub fn specs() -> Vec<CommandSpec> {
             CommandSpec { id: $id, label: $label, menu: $menu, shortcut: $sc, params: $params, enabled: $enabled, journal: true, run: $run }
         };
     }
-    const ALIGN: &str = r##"{"to":"auto|layers|selection|canvas"="auto"} (auto: the selection bounds with one layer and an active selection, else the selected layers' bounds)"##;
+    const ALIGN: &str = r##"{"to":"auto|layers|selection|canvas"="auto"} (auto: the active selection's bounds when there is one, however many layers are selected; else one layer aligns to the canvas and several to their combined bounds)"##;
     vec![
         spec!("select.allLayers", "All Layers", &["Select"], Some("Cmd+Alt+A"), "{}", has_doc, |s, _| select_all_layers(s)),
         spec!("select.deselectLayers", "Deselect Layers", &["Select"], None, "{}", has_doc, |s, _| {
@@ -1479,7 +1485,15 @@ pub fn specs() -> Vec<CommandSpec> {
             link_layers(s)
         }),
         spec!("layer.mergeLayers", "Merge Layers", &["Layer"], Some("Cmd+E"), "{} (one layer selected: Merge Down)", has_layer, |s, _| merge_layers(s)),
-        spec!("layer.new.groupFromLayers", "Group from Layers…", &["Layer", "New"], None, r##"{"name":str?}"##, has_layer, group_layers),
+        spec!(
+            "layer.new.groupFromLayers",
+            "Group from Layers…",
+            &["Layer", "New"],
+            None,
+            r##"{"layer":id?,"name":str?} (no layer: every selected layer)"##,
+            has_layer,
+            group_layers
+        ),
         spec!("layer.arrange.reverse", "Reverse", &["Layer", "Arrange"], None, "{}", two_plus, |s, _| reverse(s)),
         spec!(
             "layer.lockLayers",
@@ -1807,8 +1821,8 @@ mod tests {
         x.px.iter().zip(&y.px).enumerate().all(|(i, (p, q))| p == q || damage.contains(i as i32 % w, i as i32 / w))
     }
 
-    /// Duplicate, paste and delete, and their undo and redo, recomposite only where the layer
-    /// draws; undoing a duplicate used to recomposite the whole document.
+    /// Duplicate (one layer or several), paste and delete, and their undo and redo, recomposite
+    /// only where the layers draw; undoing a duplicate used to recomposite the whole document.
     #[test]
     fn duplicate_paste_and_delete_report_where_the_layer_draws() {
         let mut s = session(8);
@@ -1831,6 +1845,12 @@ mod tests {
         s.execute("edit.copy", json!({})).unwrap();
         s.execute("select.deselect", json!({})).unwrap();
         step(&mut s, "edit.paste", json!({}));
+        // Duplicating several selected layers reports where the copies draw, too.
+        let b = rect_layer(&mut s, Rect::new(30, 30, 40, 40));
+        s.execute("layer.select", json!({"layer": a.0})).unwrap();
+        s.execute("layer.select", json!({"layer": b.0, "mode": "add"})).unwrap();
+        step(&mut s, "layer.duplicate", json!({}));
+        assert_eq!(damage(&s), Some(Rect::new(10, 10, 40, 40)), "both copies, nothing else");
         step(&mut s, "layer.delete", json!({"layer": a.0}));
     }
 

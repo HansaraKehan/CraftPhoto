@@ -52,6 +52,7 @@ pub(crate) fn cancel_stale(app: &mut PhotocraftApp) {
         cancel_drag(app);
         if lost_layer {
             app.ui.text_edit = None;
+            app.ui.text_edit_return_tool = None;
         }
     }
 }
@@ -349,16 +350,6 @@ pub(crate) fn draw_box(painter: &egui::Painter, xf: &ViewXform, t: &TransformSes
     }
 }
 
-pub(crate) fn resize_cursor(d: [f64; 2], flip: bool) -> CursorIcon {
-    let angle = d[1].atan2(if flip { -d[0] } else { d[0] }).rem_euclid(std::f64::consts::PI);
-    match (angle / std::f64::consts::FRAC_PI_4).round() as u8 % 4 {
-        0 => CursorIcon::ResizeHorizontal,
-        1 => CursorIcon::ResizeNwSe,
-        2 => CursorIcon::ResizeVertical,
-        _ => CursorIcon::ResizeNeSw,
-    }
-}
-
 pub(crate) fn rotation_cursor(ctx: &egui::Context, p: Pos2) {
     let tokens = crate::theme::Tokens::get(ctx);
     let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("type-rotate-cursor")));
@@ -399,7 +390,7 @@ pub(crate) fn cursor(app: &mut PhotocraftApp, ctx: &egui::Context, xf: &ViewXfor
             let b = if handle.is_multiple_of(2) { t.quad[3] } else { t.quad[1] };
             [b[0] - t.quad[0][0], b[1] - t.quad[0][1]]
         };
-        return Some(resize_cursor(direction, xf.flip));
+        return Some(crate::tool_cursor::resize(direction, xf));
     }
     let Some(t) = frame(app) else { return Some(CursorIcon::Default) };
     let h = app.ui.type_transform.as_ref().map(|t| t.gesture.hit).or_else(|| hit(app, &t, xf.to_doc(p)));
@@ -407,7 +398,7 @@ pub(crate) fn cursor(app: &mut PhotocraftApp, ctx: &egui::Context, xf: &ViewXfor
         Some(Hit::Corner(i)) => {
             let q = *t.quad.get(i)?;
             let opposite = *t.quad.get((i + 2) % 4)?;
-            resize_cursor([q[0] - opposite[0], q[1] - opposite[1]], xf.flip)
+            crate::tool_cursor::resize([q[0] - opposite[0], q[1] - opposite[1]], xf)
         }
         Some(Hit::Edge(_)) => {
             // Original arrowhead indicator, above the canvas, without a proprietary cursor asset.

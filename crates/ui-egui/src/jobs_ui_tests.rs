@@ -84,6 +84,21 @@ fn frames_for_at_least(h: &mut Harness<'_, PhotocraftApp>, ms: u64, min_frames: 
     (n, worst)
 }
 
+/// Step at least `min` frames and until `ready` holds; returns (frames, slowest frame in ms).
+/// The test fails when `ready` still does not hold after 60 s.
+fn frames_until(h: &mut Harness<'_, PhotocraftApp>, min: u64, ready: impl Fn(&Harness<'_, PhotocraftApp>) -> bool) -> (u64, f64) {
+    let t = Instant::now();
+    let (mut n, mut worst) = (0, 0.0f64);
+    while n < min || !ready(h) {
+        assert!(t.elapsed() < Duration::from_secs(60), "not ready after {n} frames");
+        let f = Instant::now();
+        h.step();
+        worst = worst.max(f.elapsed().as_secs_f64() * 1000.0);
+        n += 1;
+    }
+    (n, worst)
+}
+
 #[test]
 fn the_frame_loop_keeps_running_during_a_slow_job_and_esc_cancels_it() {
     let mut h = app_harness();
@@ -91,7 +106,9 @@ fn the_frame_loop_keeps_running_during_a_slow_job_and_esc_cancels_it() {
     let doc_before = h.state().session.active().unwrap().doc.clone();
     let job = slow_job(h.state_mut(), &gate);
     let frame0 = h.state().frame;
-    let (n, worst) = frames_for_at_least(&mut h, 400, 10);
+    // The worker thread reports "Filtering tiles" when it starts, which can be after the dialog appears.
+    let (n, worst) = frames_until(&mut h, 10, |h| h.query_by_label("Filtering tiles").is_some());
+    assert!(h.state().session.job(job).is_some(), "the job is still running");
     assert!(h.state().frame - frame0 >= 10, "the UI kept rendering ({n} frames)");
     eprintln!("{n} frames during the job, slowest {worst:.1} ms");
     // The status bar shows the job, and after the delay the modal progress dialog.

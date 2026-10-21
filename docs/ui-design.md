@@ -58,6 +58,7 @@ curl -sfL -o assets/icons/<name>.svg https://raw.githubusercontent.com/lucide-ic
 | Quick layer pick | `quick_pick.rs` | macOS: ⌘⌥⌃-click with any tool selects the topmost visible layer with pixels under the pointer (`layer.pickAt`) without switching tools; the drag and release are swallowed. Windows/Linux have no third modifier distinct from the ⌃⌥ brush resize, so the gesture is a no-op there (use the Move tool's Auto-Select). A failed pick is a status-bar error. |
 | Layers rows | `panels.rs` | Double-click: on the name renames in place; on the Background makes it a normal layer; on an adjustment or fill thumbnail opens its Properties; on a Smart Object thumbnail opens its contents (Edit Contents); anywhere else on the row opens Layer Style. |
 | Layer masks | `panels.rs` | Clicking the mask thumbnail targets the mask (corner-bracket frame; the tab reads "Layer, Layer Mask/8"). Brush, eraser (paints background colour), gradient, bucket and moving the selected pixels (⌘-drag, `select.float`; the hole takes the background colour) then send `"target": "mask"`. Adjustment and fill layers target their mask automatically. |
+| Channels selection | `channels_panel.rs` | Load channel as selection in the footer follows the highlighted channel row. When the active layer mask is targeted for painting while the underlying channel view remains Composite, it loads that layer mask; otherwise it loads the selected composite, color, alpha or vector mask channel. |
 | Path thumbnails | `vector_ui.rs` | Ctrl/Cmd-click the thumbnail of a Work Path, saved path or layer path to load it as a selection; Shift adds, Alt subtracts, Shift+Alt intersects. Clicking the row name only selects the path. |
 | Levels / Curves | `tone.rs` | Histogram of the image *below* the adjustment. Curves: click to add a point, drag out to delete. Every change is a coalesced `layer.setAdjustment`, so one drag = one undo step and the canvas updates at full resolution on the GPU. |
 | Shape Stroke Options | `shape_stroke_ui.rs`, `vector_ui.rs` | Direct editing: valid changes apply immediately, with one numeric drag per undo step in Properties. Escape/outside click closes the popup and retains changes; a child dropdown keeps the parent open. The options bar sets new-shape defaults; Properties edits the selected shape. |
@@ -102,8 +103,8 @@ The app's top bar (`panels::title_bar`) starts with the brand mark (the app icon
 ## Compact tool controls
 
 The toolbar scrolls its tool rows when two columns still exceed the available height. Foreground
-and background colours stay visible below those rows, together with Pro's Quick Mask and Screen
-Mode controls. Long options rows scroll horizontally. Both scrollers bring newly focused
+and background colours stay visible below those rows, together with the Quick Mask and Screen
+Mode controls in every theme. Long options rows scroll horizontally. Both scrollers bring newly focused
 controls into view and retain the existing tool actions and popups.
 
 The offscreen regression fixture uses production panels, fonts and SVG loaders across every

@@ -479,6 +479,26 @@ fn adjustment_smart_filters_take_a_selection_as_their_mask() {
     assert_eq!(at(&now, 40, 16), at(&original, 40, 16), "outside the mask the composite is unchanged");
 }
 
+/// #5655: as for `filter.*` smart filters, a pixel or full lock refuses an adjustment smart
+/// filter, leaving the layer and the history as they were.
+#[test]
+fn locked_smart_objects_refuse_adjustment_smart_filters() {
+    let adjustments =
+        [("image.adjustments.invert", json!({})), ("image.adjustments.shadowsHighlights", json!({"shadowAmount": 100, "blackClip": 0, "whiteClip": 0}))];
+    for lock in [json!({"all": true}), json!({"pixels": true})] {
+        for (cmd, p) in &adjustments {
+            let mut s = smart_session();
+            s.execute("layer.lockLayers", lock.clone()).unwrap();
+            let (steps, flat) = (s.active().unwrap().history.past_len(), flatten(&s));
+            let r = s.execute(cmd, p.clone());
+            assert!(r.is_err(), "{cmd} added a smart filter to a smart object locked with {lock}: {r:?}");
+            assert!(smart_filters_of(&s).is_empty(), "{cmd} {lock}: nothing recorded");
+            assert_eq!(s.active().unwrap().history.past_len(), steps, "{cmd} {lock}: no history step");
+            assert_eq!(flatten(&s), flat, "{cmd} {lock}: pixels untouched");
+        }
+    }
+}
+
 /// A wrong-typed value errors before anything is recorded (never a panic), and the adjustments
 /// that can't re-render from a source (Replace Color, Match Color) stay off a smart object.
 #[test]
@@ -527,6 +547,106 @@ fn a_targeted_mask_enables_editing_it_on_any_layer() {
     assert_eq!(rgba(&s, 23, 3), pixels);
 }
 
+/// #5335: Curves (⌘M) edits the targeted layer mask, saved channel or Quick Mask at every depth.
+#[test]
+fn curves_apply_to_non_colour_targets_at_every_depth() {
+    let area = photocraft_geom::Rect::from_xywh(0, 0, 48, 32);
+    for depth in DEPTHS {
+        for target in ["mask", "alpha", "quickMask"] {
+            let mut s = session(depth, "rgb");
+            s.execute("edit.fill", json!({"contents": "color", "color": "#336699"})).unwrap();
+            let p = match target {
+                "mask" => {
+                    s.execute("layer.layerMask.revealAll", json!({})).unwrap();
+                    json!({"points": [[0, 0], [128, 200], [255, 255]], "target": "mask"})
+                }
+                "alpha" => {
+                    s.execute("channel.new", json!({"name": "Sky sel", "fill": "white"})).unwrap();
+                    json!({"points": [[0, 0], [128, 200], [255, 255]], "target": {"channel": 0}})
+                }
+                _ => {
+                    s.execute("select.editInQuickMaskMode", json!({"on": true})).unwrap();
+                    json!({"points": [[0, 0], [128, 200], [255, 255]], "target": "quickMask"})
+                }
+            };
+            let edit_target = p.get("target").cloned().unwrap_or(json!(null));
+            s.edit("levels", |doc, active| {
+                let (surf, _) = crate::channel_cmds::target_surface(doc, *active, &json!({ "target": edit_target })).unwrap();
+                surf.fill_rect(area, &[0.5]);
+                Ok(())
+            })
+            .unwrap();
+            let read = |s: &Session| {
+                let d = s.active().unwrap();
+                let layer = d.doc.layer(d.active_layer.unwrap()).unwrap();
+                let t = match target {
+                    "quickMask" => d.doc.quick_mask.as_ref().unwrap().surface.sample_channel(8, 8, 0),
+                    "alpha" => d.doc.channels[0].surface.sample_channel(8, 8, 0),
+                    _ => layer.mask.as_ref().unwrap().surface.sample_channel(8, 8, 0),
+                };
+                (rgba(s, 8, 8), t)
+            };
+            let ((pixels, before), past) = (read(&s), s.active().unwrap().history.past_len());
+            s.execute("image.adjustments.curves", p).unwrap();
+            let (pixels_after, after) = read(&s);
+            let case = format!("{target} at {depth}");
+            assert_eq!(pixels_after, pixels, "{case}: colour pixels stay put");
+            assert!(after > before + 0.1, "{case}: the curve lifted the midtone ({before} → {after})");
+            assert_eq!(s.active().unwrap().history.past_len(), past + 1, "{case}");
+            s.undo();
+            assert!((read(&s).1 - before).abs() < 1e-5, "{case}: undo restores the target");
+        }
+    }
+}
+
+/// #5335: a layer mask, saved channel or Quick Mask holds gray levels whatever the document's
+/// colour mode: inverting 25% grey gives 75% grey in Lab and CMYK, not an untouched plane (Lab
+/// ignores the composite) or an ink-separated result (CMYK curves the inks).
+#[test]
+fn curves_on_grey_targets_ignore_the_document_colour_mode() {
+    let area = photocraft_geom::Rect::from_xywh(0, 0, 48, 32);
+    for mode in ["lab", "cmyk"] {
+        for depth in [8u64, 16] {
+            for target in ["mask", "alpha", "quickMask"] {
+                let mut s = session(depth, mode);
+                let p = match target {
+                    "mask" => {
+                        s.execute("layer.layerMask.revealAll", json!({})).unwrap();
+                        json!("mask")
+                    }
+                    "alpha" => {
+                        s.execute("channel.new", json!({"name": "Sky sel", "fill": "white"})).unwrap();
+                        json!({"channel": 0})
+                    }
+                    _ => {
+                        s.execute("select.editInQuickMaskMode", json!({"on": true})).unwrap();
+                        json!("quickMask")
+                    }
+                };
+                s.edit("levels", |doc, active| {
+                    let (surf, _) = crate::channel_cmds::target_surface(doc, *active, &json!({ "target": p })).unwrap();
+                    surf.fill_rect(area, &[0.25]);
+                    Ok(())
+                })
+                .unwrap();
+                let read = |s: &Session| match target {
+                    "quickMask" => doc(s).quick_mask.as_ref().unwrap().surface.sample_channel(8, 8, 0),
+                    "alpha" => doc(s).channels[0].surface.sample_channel(8, 8, 0),
+                    _ => mask_at(s, 8, 8),
+                };
+                let before = read(&s);
+                let pixels = rgba(&s, 8, 8);
+                s.execute("image.adjustments.curves", json!({"points": [[0, 255], [255, 0]], "target": p})).unwrap();
+                let after = read(&s);
+                let case = format!("{mode} {depth}-bit {target}");
+                assert!((before - 0.25).abs() < 0.01, "{case}: filled with 25% grey ({before})");
+                assert!((after - 0.75).abs() < 0.02, "{case}: inverting 25% grey gives 75% grey ({after})");
+                assert_eq!(rgba(&s, 8, 8), pixels, "{case}: colour pixels stay put");
+            }
+        }
+    }
+}
+
 #[test]
 fn replace_color_localized_clusters_only_change_the_colour_near_the_sample() {
     // The same cream on the left (x < 8) and the right (x ≥ 40), grey between.
@@ -560,4 +680,54 @@ fn replace_color_localized_clusters_only_change_the_colour_near_the_sample() {
     assert!(err.to_string().contains("points"), "{err}");
     let err = s.execute("image.adjustments.replaceColor", json!({"points": [[1]]})).unwrap_err();
     assert!(err.to_string().contains("bad point"), "{err}");
+}
+
+/// #6095: ⌘I in Quick Mask inverts the whole mask, not only where it was white, so leaving Quick
+/// Mask selects everything but the original rectangle, whichever way the colour reads. With
+/// Color Indicates Selected Areas and nothing selected, it selects everything. A black alpha
+/// channel inverts to white.
+#[test]
+fn invert_turns_the_black_of_quick_mask_and_alpha_channels_white() {
+    for depth in DEPTHS {
+        let mut s = session(depth, "rgb");
+        let pixels = rgba(&s, 2, 2);
+        s.execute("select.rect", json!({"x": 10, "y": 8, "width": 20, "height": 10})).unwrap();
+        s.execute("select.editInQuickMaskMode", json!({"on": true})).unwrap();
+        s.execute("image.adjustments.invert", json!({"target": "quickMask"})).unwrap();
+        let q = &doc(&s).quick_mask.as_ref().unwrap().surface;
+        let (inside, outside) = (q.sample_channel(15, 12, 0), q.sample_channel(2, 2, 0));
+        assert!(inside < 0.01 && outside > 0.99, "{depth}-bit Quick Mask inverted: inside {inside}, outside {outside}");
+        s.execute("select.editInQuickMaskMode", json!({"on": false})).unwrap();
+        let sel = doc(&s).selection.as_ref().expect("an inverse selection after Quick Mask");
+        let (inside, outside) = (sel.sample_channel(15, 12, 0), sel.sample_channel(2, 2, 0));
+        assert!(inside < 0.01 && outside > 0.99, "{depth}-bit selection: inside {inside}, outside {outside}");
+        assert_eq!(rgba(&s, 2, 2), pixels, "{depth}-bit: the layer is untouched");
+
+        s.execute("select.deselect", json!({})).unwrap();
+        s.execute("channel.new", json!({"name": "Black", "fill": "black"})).unwrap();
+        s.execute("image.adjustments.invert", json!({"target": {"channel": 0}})).unwrap();
+        let a = doc(&s).channels[0].surface.sample_channel(40, 30, 0);
+        assert!(a > 0.99, "{depth}-bit black alpha channel inverts to white ({a})");
+        s.undo();
+        assert!(doc(&s).channels[0].surface.sample_channel(40, 30, 0) < 0.01, "{depth}-bit: undo restores the black");
+
+        // Color Indicates Selected Areas: a rectangle comes back inverted, and nothing selected
+        // comes back as everything selected.
+        for (start, inside, outside) in [("rectangle", 0.0, 1.0), ("nothing", 1.0, 1.0)] {
+            let mut s = session(depth, "rgb");
+            s.execute("channel.options", json!({"channel": "quickMask", "indicates": "selected"})).unwrap();
+            if start == "rectangle" {
+                s.execute("select.rect", json!({"x": 10, "y": 8, "width": 20, "height": 10})).unwrap();
+            }
+            s.execute("select.editInQuickMaskMode", json!({"on": true})).unwrap();
+            s.execute("image.adjustments.invert", json!({"target": "quickMask"})).unwrap();
+            s.execute("select.editInQuickMaskMode", json!({"on": false})).unwrap();
+            let sel = doc(&s).selection.as_ref().unwrap_or_else(|| panic!("{depth}-bit Selected Areas, {start}: a selection after Quick Mask"));
+            let got = (sel.sample_channel(15, 12, 0), sel.sample_channel(2, 2, 0));
+            assert!(
+                (got.0 - inside).abs() < 0.01 && (got.1 - outside).abs() < 0.01,
+                "{depth}-bit Selected Areas, {start}: selection (inside, outside) {got:?}"
+            );
+        }
+    }
 }

@@ -59,6 +59,14 @@ fn hdr_adjustments_preserve_range_and_cpu_parity() {
             black: Vec::new(),
             pencil: false,
         },
+        // 32-bit Photoshop rules: unclipped, legacy pivot 127, the mixer's 1/1024 steps and halved constant.
+        Adjustment::BrightnessContrast { brightness: 25.0, contrast: 30.0, legacy: true },
+        Adjustment::BrightnessContrast { brightness: -20.0, contrast: -30.0, legacy: true },
+        Adjustment::ChannelMixer { matrix: [[0.8, 0.3, -0.1, 0.0], [0.1, 0.9, 0.0, 0.05], [0.0, 0.2, 0.7, 0.0]], monochrome: false },
+        Adjustment::ChannelMixer { matrix: [[0.4, 0.4, 0.2, 0.1], [0.0; 4], [0.0; 4]], monochrome: true },
+        Adjustment::PhotoFilter { color: [0.97, 0.76, 0.0], density: 0.4, preserve_luminosity: true },
+        Adjustment::PhotoFilter { color: [0.2, 0.6, 0.9], density: 0.3, preserve_luminosity: false },
+        Adjustment::BlackWhite { weights: [70.0, 20.0, 50.0, 10.0, 90.0, 30.0], tint: Some([0.9, 0.7, 0.5]) },
     ] {
         let mut d = Document::new("HDR adjustments", Size::new(3, 1), ColorMode::Rgb, SampleType::F32);
         let mut layer = Layer::raster("pixels", PixelFormat::RGBA32F);
@@ -70,32 +78,49 @@ fn hdr_adjustments_preserve_range_and_cpu_parity() {
     }
 }
 
+/// The default adapter, or the one wgpu's `WGPU_BACKEND` and `WGPU_DX12_COMPILER` choose: e.g.
+/// `WGPU_BACKEND=dx12 WGPU_DX12_COMPILER=fxc` tests D3D12 with FXC, the app's default on Windows,
+/// where the default adapter may be Vulkan. A backend asked for that can't run the tests fails
+/// them rather than skipping.
 fn gpu() -> Option<Gpu> {
     let lock = GPU_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let instance = wgpu::Instance::default();
+    let required = std::env::var_os("WGPU_BACKEND").is_some();
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
     let adapter = match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())) {
         Ok(a) => a,
         Err(e) => {
+            assert!(!required, "WGPU_BACKEND is set but has no adapter: {e}");
             eprintln!("skipping GPU parity tests: no adapter ({e})");
             return None;
         }
     };
-    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()?;
-    eprintln!("GPU parity backend: {:?}", adapter.get_info().backend);
-    // Exact parity needs 32-bit float targets. Adapters without them (e.g. GL software
-    // rasterizers) use the CPU compositor in the app, so there is nothing to compare there.
-    if Compositor::preferred_acc_format(&adapter) != wgpu::TextureFormat::Rgba32Float {
-        eprintln!("skipping GPU parity tests: adapter can't render Rgba32Float");
-        return None;
-    }
-    let comp = match Compositor::try_new_with_format(&device, wgpu::TextureFormat::Rgba32Float) {
-        Ok(c) => c,
+    let info = adapter.get_info();
+    let (device, queue) = match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())) {
+        Ok(d) => d,
         Err(e) => {
-            eprintln!("skipping GPU parity tests: {e}");
+            assert!(!required, "WGPU_BACKEND is set but {} has no device: {e}", info.name);
+            eprintln!("skipping GPU parity tests: no device ({e})");
             return None;
         }
     };
-    let mut paged = Compositor::try_new_with_format(&device, wgpu::TextureFormat::Rgba32Float).ok()?;
+    eprintln!("GPU parity backend: {:?} ({}, {:?})", info.backend, info.name, info.device_type);
+    // Exact parity needs 32-bit float targets. Adapters without them (e.g. GL software
+    // rasterizers) use the CPU compositor in the app, so there is nothing to compare there.
+    if Compositor::preferred_acc_format(&adapter) != wgpu::TextureFormat::Rgba32Float {
+        assert!(!required, "WGPU_BACKEND is set but {} can't render Rgba32Float", info.name);
+        eprintln!("skipping GPU parity tests: adapter can't render Rgba32Float");
+        return None;
+    }
+    let compositor = || match Compositor::try_new_with_format(&device, wgpu::TextureFormat::Rgba32Float) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            assert!(!required, "WGPU_BACKEND is set but {} can't build the compositor: {e}", info.name);
+            eprintln!("skipping GPU parity tests: {e}");
+            None
+        }
+    };
+    let comp = compositor()?;
+    let mut paged = compositor()?;
     paged.set_texture_limit(PAGED_LIMIT);
     Some(Gpu { device, queue, comp, paged, _lock: lock })
 }
@@ -141,6 +166,14 @@ fn mask(rect: Rect, seed: u32, default: f32) -> LayerMask {
     m.surface.write_region(rect, &data);
     m.density = 0.8;
     m
+}
+
+/// `l` with a mask that reveals everything, so the executor draws it in a pass of its own rather
+/// than batched with the layer below: prefix tests resume at any layer (only where a batch run
+/// starts, `batch_runs`).
+fn alone(mut l: Layer) -> Layer {
+    l.mask = Some(LayerMask::reveal_all());
+    l
 }
 
 fn base_doc(w: u32, h: u32) -> Document {
@@ -224,7 +257,7 @@ fn stack_prefix_reuse_matches_uncached_gpu_and_cpu_at_every_depth() {
     for depth in [SampleType::U8, SampleType::U16, SampleType::F32] {
         let mut doc = Document::new("reuse", Size::new(300, 70), ColorMode::Rgb, depth);
         for seed in 1..=4 {
-            doc.layers.push(noise_layer("layer", doc.pixel_format(), doc.bounds(), seed, 0.2));
+            doc.layers.push(alone(noise_layer("layer", doc.pixel_format(), doc.bounds(), seed, 0.2)));
         }
         check(&mut g, &doc, "populate prefix");
         for (opacity, fill, blend, visible) in [
@@ -262,22 +295,31 @@ fn stack_prefix_reuse_matches_uncached_gpu_and_cpu_at_every_depth() {
 /// Duplicating a layer high in the stack, undoing and redoing it (#5286): the render resumes
 /// from the lower cached prefix and moves the cache up to just below the copy, so the undo and
 /// the redo skip more passes. Every render matches an uncached compositor bit for bit, at every
-/// depth.
+/// depth, also when plain layers are drawn several to a pass and the cache can only resume where
+/// a batch starts.
 #[test]
 fn prefix_follows_an_edit_up_the_stack_and_stays_exact() {
     let Some(mut g) = gpu() else { return };
     let mut uncached = Compositor::new(&g.device);
     uncached.set_composite_cache_budget(0);
-    for depth in [SampleType::U8, SampleType::U16, SampleType::F32] {
+    for (depth, batched) in [SampleType::U8, SampleType::U16, SampleType::F32].into_iter().flat_map(|d| [(d, false), (d, true)]) {
         let mut doc = Document::new("follow", Size::new(300, 70), ColorMode::Rgb, depth);
         for seed in 1..=6 {
-            doc.layers.push(noise_layer("layer", doc.pixel_format(), doc.bounds(), seed, 0.2));
+            let l = noise_layer("layer", doc.pixel_format(), doc.bounds(), seed, 0.2);
+            doc.layers.push(if batched { l } else { alone(l) });
         }
         let mut exact = |g: &mut Gpu, doc: &Document, what: &str| -> photocraft_gpu::Stats {
             let stats = diff_rect(g, doc, doc.bounds(), what).unwrap_or_else(|e| panic!("{e}"));
             let cached = render_to_vec(&mut g.comp, &g.device, &g.queue, doc, doc.bounds()).unwrap();
-            let cold = render_to_vec(&mut uncached, &g.device, &g.queue, doc, doc.bounds()).unwrap();
-            assert_eq!(cached, cold, "{depth:?} {what}: reuse preserves the GPU accumulator exactly");
+            let (cold, cold_stats) = photocraft_gpu::render_to_vec_stats(&mut uncached, &g.device, &g.queue, doc, doc.bounds()).unwrap();
+            assert_eq!(cached, cold, "{depth:?} batched {batched} {what}: reuse preserves the GPU accumulator exactly");
+            // Batched and single-layer draws needn't give the same bits on every backend (FXC
+            // on D3D12): a render that captures the prefix groups the layers as an uncached one
+            // does, wherever its checkpoint is.
+            if stats.prefix_hits == 0 {
+                assert_eq!(stats.layers_batched, cold_stats.layers_batched, "{depth:?} {what}: capturing changed the batches");
+            }
+            assert_eq!(cold_stats.layers_batched > 0, batched, "{depth:?} {what}");
             stats
         };
         exact(&mut g, &doc, "populate");
@@ -288,15 +330,17 @@ fn prefix_follows_an_edit_up_the_stack_and_stays_exact() {
         let copy = doc.layers[4].duplicate();
         doc.layers.insert(5, copy);
         let first = exact(&mut g, &doc, "duplicate");
-        assert!(first.prefix_hits > 0, "{depth:?} the duplicate resumes from the low prefix");
         let undo = exact(&mut g, &low, "undo");
-        assert!(undo.prefix_hits > 0, "{depth:?}");
-        assert!(undo.prefix_passes_skipped > first.prefix_passes_skipped, "{depth:?} the cache moved up: {first:?} {undo:?}");
+        assert!(undo.prefix_hits > 0, "{depth:?} batched {batched}");
+        if !batched {
+            assert!(first.prefix_hits > 0, "{depth:?} the duplicate resumes from the low prefix");
+            assert!(undo.prefix_passes_skipped > first.prefix_passes_skipped, "{depth:?} the cache moved up: {first:?} {undo:?}");
+        }
         let redo = exact(&mut g, &doc, "redo");
-        assert_eq!(redo.prefix_passes_skipped, undo.prefix_passes_skipped, "{depth:?}");
+        assert_eq!(redo.prefix_passes_skipped, undo.prefix_passes_skipped, "{depth:?} batched {batched}");
         // An edit below the moved cache still invalidates it.
         doc.layers[2].opacity = 0.4;
-        assert_eq!(exact(&mut g, &doc, "lower edit").prefix_hits, 0, "{depth:?}");
+        assert_eq!(exact(&mut g, &doc, "lower edit").prefix_hits, 0, "{depth:?} batched {batched}");
     }
 }
 
@@ -311,7 +355,7 @@ fn chunks_keep_their_own_checkpoint_after_a_partial_refresh() {
     uncached.set_composite_cache_budget(0);
     let mut doc = base_doc(600, 300);
     for seed in 2..=5 {
-        doc.layers.push(noise_layer("layer", PixelFormat::RGBA8, doc.bounds(), seed, 0.2));
+        doc.layers.push(alone(noise_layer("layer", PixelFormat::RGBA8, doc.bounds(), seed, 0.2)));
     }
     let mut render = |g: &mut Gpu, doc: &Document, rect: Rect, what: &str| -> photocraft_gpu::Stats {
         let (cached, stats) = photocraft_gpu::render_to_vec_stats(&mut g.paged, &g.device, &g.queue, doc, rect).unwrap();
@@ -427,8 +471,8 @@ fn disjoint_partial_damages_admit_whole_chunks_not_damage_rects() {
 fn prefix_partial_damage_context_occlusion_and_budget_are_conservative() {
     let Some(mut g) = gpu() else { return };
     let mut doc = base_doc(600, 300);
-    doc.layers.push(noise_layer("middle", PixelFormat::RGBA8, doc.bounds(), 2, 0.2));
-    doc.layers.push(noise_layer("top", PixelFormat::RGBA8, doc.bounds(), 3, 0.2));
+    doc.layers.push(alone(noise_layer("middle", PixelFormat::RGBA8, doc.bounds(), 2, 0.2)));
+    doc.layers.push(alone(noise_layer("top", PixelFormat::RGBA8, doc.bounds(), 3, 0.2)));
     check(&mut g, &doc, "full prefix");
     // A partial rectangle inside an already-covered whole chunk is served as a sub-rect copy —
     // after a full render every in-bounds rectangle is covered, which is the point of whole
@@ -663,6 +707,9 @@ fn adjustment_layers() {
         let pf = Adjustment::PhotoFilter { color: [0.93, 0.54, 0.0], density: 0.6, preserve_luminosity: true };
         d.layers.push(Layer::new("pf", LayerContent::Adjustment(pf)));
         check(&mut g, &d, &format!("photo filter {depth:?}"));
+        // Threshold: whole 16-bit samples against the level in 16 bits, or the float luminosity.
+        d.layers.push(Layer::new("th", LayerContent::Adjustment(Adjustment::Threshold { level: 0.5 })));
+        check(&mut g, &d, &format!("threshold {depth:?}"));
     }
     for adj in adjustments() {
         for (mode, opacity, masked) in [(BlendMode::Normal, 1.0, false), (BlendMode::Multiply, 0.7, true)] {
@@ -1209,19 +1256,101 @@ fn small_layers_composite_over_their_bounds() {
 fn many_layers_submit_inside_one_chunk() {
     // P12: a refresh recorded every pass of a page cell into one command buffer, and with a few
     // hundred layers Metal ran out of command buffers (device lost, "pc_compose_uniforms is
-    // invalid"). 700 layers need well over 1000 passes in the document's only chunk.
+    // invalid"). 1200 layers need well over 1000 passes in the document's only chunk: each is
+    // masked, so it is drawn in a pass of its own rather than batched with its neighbours.
     let Some(mut g) = gpu() else { return };
     let mut d = base_doc(64, 48);
     let modes: Vec<BlendMode> = BlendMode::layer_modes().collect();
-    for (i, mode) in modes.iter().copied().cycle().take(700).enumerate() {
+    for (i, mode) in modes.iter().copied().cycle().take(1200).enumerate() {
         let mut l = noise_layer("l", PixelFormat::RGBA8, Rect::from_xywh(0, 0, 64, 48), 500 + i as u32, 0.0);
         l.blend = mode;
         l.opacity = 0.9;
+        l.mask = Some(mask(Rect::from_xywh(0, 0, 64, 48), 3000 + i as u32, 1.0));
         d.layers.push(l);
     }
-    let stats = diff_rect(&mut g, &d, d.bounds(), "700 layers").unwrap_or_else(|e| panic!("{e}"));
+    let stats = diff_rect(&mut g, &d, d.bounds(), "1200 layers").unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(stats.layers_batched, 0, "{stats:?}");
     assert_eq!(stats.chunks, 1);
     assert!(stats.flushes > 0, "{stats:?}");
+}
+
+#[test]
+fn runs_of_plain_layers_blend_in_one_pass() {
+    // Consecutive plain layers are drawn several to a pass (`fs_layerbatch`). Every layer mode at
+    // varied opacity and fill (the fill-special modes included), solid fills, layers that end
+    // inside the canvas, and the layers that end a run: masked, Dissolve, small (clipped to their
+    // bounds) and clipping groups. Then an edit in the middle, so the prefix cache resumes
+    // part-way up the stack and runs start at its checkpoint.
+    let Some(mut g) = gpu() else { return };
+    let mut d = base_doc(96, 64);
+    let modes: Vec<BlendMode> = BlendMode::layer_modes().collect();
+    for (i, mode) in modes.iter().copied().cycle().take(90).enumerate() {
+        let i32_ = i as i32;
+        let rect = if i % 5 == 2 { Rect::from_xywh(-8, 10, 70, 40) } else { Rect::from_xywh(0, 0, 96, 64) };
+        let mut l = noise_layer("l", PixelFormat::RGBA8, rect, 900 + i as u32, 0.0);
+        l.blend = mode;
+        l.opacity = 0.35 + 0.05 * (i % 13) as f32;
+        l.fill_opacity = if i % 4 == 1 { 0.6 } else { 1.0 };
+        if i % 11 == 7 {
+            l.mask = Some(mask(Rect::from_xywh(i32_ % 30, 0, 50, 64), 70 + i as u32, 0.0));
+        }
+        if i % 23 == 9 {
+            l.clipped = true;
+        }
+        d.layers.push(l);
+        if i % 9 == 4 {
+            let mut f = Layer::new("fill", LayerContent::Fill(Fill::Solid(Color::rgba(0.3, 0.6, 0.2, 0.4))));
+            f.blend = modes[i % modes.len()];
+            d.layers.push(f);
+        }
+        if i % 17 == 8 {
+            d.layers.push(noise_layer("small", PixelFormat::RGBA8, Rect::from_xywh(20, 20, 6, 5), 40 + i as u32, 0.5));
+        }
+    }
+    let stats = diff_rect(&mut g, &d, d.bounds(), "plain layer runs").unwrap_or_else(|e| panic!("{e}"));
+    assert!(stats.layers_batched > 0, "no layers were batched: {stats:?}");
+    let mid = d.layers.len() / 2;
+    d.layers[mid].opacity = 0.5;
+    let stats = diff_rect(&mut g, &d, d.bounds(), "plain layer runs, edited in the middle").unwrap_or_else(|e| panic!("{e}"));
+    assert!(stats.layers_batched > 0, "{stats:?}");
+}
+
+#[test]
+fn runs_of_normal_layers_blend_with_normal_code_alone() {
+    // Runs whose layers all blend Normal draw with `fs_layerbatch_normal`: varied opacity and fill
+    // over a partly transparent backdrop, masked layers leading runs, solid fills and layers that
+    // end inside the canvas, at every depth. Lab documents mix Normal in CIELAB, so their runs
+    // keep the full shader.
+    let Some(mut g) = gpu() else { return };
+    for (mode, depth) in
+        [(ColorMode::Rgb, SampleType::U8), (ColorMode::Rgb, SampleType::U16), (ColorMode::Rgb, SampleType::F32), (ColorMode::Lab, SampleType::U8)]
+    {
+        let mut d = Document::new("normal", Size::new(96, 64), mode, depth);
+        let fmt = d.pixel_format();
+        d.layers.push(noise_layer("bg", fmt, Rect::from_xywh(0, 0, 96, 64), 5, 0.0));
+        for i in 0..40u32 {
+            let rect = if i % 5 == 3 { Rect::from_xywh(-6, 9, 70, 44) } else { Rect::from_xywh(0, 0, 96, 64) };
+            let mut l = noise_layer("n", fmt, rect, 600 + i, if i % 3 == 0 { 0.0 } else { 0.4 });
+            l.opacity = 0.2 + 0.07 * (i % 11) as f32;
+            l.fill_opacity = [1.0, 0.55, 0.0, 0.8][i as usize % 4];
+            if i % 7 == 2 {
+                l.mask = Some(mask(Rect::from_xywh(i as i32 % 25, 0, 60, 64), 50 + i, 0.0));
+            }
+            d.layers.push(l);
+            if i % 6 == 4 {
+                let mut f = Layer::new("fill", LayerContent::Fill(Fill::Solid(Color::rgba(0.7, 0.2, 0.5, 0.6))));
+                f.opacity = 0.45;
+                d.layers.push(f);
+            }
+        }
+        let what = format!("normal runs {mode:?} {depth:?}");
+        let stats = diff_rect(&mut g, &d, d.bounds(), &what).unwrap_or_else(|e| panic!("{e}"));
+        if mode == ColorMode::Lab {
+            assert!(stats.layers_batched > 0 && stats.normal_batches == 0, "{what}: {stats:?}");
+        } else {
+            assert!(stats.normal_batches > 0, "{what}: {stats:?}");
+        }
+    }
 }
 
 fn blob(name: &str, fmt: PixelFormat, cx: f32, cy: f32, r: f32, color: [f32; 3]) -> Layer {
@@ -1557,6 +1686,60 @@ fn layer_effects_every_kind() {
         }
     }
     assert!(failures.is_empty(), "{} failures:\n{}", failures.len(), failures.join("\n"));
+}
+
+#[test]
+fn exterior_effects_merge_from_the_shape_at_any_fill() {
+    // Drop shadows and outer glows alone: the merge builds the layer from its shape (fill inside
+    // it, times its alpha) instead of passes of its own. Fill from 0 to 1, opacity, modes
+    // (including one that blends with the knocked-out shadow), both depths, a layer covering the
+    // canvas (no copy back), and the layer clipped onto a base (merged atop it).
+    let Some(mut g) = gpu() else { return };
+    let mut ds = shadow(BlendMode::Multiply, 0.75, 120.0, 6.0, 8.0, 0.0);
+    let mut ds_through = shadow(BlendMode::Normal, 0.9, 45.0, 4.0, 5.0, 0.2);
+    ds_through.knocks_out = false;
+    let og = glow(FxPaint::Color(Color::rgb(1.0, 0.9, 0.2)), GlowTechnique::Softer, 10.0, 0.3, GlowSource::Edge);
+    ds.use_global_light = true;
+    let stacks = [
+        ("drop shadow", vec![Effect::DropShadow(ds.clone())]),
+        ("drop shadow, not knocked out", vec![Effect::DropShadow(ds_through)]),
+        ("outer glow", vec![Effect::OuterGlow(og.clone())]),
+        ("shadow and glow", vec![Effect::OuterGlow(og), Effect::DropShadow(ds)]),
+    ];
+    for depth in [SampleType::U8, SampleType::U16] {
+        for (name, fx) in &stacks {
+            for (opacity, fill, blend) in [
+                (1.0, 1.0, BlendMode::Normal),
+                (0.8, 0.6, BlendMode::Normal),
+                (1.0, 0.0, BlendMode::Normal),
+                (0.7, 0.35, BlendMode::Multiply),
+                (1.0, 0.5, BlendMode::Screen),
+            ] {
+                let what = format!("{name} {depth:?} opacity {opacity} fill {fill} {blend:?}");
+                let mut d = fx_doc(96, 80, depth);
+                let mut l = blob("fx", d.pixel_format(), 46.0, 40.0, 22.0, [0.2, 0.6, 0.9]);
+                l.effects.items = fx.clone();
+                (l.opacity, l.fill_opacity, l.blend) = (opacity, fill, blend);
+                d.layers.push(l.clone());
+                fx_check(&mut g, &d, &what);
+                // The same layer clipped onto a base.
+                let mut base = blob("base", d.pixel_format(), 40.0, 44.0, 30.0, [0.9, 0.8, 0.3]);
+                base.effects.items.clear();
+                d.layers.pop();
+                d.layers.push(base);
+                l.clipped = true;
+                d.layers.push(l.clone());
+                fx_check(&mut g, &d, &format!("{what}, clipped"));
+                // A partly transparent layer over the whole canvas.
+                let mut d = fx_doc(64, 48, depth);
+                let mut full = noise_layer("full", d.pixel_format(), Rect::from_xywh(0, 0, 64, 48), 7, 0.2);
+                full.effects.items = fx.clone();
+                (full.opacity, full.fill_opacity, full.blend) = (opacity, fill, blend);
+                d.layers.push(full);
+                fx_check(&mut g, &d, &format!("{what}, full canvas"));
+            }
+        }
+    }
 }
 
 #[test]
@@ -2587,4 +2770,23 @@ fn the_focused_view_stays_resident_after_a_full_refresh() {
         let cpu = photocraft_compose::render(&d, view);
         assert!(worst_diff(&cpu.px, &out).0 <= TOL);
     }
+}
+
+// A pass-through group holding an adjustment renders isolated when layers clip to it, on the GPU
+// as on the CPU (psd-tools passthrough_clipping_mask_adjustment).
+#[test]
+fn pass_through_clipping_base_with_an_adjustment() {
+    let Some(mut g) = gpu() else { return };
+    let mut d = base_doc(32, 24);
+    d.layers.push(noise_layer("mid", PixelFormat::RGBA8, Rect::new(0, 0, 32, 24), 41, 1.0));
+    let mut grp = Layer::group(
+        "g",
+        vec![noise_layer("in", PixelFormat::RGBA8, Rect::new(4, 4, 20, 20), 42, 0.5), Layer::new("inv", LayerContent::Adjustment(Adjustment::Invert))],
+    );
+    grp.blend = BlendMode::PassThrough;
+    d.layers.push(grp);
+    let mut clip = noise_layer("clip", PixelFormat::RGBA8, Rect::new(8, 0, 28, 16), 43, 0.3);
+    clip.clipped = true;
+    d.layers.push(clip);
+    check(&mut g, &d, "pass-through clipping base with an adjustment");
 }

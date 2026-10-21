@@ -562,6 +562,9 @@
 # Field Blur pins (#3373)
 	No pin selected	Není vybrán žádný špendlík
 	Click the image to add a pin; drag a pin to move it, or its ring to change its blur. Delete removes the selected pin.	Kliknutím do obrazu přidáte špendlík; tažením špendlík přesunete, tažením jeho prstence změníte rozostření. Delete odstraní vybraný špendlík.
+	Drag the handles on the outline to resize and turn it, the square to round its corners, and the dots inside to set where the blur starts.	Tažením úchytů na obrysu ho změníte a otočíte, čtverečkem zaoblíte rohy a body uvnitř nastavíte, kde začíná rozostření.
+	Drag the pin to move the band, or its ring to change its blur. Drag the solid lines to widen the sharp band, the dashed lines to set the transition, and the dots to turn it.	Tažením špendlíku přesunete pás, tažením jeho prstence změníte rozostření. Plné čáry rozšiřují ostrý pás, přerušované nastavují přechod a body ho otáčejí.
+	Drag the handles on the outline to resize and turn it; the ring sets the blur angle.	Tažením úchytů na obrysu ho změníte a otočíte; prstenec nastavuje úhel rozostření.
 	Iris Blur…	Rozostření clonou…
 	Tilt-Shift…	Tilt-shift…
 	Path Blur…	Rozostření podél cesty…
@@ -997,7 +1000,6 @@
 	Contiguous	Souvislé
 	Contrast	Kontrast
 	Control:	Řízení:
-	Convert document's colors to the working space	Převést barvy dokumentu do pracovního prostoru barev
 	Convert to sRGB	Převést do sRGB
 	Copies	Kopie
 	Copper	Měď
@@ -1052,6 +1054,7 @@
 	Delete Group	Odstranit skupinu
 	Delete Layer Mask	Odstranit masku vrstvy
 	Delete Layers	Odstranit vrstvy
+	Add Shortcut	Přidat zkratku
 	Delete Shortcut	Odstranit zkratku
 	Delete Timeline	Odstranit časovou osu
 	Delete Tool Preset	Odstranit přednastavení nástroje
@@ -1580,7 +1583,6 @@
 	Use Default	Použít výchozí
 	Use Legacy	Použít starší
 	Use Measurement Scale	Použít měřítko měření
-	Use the embedded profile (instead of the working space)	Použít vložený profil (místo pracovního prostoru barev)
 	Variables bind a layer's visibility, text or pixels to a named data slot.	Proměnné vážou viditelnost, text nebo pixely vrstvy na pojmenované datové pole.
 	Vertical scale	Svislé měřítko
 	Vibrance	Živost
@@ -1909,6 +1911,8 @@
 	Camera Raw Defaults	Výchozí nastavení Camera Raw
 	Canvas border	Okraj plátna
 	Show canvas dots	Zobrazit tečky plátna
+	Clip thumbnails to layer bounds	Oříznout miniatury na hranice vrstvy
+	Clip Thumbnails to Layer Bounds	Oříznout miniatury na hranice vrstvy
 	Canvas color	Barva plátna
 	Canvas custom color	Vlastní barva plátna
 	Color picker	Výběr barvy
@@ -2099,7 +2103,8 @@
 	Expand group  ({key}-click: all groups)	Rozbalit skupinu  ({key}+kliknutí: všechny skupiny)
 	Fade steps	Kroky zeslabení
 	Hide the layer's effects  ({key}-click: all layers)	Skrýt efekty vrstvy  ({key}+kliknutí: všechny vrstvy)
-	Import Brushes… (.abr)	Importovat štětce… (.abr)
+	Import Brushes… (.abr or image)	Importovat štětce… (.abr nebo obrázek)
+	Import Brush from Image…	Importovat štětec z obrázku…
 	Move Group Down	Posunout skupinu dolů
 	Move Group Up	Posunout skupinu nahoru
 	Reset the brush to the defaults	Obnovit výchozí nastavení štětce
@@ -2166,6 +2171,11 @@
 	Color Replacement Tool	Nástroj Nahrazení barvy
 	Color Replacement	Nahrazení barvy
 	Wet	Vlhkost
+	Current Brush Load	Aktuální náplň štětce
+	Load Brush	Naplnit štětec
+	Clean Brush	Vyčistit štětec
+	Load the brush after each stroke	Naplnit štětec po každém tahu
+	Clean the brush after each stroke	Vyčistit štětec po každém tahu
 	Mix	Míchání
 	Wetness Jitter	Kolísání vlhkosti
 	Mix Jitter	Kolísání míchání
@@ -2214,7 +2224,6 @@
 	Cancelled opening {name}	Otevírání {name} zrušeno
 	The document “{name}” does not have an embedded {mode} profile.	Dokument „{name}“ nemá vložený profil {mode}.
 	The document “{name}” has an embedded color profile that does not match the current {mode} working space.	Dokument „{name}“ má vložený barevný profil, který neodpovídá aktuálnímu pracovnímu prostoru barev {mode}.
-	Embedded: {embedded}	Vložený: {embedded}
 	Working: {working}	Pracovní: {working}
 	Developing {name}	Vyvolávání {name}
 	Cancelled {label}	Zrušeno: {label}
@@ -2438,7 +2447,6 @@ cameraRaw	Color	Barvy
 	Redrawing	Překreslování
 	This redraw took {seconds} s on the CPU.	Toto překreslení na CPU trvalo {seconds} s.
 	Edits that change the whole document, such as a layer's blend mode, opacity or visibility, redraw all of it.	Úpravy, které mění celý dokument, například režim prolnutí, krytí nebo viditelnost vrstvy, jej překreslí celý.
-	Its layers don't fit the GPU memory budget. Raising Memory usage in Preferences › Performance raises the budget, up to a quarter of this computer's memory.	Vrstvy se nevejdou do rozpočtu paměti GPU. Zvýšením hodnoty Využití paměti v Předvolbách › Výkon se rozpočet zvětší, nejvýše na čtvrtinu paměti tohoto počítače.
 	The GPU compositor wasn't used: {reason}	Kompozitor GPU nebyl použit: {reason}
 fontWeight	Thin	Jemná
 fontWeight	ExtraLight	Extrajemná
@@ -2504,6 +2512,8 @@ fontWeight	Italic	Kurzíva
 	Color Picker (Layer Style Color)	Výběr barvy (barva stylu vrstvy)
 	Auto Hide Notifications	Automaticky skrývat oznámení
 	Notification Duration (seconds)	Trvání oznámení (sekundy)
+	Bundle Arrow-Key Nudges	Slučovat posuny šipkami
+	Nudge Bundle Pause (ms)	Pauza slučování posunů (ms)
 	Appearance Mode	Režim vzhledu
 	Dark Theme	Tmavý motiv
 	Light Theme	Světlý motiv
@@ -2636,6 +2646,26 @@ cameraData	Lens	Objektiv
 	Snap to Origin	Přichytit k počátku
 	Search settings…	Hledat nastavení…
 	No matching settings	Žádná odpovídající nastavení
+# Edit › Content-Aware Fill workspace
+	Sampling Brush Tool	Nástroj Štětec vzorkování
+	Sampling Area Overlay	Překrytí oblasti vzorkování
+	Show Sampling Area	Zobrazit oblast vzorkování
+	Indicates	Označuje
+	Sampling Area	Oblast vzorkování
+	Excluded Area	Vyloučená oblast
+	Sampling Area Options	Volby oblasti vzorkování
+	Rectangular	Obdélníková
+	Fill Settings	Nastavení výplně
+	Rotation Adaptation	Přizpůsobení otočení
+	Very High	Velmi vysoká
+	High	Vysoká
+	Low	Nízká
+	Full	Úplná
+	Mirror	Zrcadlit
+	Output Settings	Nastavení výstupu
+	Output To	Výstup do
+	Duplicate Layer	Duplikovat vrstvu
+	Contract	Zúžit
 
 # Dynamic labels the tl! literal scanner cannot see: filter and Filter Gallery parameter names and
 # choices (humanized from their keys), Camera Raw controls, render filters (Flame, Picture Frame, Tree),
@@ -2776,7 +2806,6 @@ cameraData	Lens	Objektiv
 	Content-Aware Fill	Výplň s ohledem na obsah
 	Content-Aware Move	Přesun s ohledem na obsah
 	Continue	Pokračovat
-	Contract	Zúžit
 	Contrasty	Kontrastní
 	Conté Crayon	Křída Conté
 	Convert to Linked	Převést na propojený
@@ -2852,7 +2881,6 @@ cameraData	Lens	Objektiv
 	Draft	Koncept
 	Dry Brush	Suchý štětec
 	Duplicate	Duplikovat
-	Duplicate Layer	Duplikovat vrstvu
 	Duplicate Layer Comp	Duplikovat kompozici vrstev
 	Duplicate Layers	Duplikovat vrstvy
 	Duplicate Path	Duplikovat cestu
@@ -2979,7 +3007,6 @@ cameraData	Lens	Objektiv
 	Hide	Skrýt
 	Hide Others	Skrýt ostatní
 	Hide {app}	Skrýt {app}
-	High	Vysoká
 	High Pass	Horní propust
 	Highlight	Světla
 	Highlight Amount	Míra světel
@@ -3066,7 +3093,6 @@ cameraData	Lens	Objektiv
 	Long Lines	Dlouhé čáry
 	Long Strokes	Dlouhé tahy
 	Loop	Smyčka
-	Low	Nízká
 	Lower	Dolní
 	Lum	Jas
 	Lut	LUT
@@ -3482,6 +3508,7 @@ cameraRaw	Vibrance	Živost
 cameraRaw	Whites	Bílé
 layerLabel	No Color	Žádná barva
 	Loading fonts…	Načítání písem…
+	Response curve	Křivka odezvy
 	Simulate Pressure	Simulovat přítlak
 	Background Eraser	Guma pozadí
 	Healing Brush	Retušovací štětec
@@ -3717,6 +3744,7 @@ navigator	Zoom	Zvětšení
 	Remove after each stroke	Odstranit po každém tahu
 	Apply the removal ({key})	Použít odstranění ({key})
 	Strokes to remove: {n} (Enter applies, Esc cancels)	Tahy k odstranění: {n} (Enter použije, Esc zruší)
+	Show home recent files	Zobrazit nedávné soubory na úvodní obrazovce
 	Clear Brush Controls	Obnovit ovládací prvky stopy
 	Reset All Locked Settings	Obnovit všechna zamknutá nastavení
 	Copy Texture to Other Tools	Kopírovat texturu do jiných nástrojů
@@ -3743,6 +3771,9 @@ navigator	Zoom	Zvětšení
 	Action playback stopped	Přehrávání akce zastaveno
 	Step {step} is waiting for its dialog	Krok {step} čeká na svůj dialog
 @plural	{n} action|{n} actions	{n} akce|{n} akce|{n} akcí
+	Background (Default)	Pozadí (výchozí)
+# Batch / Image Processor
+	Include All Subfolders	Zahrnout všechny podsložky
 	Auto Add/Delete	Automaticky přidat/odstranit
 
 # Native Windows printing qualification
@@ -3752,3 +3783,84 @@ navigator	Zoom	Zvětšení
 	Sent to {printer}	Odesláno do {printer}
 	set in Print Settings…	nastavuje se v nastavení tisku…
 	ICO is limited to 256 × 256 pixels	ICO je omezen na 256 × 256 pixelů
+# Embedded Profile Mismatch: profile names beside the choices, Remember this choice
+	Use the embedded profile ({profile})	Použít vložený profil ({profile})
+	Convert to the working space ({profile})	Převést do pracovního prostoru barev ({profile})
+	Remember this choice for future images	Zapamatovat si tuto volbu pro další obrázky
+	Turn the prompt back on with Ask On Mismatch in Edit › Color Settings.	Dotaz znovu zapnete volbou Ask On Mismatch v nabídce Úpravy › Nastavení barev.
+	Button Mode	Režim tlačítka
+	Button Mode On	Režim tlačítka zapnutý
+
+# Darken / Lighten Interface (⇧⌘F1 / ⇧⌘F2)
+	Darken Interface	Ztmavit rozhraní
+	Lighten Interface	Zesvětlit rozhraní
+# Bevel & Emboss Technique.
+	Technique	Technika
+	Chisel Hard	Tvrdé tesání
+	Chisel Soft	Měkké tesání
+	Open color-less EXR as ACEScg	Otevřít EXR bez údaje o barevném prostoru jako ACEScg
+
+# View › Guides › right-click a guide
+	Edit Selected Guides	Upravit vybraná vodítka
+	Clear Selected Guides	Vymazat vybraná vodítka
+	Pasting from other apps is unavailable	Vkládání z jiných aplikací není k dispozici
+	PhotoCraft can't reach the system clipboard in this session. On Wayland, a Flatpak sandbox hides the protocol that images from other apps are read through.	PhotoCraft v této relaci nemá přístup k systémové schránce. Na Waylandu sandbox Flatpaku skrývá protokol, přes který se čtou obrázky z jiných aplikací.
+	To paste from other apps, start PhotoCraft under XWayland: `{command}`	Chcete-li vkládat z jiných aplikací, spusťte PhotoCraft pod XWaylandem: `{command}`
+	Nothing to paste: PhotoCraft can't read the system clipboard here	Není co vložit: PhotoCraft zde nemůže číst systémovou schránku
+	Delete this set	Smazat tuto sadu
+	New Set…	Nová sada…
+	PhotoCraft Defaults	Výchozí PhotoCraft
+	Save a list of these shortcuts as a web page	Uložit seznam těchto zkratek jako webovou stránku
+	Save the changes to this set	Uložit změny do této sady
+	Save these shortcuts as a .kys file	Uložit tyto zkratky jako soubor .kys
+	Save these shortcuts as a new set	Uložit tyto zkratky jako novou sadu
+	Set deleted.	Sada smazána.
+	Set saved.	Sada uložena.
+	Set:	Sada:
+	Summarize…	Shrnout…
+	There are too many sets: delete one first.	Sad je příliš mnoho: nejprve jednu smažte.
+	set name	název sady
+	{set} (modified)	{set} (změněno)
+	Show file name in title	Zobrazit název souboru v titulu
+	Accept and Go to Conflict	Přijmout a přejít ke konfliktu
+	Changes undone.	Změny vráceny.
+	Choose a new shortcut for this command, or leave it without one.	Zvolte pro tento příkaz novou zkratku, nebo ho nechte bez ní.
+	Put this command's shortcuts back as they were	Vrátit zkratky tohoto příkazu do původního stavu
+	Take the shortcut from the other command and select it	Odebrat zkratku druhému příkazu a vybrat ho
+	Undo Changes	Vrátit změny
+	{shortcut} is reserved by the system and can't be assigned.	{shortcut} je vyhrazena systémem a nelze ji přiřadit.
+	Low-Latency Drawing (vsync off, applies at next launch)	Kreslení s nízkou latencí (bez vertikální synchronizace, platí po dalším spuštění)
+# Free Transform: a new layer while the box is open (#5859)
+	Free Transform is still being applied; try again when it has finished.	Volná transformace se stále použije; zkuste to znovu, až skončí.
+	The transform couldn't be applied.	Transformaci nelze použít.
+# Preferences › Performance › GPU Memory; the status bar and slow-redraw notice
+	Its layers need {needed} of GPU memory; the budget leaves them {budget}.	Vrstvy potřebují {needed} paměti GPU; rozpočet jim ponechává {budget}.
+	Set GPU Memory in Preferences › Performance to what your graphics card can hold, at most 3/8 of its memory. Automatic follows Memory Usage, within a quarter of this computer's memory and 3/8 of the card's, and doesn't count the document against a card whose memory is known. The status bar shows GPU Memory Full while they don't fit.	V Předvolbách › Výkon nastavte Paměť GPU na tolik, kolik vaše grafická karta pojme, nejvýše 3/8 její paměti. Automaticky se řídí Využitím paměti, v rámci čtvrtiny paměti tohoto počítače a 3/8 paměti karty, a u karty se známou pamětí do ní dokument nezapočítává. Dokud se nevejdou, stavový řádek ukazuje Paměť GPU je plná.
+	GPU Memory Full	Paměť GPU je plná
+	The layers need {needed} of GPU memory and may hold {budget}, so edits that redraw the whole document do it on the CPU. Click to set GPU Memory.	Vrstvy potřebují {needed} paměti GPU a mohou zabrat {budget}, takže úpravy, které překreslují celý dokument, to dělají na CPU. Kliknutím nastavíte Paměť GPU.
+	GPU memory budget: {budget}	Rozpočet paměti GPU: {budget}
+	This document's layers: {needed} of {budget} for layers	Vrstvy tohoto dokumentu: {needed} z {budget} pro vrstvy
+	This document's layers need {needed} but may hold {budget}: whole-document redraws use the CPU	Vrstvy tohoto dokumentu potřebují {needed}, ale mohou zabrat {budget}: překreslení celého dokumentu probíhá na CPU
+	GPU Memory (MB, 0 = Automatic)	Paměť GPU (MB, 0 = Automaticky)
+	{name} was changed by another app after it was opened or saved here.	Soubor {name} změnila jiná aplikace poté, co byl zde otevřen nebo uložen.
+	Replace it with this document, or cancel and use File › Save As to keep both.	Nahraďte ho tímto dokumentem, nebo zrušte a použijte Soubor › Uložit jako, abyste zachovali obojí.
+	Decrease Brush Size	Zmenšit velikost štětce
+	Increase Brush Size	Zvětšit velikost štětce
+	Decrease Brush Hardness	Snížit tvrdost štětce
+	Increase Brush Hardness	Zvýšit tvrdost štětce
+	Memory Usage	Využití paměti
+	Per-document RAM limit (MB)	Limit RAM na dokument (MB)
+	Installed RAM: {ram} MB; this limit: {percent}%	Nainstalovaná RAM: {ram} MB; tento limit: {percent}%
+	Limits each open document's pixels plus History. Oldest undo states are discarded when the limit is exceeded.	Omezuje pixely plus Historii každého otevřeného dokumentu. Nejstarší stavy zpět se při překročení limitu zahodí.
+	Applies immediately when saved. Memory is not reserved in advance.	Platí hned po uložení. Paměť se předem nerezervuje.
+	With GPU Memory set to Automatic, this also limits the GPU layer budget. That budget is capped at one quarter of installed RAM and, when known, three eighths of the graphics card's memory, with a 512 MB minimum. Raising this limit beyond those caps does not increase the GPU budget.	Při GPU paměti Automaticky omezuje i GPU rozpočet. Strop je čtvrtina RAM a, je-li známo, tři osminy paměti karty, minimum 512 MB. Vyšší limit GPU rozpočet nezvýší.
+	Use	Použít
+	In Front	Vpředu
+	Behind	Vzadu
+
+# DDS Options (#1327)
+	DDS Options	Možnosti DDS
+	Generate Mipmaps	Generovat mipmapy
+
+# Graphics Adapter preference (#1885)
+	GPU adapter	Adaptér GPU

@@ -254,3 +254,21 @@ fn save_settings_start_at_the_opened_files_encoding() {
     app.open_bytes("art.webp", &lossless).unwrap();
     assert!(app.save_settings().webp_lossless);
 }
+
+/// A browser download is only requested: the document takes the name but keeps its unsaved
+/// changes, so the leave-page guard stays armed (#4962). A confirmed write still saves it.
+#[test]
+fn unconfirmed_download_names_the_document_but_keeps_it_unsaved() {
+    assert_eq!(crate::saved_revision_after_write(true, 7, 3), 7);
+    assert_eq!(crate::saved_revision_after_write(false, 7, 3), 3);
+    let mut app = app();
+    app.services.write_unconfirmed = true;
+    let (_, _, revision, saved) = identity(&app);
+    app.save_as(Some("download.psd".into())).unwrap();
+    assert_eq!(identity(&app), ("download.psd".into(), Some("download.psd".into()), revision, saved));
+    assert!(app.session.active().unwrap().is_dirty());
+    assert!(app.has_unsaved_work());
+    app.services.write_unconfirmed = false;
+    app.save_as(Some("download.psd".into())).unwrap();
+    assert!(!app.has_unsaved_work());
+}

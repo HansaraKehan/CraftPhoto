@@ -1,6 +1,6 @@
 # photocraft-cms
 
-Pure-Rust ICC colour management for Photocraft. No workspace dependencies (L0, publishable),
+Pure-Rust ICC colour management for PhotoCraft. No workspace dependencies (L0, publishable),
 no C, no `unsafe`. Implemented from the public ICC.1:2010 (v4.3) and ICC.1:2001-04 (v2)
 specifications, CIE 15, and Adobe's published black point compensation paper.
 
@@ -20,6 +20,9 @@ t.eval(&[1.0, 0.0, 0.0], &mut out);                        // exact single colou
 * `Transform::proof(src, proof, display, intent, bpc, simulate_paper)`: soft-proof chain.
 * `GamutCheck::new(src, proof, ΔE)`: out-of-gamut test (gamut warning).
 * `Lut3d::from_transform(&t, 33).to_rgba16f_bytes()`: display transform as a 3D texture.
+* `Transform::gpu_matrix_shaper()`: accurate RGB input curves + matrix + output curves for
+  display shaders. Float tables retain near-black detail; unsupported chains return `None`
+  for the 3D LUT fallback. No GPU dependency is required by this crate.
 * `transform::cached(src, dst, opts)`: process-wide transform cache.
 * `Profile::to_bytes()`: original bytes of parsed profiles (byte-exact), or an ICC v4.3 encoding.
 * `Profile::same_colors(&other)`: the same colour space whatever the encoding (every sample of
@@ -36,6 +39,10 @@ t.eval(&[1.0, 0.0, 0.0], &mut out);                        // exact single colou
   tetrahedral interpolation (4D: linear on the first input between two tetrahedra); purely
   analytic chains (e.g. Lab ↔ RGB) are evaluated exactly. Buffers ≥ 16k pixels run on rayon
   (native only).
+* GPU matrix/TRC display transforms reuse the 4097-entry input curves, 3×3 matrix plus
+  offsets, and 4096-entry output curves indexed by `x^(1/4)`. Each channel is interpolated
+  separately using float texels; SDR input/output are clamped to `[0, 1]`. A final RGB
+  33³ table cannot resolve steep inverse gamma curves near black, even with float texels.
 * Rendering intents: AToB0/1/2 and BToA0/1/2 by intent with AToB0/BToA0 fallback; absolute
   colorimetric scales by media white (`wtpt`; v2 display profiles treated as D50; a zero,
   negative or non-finite white is refused with `CmsError::Invalid`); BPC uses
@@ -53,13 +60,13 @@ t.eval(&[1.0, 0.0, 0.0], &mut out);                        // exact single colou
 | `rec2020` | Rec. 2020 primaries, Rec. 709 OETF |
 | `gray-gamma-2.2`, `sgray` | gray gamma 2.2; gray with the sRGB curve (default gray working space) |
 | `lab-d50` | Lab identity (v4 encoding) |
-| `coated-cmyk` | **Photocraft Coated CMYK (synthetic, 300% TAC, medium GCR)** — default CMYK |
+| `coated-cmyk` | **PhotoCraft Coated CMYK (synthetic, 300% TAC, medium GCR)** — default CMYK |
 
 ### The CMYK profile
 
 Adobe's CMYK profiles (U.S. Web Coated SWOP, Coated FOGRA39) are proprietary, and the freely
 downloadable characterisation-based profiles (ECI/FOGRA, colord, Ghostscript) carry
-redistribution conditions or unclear licences, so Photocraft generates its own
+redistribution conditions or unclear licences, so PhotoCraft generates its own
 (`src/synth.rs`): a Yule–Nielsen modified Neugebauer model (n = 2) over the 16 overprints with
 ISO 12647-2 coated-paper Lab aims for paper/C/M/Y/RGB overprints, parabolic dot gain (14 % CMY,
 17 % K at 50 %), GCR black generation (starts at 20 % gray component, K max 95 %), total ink

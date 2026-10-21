@@ -132,7 +132,7 @@ thread_local! {
 }
 
 /// Files known to be invalid upstream: their parse error is expected.
-const KNOWN_BAD: &[(&str, &str)] = &[("group-divider-blend-mode.psd", "psd-tools fixture stripped to 1906 bytes: merged image data missing")];
+const KNOWN_BAD: &[(&str, &str)] = &[("group-divider-blend-mode.psd", "malformed merged image data; recovery is tested in psd_damaged_merged.rs (#6152)")];
 
 /// One corpus directory with its own floors.
 struct Source {
@@ -148,15 +148,15 @@ struct Source {
 }
 
 /// Hand-picked mix in `corpus/psd` (170 files: 134 vs the merged image + 12 vs the thumbnail).
-const MIXED: Source = Source { label: "io corpus", dir: "corpus/psd", group_depth: 0, pass_floor: 146, roundtrip_floor: 169 };
+const MIXED: Source = Source { label: "io corpus", dir: "corpus/psd", group_depth: 0, pass_floor: 148, roundtrip_floor: 169 };
 
 /// The full psd-tools test set (309 files at the pinned commit; see `xtask/psd-tools-corpus.sha256`):
 /// 226 vs the merged image + 10 vs the thumbnail (Advanced Blending knockouts: +7).
-const PSD_TOOLS: Source = Source { label: "psd-tools corpus", dir: "corpus/psd-tools", group_depth: 0, pass_floor: 236, roundtrip_floor: 308 };
+const PSD_TOOLS: Source = Source { label: "psd-tools corpus", dir: "corpus/psd-tools", group_depth: 0, pass_floor: 249, roundtrip_floor: 308 };
 
 /// Our Photoshop-authored oracles (256 files; https://github.com/storytold/photocraft-corpus),
 /// grouped by feature (`smart-filters`, `effects`, `text`, `adjustments/<mode><bits>`).
-const PHOTOSHOP: Source = Source { label: "photoshop oracles", dir: "corpus/photoshop", group_depth: 2, pass_floor: 147, roundtrip_floor: 258 };
+const PHOTOSHOP: Source = Source { label: "photoshop oracles", dir: "corpus/photoshop", group_depth: 2, pass_floor: 188, roundtrip_floor: 258 };
 
 /// The corpus directory; a missing corpus fails the test.
 fn locate(src: &Source) -> PathBuf {

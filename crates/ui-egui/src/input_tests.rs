@@ -317,6 +317,56 @@ fn curves_picker_samples_document_coordinates_through_the_view_transform() {
     assert!((red - 32.0).abs() < 0.6, "sampled document-right blue patch through the flipped 400% view: {red}");
 }
 
+/// #7325: ⌘/Ctrl-click on the image with Curves open adds a point at the pixel's tone. The
+/// modifier is the press's own, a drag onto another tone adds nothing more, and the Hand tool
+/// does not take the press for a pan.
+#[test]
+fn command_click_under_curves_adds_one_point_per_press_not_per_frame() {
+    // The Hand tool too: the press is the dialog's, not the start of a pan.
+    for hand in [false, true] {
+        let mut h = harness();
+        if hand {
+            h.state_mut().ui.tool = crate::state::Tool::Hand;
+        }
+        h.state_mut().run("select.rect", json!({"x": 0, "y": 0, "width": 80, "height": 300})).unwrap();
+        h.state_mut().run("edit.fill", json!({"color": "#804020"})).unwrap();
+        h.state_mut().run("select.rect", json!({"x": 80, "y": 0, "width": 320, "height": 300})).unwrap();
+        h.state_mut().run("edit.fill", json!({"color": "#20a0e0"})).unwrap();
+        h.state_mut().run("select.deselect", json!({})).unwrap();
+        let view = &mut h.state_mut().ui.views[0];
+        (view.zoom, view.center, view.fit_pending) = (4.0, [200.0, 150.0], false);
+        let dialog = crate::adjust_dialog::open(h.state_mut(), "image.adjustments.curves").unwrap();
+        h.run_steps(3);
+        let points = |h: &Harness<'static, PhotocraftApp>| {
+            let d = h.state().ui.dialogs.iter().find(|d| d.id == dialog).unwrap();
+            d.fields.get("points").and_then(serde_json::Value::as_array).map_or(0, Vec::len)
+        };
+        let canvas = h.state().last_canvas_rect;
+        // Document x 65 (the brown strip) and 100 (the blue), both left of the centred dialog.
+        let (brown, blue) = (pos2(canvas.left() + 60.0, canvas.center().y), pos2(canvas.left() + 200.0, canvas.center().y));
+        h.hover_at(brown);
+        h.run_steps(1);
+        press(&mut h, brown, true);
+        press(&mut h, brown, false);
+        assert_eq!(points(&h), 2, "a plain click adds no point (hand: {hand})");
+
+        let button = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::COMMAND };
+        // ⌘ stays held through the drag, so only the press can tell the frames apart.
+        h.event(egui::Event::ModifiersChanged(Modifiers::COMMAND));
+        h.event(button(brown, true));
+        h.run_steps(1);
+        assert_eq!(points(&h), 3, "the press adds the point (hand: {hand})");
+        for t in [0.25, 0.5, 0.75, 1.0] {
+            h.event(egui::Event::PointerMoved(brown + (blue - brown) * t));
+            h.run_steps(1);
+        }
+        h.event(button(blue, false));
+        h.event(egui::Event::ModifiersChanged(Modifiers::NONE));
+        h.run_steps(2);
+        assert_eq!(points(&h), 3, "dragging onto another tone adds nothing more (hand: {hand})");
+    }
+}
+
 /// Type tool (#206): Alt+←/→ at a collapsed caret kerns the pair before it by 20/1000 em (100
 /// with ⌘/Ctrl), one history step per press; ⌘/Ctrl+←/→ moves by word; Alt+Shift+→ extends
 /// the selection by a word.
@@ -1086,4 +1136,32 @@ fn move_tool_controls_rotate_from_just_outside_the_box() {
     let end = h.state().ui.transform.as_ref().map(|t| t.quad).expect("the drag opened Free Transform");
     let tilt = (end[1][1] - end[0][1]).atan2(end[1][0] - end[0][0]).to_degrees();
     assert!((tilt - 90.0).abs() < 8.0 || (tilt + 270.0).abs() < 8.0, "rotated about a quarter turn, got {tilt}° (zoom {zoom})");
+}
+
+#[test]
+fn marquee_drag_after_hiding_extras_restores_selection_visibility() {
+    let mut h = harness();
+    h.state_mut().ui.tool = crate::state::Tool::RectMarquee;
+    let ctx = h.ctx.clone();
+    crate::menus::invoke(h.state_mut(), &ctx, "view.extras", json!({})).unwrap();
+    assert!(!h.state().ui.view.extras);
+    let start = h.state().last_canvas_rect.center() - vec2(30.0, 20.0);
+    let end = start + vec2(60.0, 40.0);
+    h.hover_at(start);
+    h.run_steps(1);
+    h.event(egui::Event::PointerButton { pos: start, button: egui::PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE });
+    h.run_steps(1);
+    for i in 1..=4 {
+        h.hover_at(start + (end - start) * (i as f32 / 4.0));
+        h.run_steps(1);
+    }
+    h.event(egui::Event::PointerButton { pos: end, button: egui::PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE });
+    h.run_steps(3);
+    assert!(h.state().session.active().unwrap().doc.selection.is_some(), "the pointer drag created a selection");
+    assert!(h.state().ui.view.shows(h.state().ui.view.show.selection_edges), "a new marquee must become visible after hiding Extras");
+    crate::menus::invoke(h.state_mut(), &ctx, "view.extras", json!({})).unwrap();
+    h.run_steps(2);
+    assert!(!h.state().ui.view.extras, "the user can hide the existing selection again");
+    h.state_mut().run("edit.fill", json!({"color": "#22cc44"})).unwrap();
+    assert!(!h.state().ui.view.extras, "painting an existing selection must preserve the user's hide choice");
 }

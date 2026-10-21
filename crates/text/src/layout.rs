@@ -22,7 +22,7 @@ use parley::{
     PositionedLayoutItem, StyleProperty,
 };
 use photocraft_doc::TextLayer;
-use photocraft_doc::text::{Caps, CharStyle, Kerning, Orientation, TextAlign, TextDirection, TextShape};
+use photocraft_doc::text::{Caps, CharStyle, FontBaseline, Kerning, Orientation, TextAlign, TextDirection, TextShape};
 use skrifa::raw::types::Tag;
 
 use crate::fonts::FontDb;
@@ -30,6 +30,23 @@ use crate::fonts::FontDb;
 /// Photoshop synthesizes small caps for faces without an OpenType `smcp` table. Keep the same
 /// readable hierarchy for every font instead of silently rendering lowercase text unchanged.
 const SYNTHETIC_SMALL_CAPS_SCALE: f32 = 0.7;
+
+/// Photoshop's default superscript / subscript size and position (Type preferences, stored in a
+/// PSD's text resources as `SuperscriptSize` .583, `SuperscriptPosition` .333 and their
+/// `Subscript` twins): the run is drawn at 58.3% of its size and moved by 33.3% of its size.
+const SCRIPT_SIZE: f32 = 0.583;
+const SCRIPT_POSITION: f32 = 0.333;
+
+/// The style a run is drawn with: superscript and subscript shrink it and shift its baseline.
+fn drawn_style(s: &mut CharStyle) {
+    let dir = match s.baseline {
+        FontBaseline::Normal => return,
+        FontBaseline::Superscript => 1.0,
+        FontBaseline::Subscript => -1.0,
+    };
+    s.baseline_shift_pt += dir * SCRIPT_POSITION * s.size_pt;
+    s.size_pt *= SCRIPT_SIZE;
+}
 
 /// Photoshop's default tab stops: every half inch, measured from the anchor of point text or the
 /// left edge of a paragraph box. PSD type carries no custom tab stops, so these are the only ones.
@@ -442,6 +459,8 @@ struct KernSlot {
     blank: bool,
     /// Advance along the line (px, horizontal scale included).
     advance: f32,
+    /// What horizontal scale adds to the shaped advance (px; negative below 100%).
+    growth: f32,
     /// A tab, shaped as a space; it advances to the next tab stop.
     tab: bool,
     /// Vertical type, upright glyph (its outline doesn't run along the column).
@@ -478,6 +497,7 @@ impl Layouter {
                 crate::served::request(&s.font_family);
             }
             fonts.select_named_face(&mut s);
+            drawn_style(&mut s);
             out.styles.push(s);
         }
         let run_starts: Vec<usize> = runs
@@ -586,6 +606,12 @@ impl Layouter {
                 for p in style_props(&out.styles[si0], k, &fallback, si0 as u32, small_caps[si0]) {
                     b.push_default(p);
                 }
+                // Paragraph text breaks a word wider than the box at the box edge, as Photoshop
+                // does (#6694): parley's default only breaks at UAX #14 opportunities and lets the
+                // word run out of the box. Point text has no width to overflow.
+                if is_box {
+                    b.push_default(StyleProperty::OverflowWrap(parley::style::OverflowWrap::BreakWord));
+                }
                 for (ri, st) in out.styles.iter().enumerate() {
                     let rs = run_starts[ri];
                     let (a, z) = (rs.max(prange.start), (rs + runs[ri].len).min(content_end));
@@ -629,6 +655,11 @@ impl Layouter {
                 for (range, size) in &synthetic_small_caps {
                     b.push(StyleProperty::FontSize(*size), range.clone());
                 }
+                // Korean breaks lines at spaces, between words, as Photoshop sets it; Unicode's
+                // default rules break between any two Hangul syllables, mid-word (#5959).
+                for range in hangul_runs(&ptext) {
+                    b.push(StyleProperty::WordBreak(parley::WordBreak::KeepAll), range);
+                }
                 for (&at, &spacing) in tabs.iter().zip(tab_spacing) {
                     b.push(StyleProperty::LetterSpacing(spacing), at..at + 1);
                 }
@@ -640,11 +671,29 @@ impl Layouter {
             // Box extent along the lines: width, or height for vertical type (columns).
             let (line_origin, line_len) = if vertical { (box_rect.1, box_rect.3) } else { (box_rect.0, box_rect.2) };
             let avail = if is_box { Some((line_len - indent_start - indent_end).max(1.0)) } else { None };
+            // Horizontal scale is applied after shaping, so paragraph text breaks at the box
+            // width divided by it (#5565). Mixed scales break at the largest, so no line
+            // overflows the box.
+            let break_scale = if is_box {
+                let si0 = style_at(prange.start);
+                (0..out.styles.len())
+                    .filter(|&ri| {
+                        let rs = run_starts.get(ri).copied().unwrap_or(0);
+                        let end = rs.saturating_add(runs.get(ri).map_or(0, |r| r.len));
+                        ri == si0 || (rs.max(prange.start) < end.min(content_end))
+                    })
+                    .filter_map(|ri| out.styles.get(ri))
+                    .map(effective_horizontal_scale)
+                    .fold(0.0f32, f32::max)
+            } else {
+                1.0
+            };
+            let break_scale = if break_scale > 0.0 { break_scale } else { 1.0 };
             let break_lines = |layout: &mut Layout<RunBrush>| {
                 if first_indent != 0.0 {
-                    layout.set_text_indent(first_indent, IndentOptions::default());
+                    layout.set_text_indent(first_indent / break_scale, IndentOptions::default());
                 }
-                layout.break_all_lines(avail);
+                layout.break_all_lines(avail.map(|a| a / break_scale));
             };
             // Paragraph text: a tab is never wider than a space plus one tab interval, so breaking
             // lines at that width keeps the expanded tabs inside the box, but can wrap early.
@@ -773,6 +822,7 @@ impl Layouter {
                             blank: first.is_none() || c.is_space_or_nbsp() || c.text_range().end <= prefix.len(),
                             upright: vertical && c.first_style().brush.1 != VClass::Rotate as u8,
                             advance: c.advance() * hs,
+                            growth: c.advance() * (hs - 1.0),
                             tab: tabs.binary_search(&c.text_range().start).is_ok(),
                         });
                     }
@@ -817,10 +867,15 @@ impl Layouter {
                 // moves the whole line).
                 let mut pos = indent_start + if li == 0 { first_indent } else { 0.0 };
                 let mut trailing_tabs = 0.0f32;
+                let mut trailing_growth = 0.0f32;
                 for (j, s) in slots.iter().enumerate() {
+                    // Trailing whitespace is outside the line's extent (`adv`).
+                    let trailing = s.blank && slots[j + 1..].iter().all(|n| n.blank);
+                    if trailing {
+                        trailing_growth += s.growth;
+                    }
                     if s.tab {
                         kern_px[j] = next_tab_stop(pos, tab_px) - pos - s.advance;
-                        // Trailing whitespace is outside the line's extent (`adv`).
                         if slots[j + 1..].iter().all(|n| n.blank) {
                             trailing_tabs += kern_px[j];
                         }
@@ -858,15 +913,18 @@ impl Layouter {
                 };
                 let dx = if is_box {
                     let base = line_origin + indent_start - kern_align;
-                    let slack = avail.unwrap_or(0.0) - adv - line_kern;
+                    let slack = avail.unwrap_or(0.0) - adv * break_scale - line_kern;
+                    // Parley aligned the unscaled line in `avail / break_scale`: scale its
+                    // indent and alignment offset back to the box.
+                    let scaled_offset = m.offset * (break_scale - 1.0);
                     base + if last_line {
                         match ps.align {
                             TextAlign::JustifyCenter => slack * 0.5 - m.offset,
                             TextAlign::JustifyRight => slack - m.offset,
-                            _ => 0.0,
+                            _ => scaled_offset,
                         }
                     } else {
-                        0.0
+                        scaled_offset
                     }
                 } else {
                     let target = match ps.align {
@@ -1031,7 +1089,7 @@ impl Layouter {
                     range: map(lr.start)..map(lr.end).min(content_end),
                     baseline,
                     x0,
-                    x1: x0 + adv + extra - trailing_tabs,
+                    x1: x0 + adv + extra - trailing_tabs - trailing_growth,
                     ascent,
                     descent,
                     paragraph: pi,
@@ -1041,6 +1099,11 @@ impl Layouter {
         }
         out
     }
+}
+
+/// A style's horizontal scale; unset (zero or negative) is 100%.
+fn effective_horizontal_scale(st: &CharStyle) -> f32 {
+    if st.horizontal_scale > 0.0 && st.horizontal_scale.is_finite() { st.horizontal_scale } else { 1.0 }
 }
 
 /// The first tab stop after `pos` (px from the anchor or box edge); stops are `interval` apart.
@@ -1373,6 +1436,23 @@ fn first_ascent(line: &parley::Line<'_, RunBrush>) -> Option<f32> {
         }
     }
     best
+}
+
+/// Hangul (syllables and jamo).
+fn is_hangul(c: char) -> bool {
+    matches!(c, '\u{1100}'..='\u{11FF}' | '\u{3130}'..='\u{318F}' | '\u{A960}'..='\u{A97F}' | '\u{AC00}'..='\u{D7AF}' | '\u{D7B0}'..='\u{D7FF}')
+}
+
+/// The byte ranges of `text` made of Hangul, each as long as it runs.
+pub(crate) fn hangul_runs(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut runs: Vec<std::ops::Range<usize>> = Vec::new();
+    for (i, c) in text.char_indices().filter(|&(_, c)| is_hangul(c)) {
+        match runs.last_mut() {
+            Some(r) if r.end == i => r.end = i + c.len_utf8(),
+            _ => runs.push(i..i + c.len_utf8()),
+        }
+    }
+    runs
 }
 
 #[cfg(test)]

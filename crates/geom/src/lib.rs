@@ -1,4 +1,4 @@
-//! Geometry primitives shared by every Photocraft crate.
+//! Geometry primitives shared by every PhotoCraft crate.
 //!
 //! Document space is integer pixels with the origin at the canvas top-left.
 //! Layers may extend beyond the canvas (negative coordinates are valid).
@@ -46,7 +46,12 @@ impl Rect {
         Self { x0, y0, x1, y1 }
     }
     pub fn from_xywh(x: i32, y: i32, w: u32, h: u32) -> Self {
-        Self::new(x, y, x.saturating_add(w as i32), y.saturating_add(h as i32))
+        // Widen before adding: `w as i32` wraps negative for widths above `i32::MAX`, which
+        // would turn the far edge backwards (an empty, inverted rect) instead of clamping it
+        // to `i32::MAX` the way `saturating_add` alone would suggest.
+        let x1 = (i64::from(x) + i64::from(w)).min(i64::from(i32::MAX)) as i32;
+        let y1 = (i64::from(y) + i64::from(h)).min(i64::from(i32::MAX)) as i32;
+        Self::new(x, y, x1, y1)
     }
     pub fn from_size(size: Size) -> Self {
         Self::from_xywh(0, 0, size.width, size.height)
@@ -117,7 +122,9 @@ impl TileCoord {
         Self::new(x.div_euclid(TILE_SIZE), y.div_euclid(TILE_SIZE))
     }
     pub fn rect(&self) -> Rect {
-        Rect::from_xywh(self.tx * TILE_SIZE, self.ty * TILE_SIZE, TILE_SIZE as u32, TILE_SIZE as u32)
+        // `tx`/`ty` can come from a file (this type is deserialized), so saturate instead of
+        // overflowing (a debug-build panic / release-build wrap) on extreme coordinates.
+        Rect::from_xywh(self.tx.saturating_mul(TILE_SIZE), self.ty.saturating_mul(TILE_SIZE), TILE_SIZE as u32, TILE_SIZE as u32)
     }
 }
 
@@ -256,6 +263,25 @@ mod tests {
         let grown = Rect::new(i32::MAX - 5, i32::MIN + 5, i32::MAX - 1, i32::MIN + 10).inflate(10);
         assert_eq!(grown.x1, i32::MAX);
         assert_eq!(grown.y0, i32::MIN);
+    }
+
+    #[test]
+    fn from_xywh_clamps_huge_sizes_instead_of_wrapping() {
+        // Widths above `i32::MAX` used to wrap negative through `w as i32`, producing an
+        // empty inverted rect instead of clamping the far edge to `i32::MAX`.
+        assert_eq!(Rect::from_xywh(0, 0, u32::MAX, 10), Rect::new(0, 0, i32::MAX, 10));
+        assert_eq!(Rect::from_xywh(-100, 5, u32::MAX, u32::MAX), Rect::new(-100, 5, i32::MAX, i32::MAX));
+        assert_eq!(Rect::from_xywh(10, 20, i32::MAX as u32 + 1, 40).width(), i32::MAX as u32 - 10);
+        // Ordinary sizes are unchanged.
+        assert_eq!(Rect::from_xywh(10, 20, 30, 40), Rect::new(10, 20, 40, 60));
+    }
+
+    #[test]
+    fn tile_rect_saturates_on_extreme_coords() {
+        // Tile coords are deserialized from files; `tx * TILE_SIZE` used to overflow.
+        let r = TileCoord::new(i32::MAX, i32::MIN).rect();
+        assert_eq!((r.x0, r.y0), (i32::MAX, i32::MIN));
+        assert_eq!(TileCoord::new(2, -3).rect(), Rect::new(512, -768, 768, -512));
     }
 
     #[test]

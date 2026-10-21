@@ -248,6 +248,22 @@ fn control_channel_opening_uses_the_same_dismissal_guard() {
     }
 }
 
+/// #7324: an agent's right-click on committed type opens the type layer menu, as on the canvas.
+#[test]
+fn control_channel_right_click_on_committed_type_opens_the_type_layer_menu() {
+    let mut h = harness(Tool::Type, false, 1.0);
+    h.state_mut().run("type.create", json!({"text": "Hello", "size": 72, "x": 100, "y": 180})).unwrap();
+    h.run_steps(3);
+    let at = fractional_point(&h, 1.0);
+    let before = document_state(&h);
+    control_tap(&mut h, at, Popup::Tool);
+    let menu = h.state().ui.canvas_tool_menu.clone().unwrap();
+    assert!(menu.type_layer && !menu.text);
+    assert!(h.state().ui.text_edit.is_none());
+    // The new type is already the active layer, so the menu selects nothing either.
+    assert!(document_state(&h) == before, "opening the menu changes nothing");
+}
+
 #[test]
 fn brush_picker_taps_preserve_pixels_selection_and_history_after_reopening() {
     for tool in [Tool::Brush, Tool::Eraser, Tool::QuickSelection] {

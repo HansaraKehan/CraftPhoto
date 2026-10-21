@@ -31,6 +31,35 @@ fn panel_commands_group_split_reorder_float_and_restore_without_duplicate_owners
 }
 
 #[test]
+fn floating_panel_rail_toggle_closes_the_float_window() {
+    let mut app = app();
+    app.run("window.panel.float", json!({"panel":"properties","x":50,"y":70,"width":330,"height":410})).unwrap();
+    assert!(app.ui.docking.as_ref().unwrap().floating.iter().any(|g| g.panels.contains(&"properties".into())));
+
+    rail_click(&mut app, Group::Properties);
+
+    assert!(app.ui.docking.as_ref().unwrap().floating.iter().all(|g| !g.panels.contains(&"properties".into())));
+    assert!(app.ui.docking.as_ref().unwrap().contains(&"adjustments".into()));
+    assert!(app.ui.panels.properties, "the docked Adjustments tab keeps the group visible");
+}
+
+#[test]
+fn brushes_menu_action_uses_the_shared_docking_layout() {
+    let mut app = app();
+    let before = app.ui.docking.clone();
+    assert!(crate::menus::invoke(&mut app, &egui::Context::default(), "window.panel.brushes", json!({})).is_ok());
+    let layout = app.ui.docking.as_ref().expect("brushes panel must be registered in docking");
+    assert!(layout.contains(&"brushes".to_string()));
+    assert!(app.ui.panels.brushes);
+    assert_ne!(app.ui.docking, before);
+
+    app.run("window.panel.float", json!({"panel":"brushes"})).unwrap();
+    assert!(app.ui.docking.as_ref().unwrap().floating.iter().any(|group| group.panels.contains(&"brushes".into())));
+    app.run("window.panel.dock", json!({"panel":"brushes"})).unwrap();
+    assert!(!app.ui.docking.as_ref().unwrap().floating.iter().any(|group| group.panels.contains(&"brushes".into())));
+}
+
+#[test]
 fn invalid_panel_requests_are_atomic_and_do_not_enter_a_custom_workspace() {
     let mut app = app();
     for (id, params) in [
@@ -96,6 +125,24 @@ fn ordinary_panel_tab_drag_enters_shared_docking_and_can_redock_into_another_tab
 }
 
 #[test]
+fn brushes_tab_drag_floats_and_can_redock_into_another_tab_group() {
+    let mut app = app();
+    crate::menus::invoke(&mut app, &egui::Context::default(), "window.panel.brushes", json!({})).unwrap();
+    let mut h = harness(app, vec2(1280.0, 800.0));
+    let source = h.query_all_by_label("Brushes").find(|node| node.rect().height() <= 45.0).unwrap().rect().center();
+    drag(&mut h, source, egui::pos2(160.0, 140.0));
+    let layout = h.state().ui.docking.as_ref().expect("brushes drag starts shared docking");
+    assert!(layout.floating.iter().any(|group| group.panels.contains(&"brushes".into())), "{layout:?}");
+
+    let source = h.ctx.read_response(egui::Id::new("photocraft-panel-docking").with(("tab", &"brushes".to_string()))).unwrap().rect.center();
+    let destination = h.ctx.read_response(egui::Id::new("photocraft-panel-docking").with(("tab", &"layers".to_string()))).unwrap().rect.center();
+    drag(&mut h, source, destination);
+    let layout = h.state().ui.docking.as_ref().unwrap();
+    assert!(!layout.floating.iter().any(|group| group.panels.contains(&"brushes".into())));
+    assert!(valid(layout));
+}
+
+#[test]
 fn saved_workspace_restores_the_custom_tree_and_hidden_panel_placement() {
     let mut app = app();
     let ctx = egui::Context::default();
@@ -128,6 +175,7 @@ fn shared_layout_keeps_panel_identity_across_themes_and_respects_workspace_lock(
 /// Explicit offscreen evidence; this creates no native windows.
 #[test]
 fn capture_custom_panel_docking_visual_fixtures() {
+    let _gpu = photocraft_testkit::gpu_lock();
     let Some(directory) = std::env::var_os("CRAFT_UI_DOCKING_FIXTURES").map(std::path::PathBuf::from) else { return };
     std::fs::create_dir_all(&directory).unwrap();
     for theme in crate::theme::ThemeKind::ALL {
@@ -164,6 +212,7 @@ fn capture_custom_panel_docking_visual_fixtures() {
 
 #[test]
 fn floating_group_titles_are_opaque_in_studio_themes() {
+    let _gpu = photocraft_testkit::gpu_lock();
     // Studio's tab strip is transparent over the dock's card; a floating group must not show the canvas (#4509).
     let mut app = app();
     app.run("window.panel.float", json!({"panel":"swatches","x":40,"y":60,"width":300,"height":300})).unwrap();
@@ -299,6 +348,7 @@ fn splitting_a_short_column_keeps_the_layers_footer_visible_and_usable() {
 
 #[test]
 fn populated_canvas_keeps_a_real_opacity_edit_after_floating_and_redocking() {
+    let _gpu = photocraft_testkit::gpu_lock();
     let mut app = app();
     app.ui.theme = crate::theme::ThemeKind::Studio;
     app.run("file.new", json!({"width":480,"height":360})).unwrap();
@@ -533,6 +583,23 @@ fn explicit_reveal_activates_existing_tab_and_expands_custom_group() {
     let before = app.ui.docking.clone();
     assert!(app.run("window.panel.layers", json!({"show":"yes"})).is_err());
     assert_eq!(app.ui.docking, before);
+}
+
+// #2455 in a custom workspace: the pro Color field fills a tall floating group, not 120 pt.
+#[test]
+fn pro_color_field_fills_a_tall_custom_group() {
+    let mut app = app();
+    app.run("window.panel.float", json!({"panel":"color","x":40,"y":60,"width":320,"height":560})).unwrap();
+    assert!(app.ui.docking.is_some());
+    let h = harness(app, vec2(1280.0, 800.0));
+    // The SV field and the 14 pt hue strip beside it are draggable, equally tall and 8 pt apart.
+    let drags: Vec<egui::Rect> =
+        h.ctx.viewport(|v| v.this_pass.widgets.layers().flat_map(|(_, w)| w).filter(|w| w.sense.senses_drag()).map(|w| w.rect).collect());
+    let field = drags
+        .iter()
+        .find(|f| drags.iter().any(|s| s.width() == 14.0 && s.top() == f.top() && s.height() == f.height() && (s.left() - f.right() - 8.0).abs() < 0.5))
+        .expect("Color field with its hue strip");
+    assert!(field.height() > 300.0, "field stays short in a 560 pt group: {field:?}");
 }
 
 // #4028: in a custom workspace too, a new adjustment layer brings Properties to the front.

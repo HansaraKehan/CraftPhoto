@@ -122,23 +122,39 @@ pub fn adjust_mask(s: &mut Surface, adj: &Adjustment, selection: Option<&Surface
 fn adjusted(s: &Surface, r: Rect, adj: &Adjustment, selection: Option<&Surface>, mode: photocraft_color::ColorMode) -> Vec<f32> {
     let fmt = s.format();
     if fmt.mode == mode && matches!(mode, photocraft_color::ColorMode::Lab | photocraft_color::ColorMode::Cmyk) && adjust::stored_channel_adjustment(adj) {
-        return adjusted_channels(s, r, adj, selection);
+        return adjusted_channels(s, r, selection, |ch| adjust::stored_channels(adj, fmt.mode, Some(fmt.sample), ch));
+    }
+    if fmt.mode == mode && mode == photocraft_color::ColorMode::Cmyk && adjust::cmy_adjustment(adj) {
+        return adjusted_cmy(s, r, adj, selection);
+    }
+    if let Adjustment::BrightnessContrast { brightness, contrast, legacy } = adj
+        && fmt.mode == mode
+        && mode == photocraft_color::ColorMode::Cmyk
+    {
+        let table = adjust::ink_brightness_contrast_lut(*brightness, *contrast, *legacy);
+        return adjusted_channels(s, r, selection, |ch| ch.iter_mut().for_each(|v| *v = adjust::ink_through(&table, *v)));
     }
     let n = fmt.channels();
     let raw = s.read_region(r);
     let mut buf = Buffer { rect: r, px: raw.chunks_exact(n).map(|p| to_rgba(&fmt, p)).collect() };
     let orig = buf.clone();
     // 32-bit documents get the float behaviour of an adjustment layer there (Levels doesn't clip);
-    // integer depths keep the unrounded, clipped curves.
-    let depth = (fmt.sample == photocraft_color::SampleType::F32).then_some(fmt.sample);
+    // integer depths keep the unrounded, clipped curves, except that 16-bit Posterize and
+    // Threshold use the 16-bit rules an adjustment layer measures against Photoshop, so the
+    // command matches its live preview (an adjustment layer) and Photoshop.
+    let depth = match (fmt.sample, adj) {
+        (photocraft_color::SampleType::F32, _) => Some(fmt.sample),
+        (photocraft_color::SampleType::U16, Adjustment::Posterize { .. } | Adjustment::Threshold { .. }) => Some(fmt.sample),
+        _ => None,
+    };
     adjust::apply_in(adj, &mut buf, adjust::Transfer::for_document(mode, fmt.sample), depth, mode);
     mix_through_selection(&fmt, r, &orig.px, &buf.px, selection)
 }
 
-/// [`adjusted`] for an adjustment Photoshop applies to a Lab or CMYK layer's own channels
-/// (`adjust::stored_channels`): exact on the stored values, with no trip through RGB, and mixed
-/// through the selection on those values (alpha untouched).
-fn adjusted_channels(s: &Surface, r: Rect, adj: &Adjustment, selection: Option<&Surface>) -> Vec<f32> {
+/// [`adjusted`] for an adjustment Photoshop applies to a Lab or CMYK layer's own channels: `op`
+/// changes one pixel's colour channels, exact on the stored values with no trip through RGB, and
+/// the selection mixes those values (alpha untouched).
+fn adjusted_channels(s: &Surface, r: Rect, selection: Option<&Surface>, op: impl Fn(&mut [f32])) -> Vec<f32> {
     let fmt = s.format();
     let (n, colors) = (fmt.channels(), fmt.mode.color_channels());
     let mut raw = s.read_region(r);
@@ -152,15 +168,36 @@ fn adjusted_channels(s: &Surface, r: Rect, adj: &Adjustment, selection: Option<&
             if k <= 0.0 {
                 continue;
             }
-            let p = to_rgba(&fmt, px);
-            let gray = photocraft_color::convert::rgb_to_gray([p[0], p[1], p[2]]);
             let Some(ch) = px.get_mut(..colors) else { continue };
             let mut out = [0.0f32; 4];
             let Some(out) = out.get_mut(..colors) else { continue };
             out.copy_from_slice(ch);
-            adjust::stored_channels(adj, fmt.mode, Some(fmt.sample), out, gray);
+            op(out);
             for (v, o) in ch.iter_mut().zip(out.iter()) {
                 *v += (o - *v) * k;
+            }
+        }
+    }
+    raw
+}
+
+/// [`adjusted`] for Hue/Saturation or Color Balance on a CMYK layer (`adjust::apply_cmy`): on its
+/// stored C, M and Y, black kept, the whole region at once; the selection mixes the stored inks.
+fn adjusted_cmy(s: &Surface, r: Rect, adj: &Adjustment, selection: Option<&Surface>) -> Vec<f32> {
+    let fmt = s.format();
+    let n = fmt.channels();
+    let mut raw = s.read_region(r);
+    let mut inks: Vec<[f32; 4]> = raw.chunks_exact(n).map(|p| std::array::from_fn(|c| p.get(c).copied().unwrap_or(0.0))).collect();
+    adjust::apply_cmy(adj, &mut inks);
+    let w = (r.width() as usize).max(1);
+    let mut coverage = vec![1.0f32; w];
+    for (j, (row, adjusted)) in raw.chunks_mut(w * n).zip(inks.chunks(w)).enumerate() {
+        if let Some(sel) = selection {
+            sel.sample_row_strided(r.y0.saturating_add(j as i32), r.x0, 1, 0, &mut coverage);
+        }
+        for ((px, ink), &k) in row.chunks_exact_mut(n).zip(adjusted).zip(&coverage) {
+            for (v, a) in px.iter_mut().zip(ink) {
+                *v += (a - *v) * k;
             }
         }
     }
@@ -378,5 +415,10 @@ pub fn merge_down(doc: &Document, lower: &Layer, upper: &Layer) -> Layer {
     // Merge Down replaces the lower layer, so keep its editing restrictions.
     // In particular, a merged Background must remain opaque and position-locked.
     merged.locks = lower.locks;
+    // And its place: two layers clipped in one chain merge into a layer still clipped to the base,
+    // with the lower layer's colour label and link.
+    merged.clipped = lower.clipped && upper.clipped;
+    merged.label = lower.label;
+    merged.link_group = lower.link_group;
     merged
 }

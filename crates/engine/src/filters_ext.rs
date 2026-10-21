@@ -277,6 +277,7 @@ pub fn params_for(id: &str, p: &Value) -> Option<FilterParams> {
             depth: match s(p, "depthMap", "none") {
                 "transparency" => DepthSource::Transparency,
                 "layerMask" => DepthSource::LayerMask,
+                "channel" => DepthSource::Channel,
                 _ => DepthSource::None,
             },
             focal_distance: f(p, "focalDistance", 0.0).clamp(0.0, 255.0),
@@ -429,8 +430,19 @@ fn map_from_document(doc: &Document, layer: Option<u64>) -> Option<algo::Image> 
 }
 
 /// Resolves inputs that live outside the target layer: Displace's map (`mapPath`, or
-/// `mapDocument` index with optional `mapLayer` id).
+/// `mapDocument` index with optional `mapLayer` id), and the alpha channel Lens Blur reads its
+/// depth from (`depthChannel`, an index or a name).
 pub(crate) fn resolve(s: &Session, fp: &mut FilterParams, p: &Value) -> Result<()> {
+    if let FilterParams::LensBlur { depth: DepthSource::Channel, depth_map, .. } = fp {
+        let doc = &s.active().ok_or(EngineError::NoDocument)?.doc;
+        let channel = p
+            .get("depthChannel")
+            .ok_or_else(|| EngineError::Other("Lens Blur: `depthMap` channel needs `depthChannel` (an alpha channel's index or name)".into()))?;
+        let surface = crate::edit_menu_cmds::channel_mask(doc, channel)
+            .ok_or_else(|| EngineError::Other(format!("Lens Blur: the document has no alpha channel {channel}")))?;
+        *depth_map = Some(Arc::new(algo::Image::read(surface, doc.bounds())));
+        return Ok(());
+    }
     let FilterParams::Displace { map, .. } = fp else { return Ok(()) };
     if map.is_some() {
         return Ok(());
@@ -466,13 +478,15 @@ fn map_from_path(path: &str, layer: Option<u64>) -> Result<Option<algo::Image>> 
 
 /// The session-free part of [`resolve`]: Displace's `mapPath`. Smart filters record params, not
 /// the map, so their re-render reads the map again here; without it the filter passed the pixels
-/// through. `mapDocument` needs the session and is left unresolved.
+/// through. The path is stored in the document, so it is followed only as
+/// [`crate::doc_path::resolve`] allows. `mapDocument` needs the session and is left unresolved.
 pub(crate) fn resolve_map_path(fp: &mut FilterParams, p: &Value) -> Result<()> {
     if let FilterParams::Displace { map, .. } = fp
         && map.is_none()
         && let Some(path) = map_path(p)
     {
-        *map = map_from_path(path, p.get("mapLayer").and_then(Value::as_u64))?.map(Arc::new);
+        let file = crate::doc_path::resolve(path).map_err(|why| crate::doc_path::refusal("the displacement map", path, why))?;
+        *map = map_from_path(&file.to_string_lossy(), p.get("mapLayer").and_then(Value::as_u64))?.map(Arc::new);
     }
     Ok(())
 }
@@ -660,7 +674,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "filter.blur.lensBlur",
             "Lens Blur…",
             ["Filter", "Blur"],
-            r##"{"radius":0..100=15,"shape":"hexagon|triangle|square|pentagon|heptagon|octagon","bladeCurvature":0..100=0,"rotation":0..360=0,"depthMap":"none|transparency|layerMask","focalDistance":0..255=0,"invert":bool,"brightness":0..100=0,"threshold":0..255=255,"noise":0..100=0,"distribution":"uniform|gaussian","monochromatic":bool,"seed":u32=0}"##
+            r##"{"radius":0..100=15,"shape":"hexagon|triangle|square|pentagon|heptagon|octagon","bladeCurvature":0..100=0,"rotation":0..360=0,"depthMap":"none|transparency|layerMask|channel","depthChannel":index|name?,"focalDistance":0..255=0,"invert":bool,"brightness":0..100=0,"threshold":0..255=255,"noise":0..100=0,"distribution":"uniform|gaussian","monochromatic":bool,"seed":u32=0}"##
         ),
         cmd!(
             "filter.blur.shapeBlur",

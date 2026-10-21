@@ -9,7 +9,7 @@ use std::sync::Arc;
 use photocraft_color::{ColorMode, PixelFormat, SampleType};
 use photocraft_doc::{Document, Pattern};
 use photocraft_geom::Rect;
-use photocraft_psd::patterns::{PsdPattern, block_key, mode_channels, parse_pattern_block, write_pattern_block};
+use photocraft_psd::patterns::{PatternBudget, PsdPattern, block_key, mode_channels, parse_pattern_block_with, write_pattern_block};
 use photocraft_raster::Surface;
 
 use crate::pixels::{deinterleave, interleave, max_sample, psd_depth, sample_for_depth, zero_sample};
@@ -110,13 +110,15 @@ pub fn to_psd(p: &Pattern) -> PsdPattern {
     }
 }
 
-/// Patterns decoded from the document's raw pattern blocks (malformed blocks are skipped).
+/// Patterns decoded from the document's raw pattern blocks (malformed blocks are skipped). All
+/// blocks share one memory budget, so repeating a block can't multiply it.
 pub fn from_global_blocks(doc: &Document) -> Vec<Pattern> {
+    let mut budget = PatternBudget::default();
     doc.metadata
         .psd_global_blocks
         .iter()
         .filter(|(_, k, _)| PATTERN_KEYS.contains(k))
-        .filter_map(|(_, _, d)| parse_pattern_block(d).ok())
+        .filter_map(|(_, _, d)| parse_pattern_block_with(d, &mut budget).ok())
         .flatten()
         .filter_map(|p| from_psd(&p))
         .collect()

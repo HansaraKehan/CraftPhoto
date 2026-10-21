@@ -9,6 +9,8 @@ use std::sync::Arc;
 
 use egui::{CursorIcon, CustomCursorImage, Painter, Pos2, Stroke, Vec2, vec2};
 
+use crate::canvas::ViewXform;
+
 mod hand;
 mod zoom;
 
@@ -91,9 +93,25 @@ fn close_ring() -> Vec<Vec2> {
 }
 
 /// Can this pass show an OS cursor bitmap? eframe's immediate viewports and its web integration
-/// don't upload cursor images; every desktop root viewport does (winit custom cursors).
+/// don't upload cursor images; every desktop root viewport does (winit custom cursors). Wayland at
+/// any scale but 1 doesn't either: winit sizes the bitmap there with a `wp_viewport` destination
+/// that some compositors ignore on cursor surfaces (Hyprland 0.56; Mutter before GNOME 48). They
+/// show it one bitmap pixel per logical pixel, so at 1.25 a brush outline was 1.25× too large and
+/// its centre sat 0.2 × its half-width right of and below the pointer, which is where the brush
+/// painted. Nothing tells the app which compositor does what, so the outline is painted instead.
 fn native(ctx: &egui::Context) -> bool {
-    cfg!(not(target_arch = "wasm32")) && ctx.viewport_id() == egui::ViewportId::ROOT
+    cfg!(not(target_arch = "wasm32")) && ctx.viewport_id() == egui::ViewportId::ROOT && !scaled_wayland(ctx)
+}
+
+/// Mark this window as a Wayland surface (or not), for [`native`]; the shell calls it every pass.
+pub(crate) fn set_wayland(ctx: &egui::Context, wayland: bool) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new("photocraft-cursor-wayland"), wayland));
+}
+
+/// A Wayland window whose scale is not 1, where winit's cursor bitmaps are unreliable.
+fn scaled_wayland(ctx: &egui::Context) -> bool {
+    let wayland = cfg!(target_os = "linux") && ctx.data(|d| d.get_temp::<bool>(egui::Id::new("photocraft-cursor-wayland"))).unwrap_or(false);
+    wayland && ctx.native_pixels_per_point().unwrap_or_else(|| ctx.pixels_per_point() / ctx.zoom_factor()) != 1.0
 }
 
 /// Bitmap pixels per egui point. winit takes an `NSCursor` image's dimensions as logical points on
@@ -102,6 +120,21 @@ fn native(ctx: &egui::Context) -> bool {
 /// sizing is from @jerrykimo's #968.)
 pub(crate) fn native_scale(ctx: &egui::Context) -> f32 {
     if cfg!(target_os = "macos") { ctx.zoom_factor() } else { ctx.pixels_per_point() }
+}
+
+/// The resize arrow for a handle that resizes along document direction `d`, as the view shows it
+/// (its rotation, flip and pixel aspect): the nearest of the four arrows. Free Transform (handles
+/// and Warp splits), the type box, Content-Aware Move's box, the Artboard tool and guides pick
+/// their arrows here.
+pub(crate) fn resize(d: [f64; 2], xf: &ViewXform) -> CursorIcon {
+    let s = xf.map_vec(vec2(d[0] as f32, d[1] as f32));
+    let angle = f64::from(s.y).atan2(f64::from(s.x)).rem_euclid(std::f64::consts::PI);
+    match (angle / std::f64::consts::FRAC_PI_4).round() as u8 % 4 {
+        0 => CursorIcon::ResizeHorizontal,
+        1 => CursorIcon::ResizeNwSe,
+        2 => CursorIcon::ResizeVertical,
+        _ => CursorIcon::ResizeNeSw,
+    }
 }
 
 /// The Hand tool's pointer: an open hand, a fist while it drags (`closed`). winit maps `Grab` and

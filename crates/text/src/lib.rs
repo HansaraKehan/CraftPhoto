@@ -1,4 +1,4 @@
-//! Photocraft's type engine.
+//! PhotoCraft's type engine.
 //!
 //! * [`fonts::FontDb`]: bundled fonts (Inter, JetBrains Mono; always available, including on the
 //!   web), optional system fonts from platform directory scans plus Fontconfig's Linux file list,

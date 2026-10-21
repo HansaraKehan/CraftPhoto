@@ -38,17 +38,35 @@ fn seed_remembered(app: &PhotocraftApp, f: &mut Map<String, Value>) {
             f.insert(key.into(), json!(v));
         }
     }
-    if let Some(v) = saved.get("metadata").and_then(Value::as_str).filter(|v| ["none", "all"].contains(v)) {
+    if let Some(v) = saved.get("metadata").and_then(Value::as_str).filter(|v| ["none", "exif", "all"].contains(v)) {
         f.insert("metadata".into(), json!(v));
     }
     if let Some(v) = saved.get("tgaBits").and_then(Value::as_str).filter(|v| ["auto", "24", "32"].contains(v)) {
         f.insert("tgaBits".into(), json!(v));
     }
+    if let Some(v) = saved.get("sizing").and_then(Value::as_str).filter(|v| ["scale", "pixels"].contains(v)) {
+        f.insert("sizing".into(), json!(v));
+    }
+    if let Some(v) = saved.get("lockAspect").and_then(Value::as_bool) {
+        f.insert("lockAspect".into(), json!(v));
+    }
+    if let Some(v) = saved.get("embedProfile").and_then(Value::as_bool) {
+        f.insert("embedProfile".into(), json!(v));
+    }
+    if let Some(v) = saved.get("profile").and_then(Value::as_str).filter(|v| ["document", "srgb"].contains(v)) {
+        f.insert("profile".into(), json!(v));
+    }
+    for key in ["width", "height"] {
+        if let Some(v) = saved.get(key).and_then(Value::as_f64).filter(|v| v.is_finite() && (1.0..=MAX_PX).contains(v)) {
+            f.insert(key.into(), json!(v.round()));
+        }
+    }
 }
 
 /// Record the settings for the next Export As (see [`seed_remembered`]).
 fn remember(app: &mut PhotocraftApp, f: &Map<String, Value>) {
-    const KEYS: [&str; 7] = ["format", "quality", "lossless", "transparency", "scale", "metadata", "tgaBits"];
+    const KEYS: [&str; 13] =
+        ["format", "quality", "lossless", "transparency", "scale", "metadata", "tgaBits", "sizing", "width", "height", "lockAspect", "profile", "embedProfile"];
     let saved: Map<String, Value> = KEYS.iter().filter_map(|k| f.get(*k).map(|v| ((*k).to_string(), v.clone()))).collect();
     app.session.prefs.edit(|p| {
         p.dialogs.insert(COMMAND.into(), Value::Object(saved));
@@ -67,9 +85,24 @@ pub fn open(app: &mut PhotocraftApp) -> Result<u64, String> {
     f.insert("scale".into(), json!(100));
     f.insert("metadata".into(), json!("none"));
     f.insert("tgaBits".into(), json!("auto"));
+    f.insert("sizing".into(), json!("scale"));
+    f.insert("lockAspect".into(), json!(true));
+    f.insert("profile".into(), json!("document"));
+    f.insert("embedProfile".into(), json!(true));
+    f.insert("width".into(), json!(st.doc.size.width));
+    f.insert("height".into(), json!(st.doc.size.height));
     f.insert("__w".into(), json!(st.doc.size.width));
     f.insert("__h".into(), json!(st.doc.size.height));
     seed_remembered(app, &mut f);
+    let explicit = s(&f, "sizing") == "pixels" && f.contains_key("width") && f.contains_key("height");
+    if !explicit && let Ok(size) = resize_from_scale(f64::from(st.doc.size.width), f64::from(st.doc.size.height), n(&f, "scale", 100.0)) {
+        f.insert("width".into(), json!(size.width));
+        f.insert("height".into(), json!(size.height));
+        if (n(&f, "scale", 100.0) - size.scale).abs() > 1e-9 {
+            f.insert("scale".into(), json!(size.scale));
+        }
+        f.insert("sizing".into(), json!("scale"));
+    }
     Ok(app.ui.open_dialog(DialogKind::Command, f))
 }
 
@@ -210,36 +243,109 @@ fn n(f: &Map<String, Value>, k: &str, d: f64) -> f64 {
 /// The document as exported: scaled (engine Image Size, bicubic) and flattened over white when
 /// transparency is off or the format has no alpha.
 fn export_document(doc: &Document, f: &Map<String, Value>, max_side: Option<u32>) -> Result<Document, String> {
-    let mut s = photocraft_engine::Session::new();
-    s.add_document(doc.clone(), None);
-    let mut scale = n(f, "scale", 100.0) / 100.0;
-    if let Some(m) = max_side {
-        let long = doc.size.width.max(doc.size.height) as f64 * scale;
-        if long > m as f64 {
-            scale *= m as f64 / long;
-        }
+    let mut session = photocraft_engine::Session::new();
+    session.add_document(doc.clone(), None);
+    if s(f, "profile") == "srgb" && doc.icc_profile.is_some() {
+        session.execute("edit.convertToProfile", json!({"profile": "srgb", "intent": "perceptual"})).map_err(|e| e.to_string())?;
     }
-    // Both dimensions are sent: a scale can leave a 1 px width unchanged while halving the
-    // height, and the engine would otherwise keep the aspect ratio from the width alone.
-    let (w, h) = scaled_size(doc.size.width as f64, doc.size.height as f64, scale);
+    let (w, h) = export_pixels(f64::from(doc.size.width), f64::from(doc.size.height), f, max_side)?;
     if s_fmt(f) == "ico" && (w > 256.0 || h > 256.0) && max_side.is_none() {
         return Err("ICO export is limited to 256 × 256 pixels; reduce the export scale".into());
     }
     if (w - doc.size.width as f64).abs() >= 1.0 || (h - doc.size.height as f64).abs() >= 1.0 {
-        s.execute("image.imageSize", json!({"width": w, "height": h, "resample": if max_side.is_some() { "bilinear" } else { "bicubic" }}))
+        session
+            .execute("image.imageSize", json!({"width": w, "height": h, "resample": if max_side.is_some() { "bilinear" } else { "bicubic" }}))
             .map_err(|e| e.to_string())?;
     }
     let fmt = s_fmt(f);
     if !f.get("transparency").and_then(Value::as_bool).unwrap_or(true) || fmt == "jpg" {
-        s.execute("layer.flattenImage", json!({})).map_err(|e| e.to_string())?;
+        session.execute("layer.flattenImage", json!({})).map_err(|e| e.to_string())?;
     }
-    s.active().map(|d| (*d.doc).clone()).ok_or_else(|| "export failed".into())
+    session.active().map(|d| (*d.doc).clone()).ok_or_else(|| "export failed".into())
 }
 
 /// The exported pixel size: each side scaled and rounded on its own, never below 1 px. The
 /// dialog's size label and `export_document` share it so the label names the file's real size.
 fn scaled_size(w: f64, h: f64, scale: f64) -> (f64, f64) {
     ((w * scale).round().max(1.0), (h * scale).round().max(1.0))
+}
+
+/// Largest side Export As will ask Image Size for. The same cap `image.imageSize` enforces.
+const MAX_PX: f64 = 300_000.0;
+
+/// Pixel size, percent scale and whether the two sides stay linked.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ExportSize {
+    width: f64,
+    height: f64,
+    scale: f64,
+}
+
+fn finite_px(v: f64) -> Result<f64, String> {
+    if !v.is_finite() || !(1.0..=MAX_PX).contains(&v) {
+        return Err(format!("export size must be within 1..={MAX_PX} pixels"));
+    }
+    Ok(v.round())
+}
+
+/// Percent scale applied to both sides. `scale` is a percent in 1..=1000.
+fn resize_from_scale(src_w: f64, src_h: f64, scale: f64) -> Result<ExportSize, String> {
+    if !scale.is_finite() || !(1.0..=1000.0).contains(&scale) {
+        return Err("scale must be within 1..=1000 percent".into());
+    }
+    let (width, height) = scaled_size(src_w.max(1.0), src_h.max(1.0), scale / 100.0);
+    if width > MAX_PX || height > MAX_PX {
+        return Err(format!("export size must be within 1..={MAX_PX} pixels"));
+    }
+    Ok(ExportSize { width, height, scale })
+}
+
+/// An edited side. With `lock`, the other side keeps the source aspect; otherwise it stays.
+fn resize_from_side(src_w: f64, src_h: f64, width: f64, height: f64, lock: bool, edited_width: bool) -> Result<ExportSize, String> {
+    let src_w = src_w.max(1.0);
+    let src_h = src_h.max(1.0);
+    let (width, height) = if edited_width {
+        let width = finite_px(width)?;
+        let height = if lock { finite_px(src_h * width / src_w)? } else { finite_px(height)? };
+        (width, height)
+    } else {
+        let height = finite_px(height)?;
+        let width = if lock { finite_px(src_w * height / src_h)? } else { finite_px(width)? };
+        (width, height)
+    };
+    let scale = if edited_width { width / src_w * 100.0 } else { height / src_h * 100.0 };
+    Ok(ExportSize { width, height, scale })
+}
+
+/// The pixels `export_document` resizes to. Explicit width and height win; otherwise the percent
+/// scale does, and a preview limit shrinks the long side before rounding (the same reduction the
+/// scale path used before pixel fields existed).
+fn export_pixels(src_w: f64, src_h: f64, f: &Map<String, Value>, max_side: Option<u32>) -> Result<(f64, f64), String> {
+    // Exact pixels apply only in pixel mode. Scale mode keeps the percent, so each layer in a
+    // multi-layer export is scaled from its own size rather than forced to the preview's pixels.
+    let explicit = if s(f, "sizing") == "pixels" { f.get("width").and_then(Value::as_f64).zip(f.get("height").and_then(Value::as_f64)) } else { None };
+    let (mut w, mut h) = if let Some((w, h)) = explicit {
+        (finite_px(w)?, finite_px(h)?)
+    } else {
+        let mut scale = n(f, "scale", 100.0) / 100.0;
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err("export scale must be a positive number".into());
+        }
+        if let Some(m) = max_side {
+            let long = src_w.max(src_h) * scale;
+            if long > f64::from(m) {
+                scale *= f64::from(m) / long;
+            }
+        }
+        return Ok(scaled_size(src_w, src_h, scale));
+    };
+    if let Some(m) = max_side {
+        let long = w.max(h);
+        if long > f64::from(m) && long > 0.0 {
+            (w, h) = scaled_size(w, h, f64::from(m) / long);
+        }
+    }
+    Ok((w, h))
 }
 
 /// Export As already supports lossy WebP; reuse the Quick Export defaults when
@@ -276,12 +382,17 @@ fn tga_bits(f: &Map<String, Value>) -> Option<photocraft_io::TgaBits> {
 fn settings(f: &Map<String, Value>) -> ExportSettings {
     let fmt = s_fmt(f);
     let quality = n(f, "quality", 85.0).clamp(1.0, 100.0) as u8;
+    let metadata = s(f, "metadata");
     ExportSettings {
         jpeg_quality: (fmt == "jpg").then_some(quality),
         webp_lossless: fmt != "webp" || lossless(f),
         webp_quality: (fmt == "webp" && !lossless(f)).then_some(quality),
-        xmp_all: s(f, "metadata") == "all",
+        xmp_all: metadata == "all",
         tga_bits: if fmt == "tga" { tga_bits(f) } else { None },
+        embed_icc: f.get("embedProfile").and_then(Value::as_bool).unwrap_or(true),
+        // Metadata: None drops EXIF and resolution as well as XMP. A missing key keeps them,
+        // which is what Export As wrote before the choice existed.
+        embed_metadata: metadata != "none",
         ..Default::default()
     }
 }
@@ -293,8 +404,13 @@ fn preview_proxy(doc: &Document, f: &Map<String, Value>) -> Result<Document, Str
 }
 
 fn scaled_estimate(bytes: usize, doc: &Document, proxy: &Document, f: &Map<String, Value>) -> u64 {
-    let scale = n(f, "scale", 100.0) / 100.0;
-    let full = doc.size.width as f64 * scale * doc.size.height as f64 * scale;
+    let full = match (f.get("width").and_then(Value::as_f64), f.get("height").and_then(Value::as_f64)) {
+        (Some(w), Some(h)) if w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0 => w * h,
+        _ => {
+            let scale = n(f, "scale", 100.0) / 100.0;
+            doc.size.width as f64 * scale * doc.size.height as f64 * scale
+        }
+    };
     let small = (proxy.size.width as f64 * proxy.size.height as f64).max(1.0);
     (bytes as f64 * full / small) as u64
 }
@@ -406,22 +522,184 @@ fn poll_or_start_preview(
 /// The native exporter uses this same IO encoder. Keep the entire estimate off the UI thread.
 #[cfg(not(target_arch = "wasm32"))]
 fn estimate_native(doc: &Document, proxy: &Document, f: &Map<String, Value>) -> Option<u64> {
-    let settings = settings(f);
-    let mut options = photocraft_io::ExportOptions::default();
-    if let Some(quality) = settings.jpeg_quality {
-        options.encode.jpeg_quality = quality;
-    }
-    options.encode.webp_lossless = settings.webp_lossless;
-    if let Some(quality) = settings.webp_quality {
-        options.encode.webp_quality = quality;
-    }
-    options.tiff_layers = settings.tiff_layers;
-    options.xmp = if settings.xmp_all { photocraft_io::XmpEmbed::All } else { photocraft_io::XmpEmbed::None };
-    options.tga_bits = settings.tga_bits;
-    options.image_previews = settings.image_previews;
-    options.psd_maximize_compatibility = settings.psd_maximize_compatibility;
-    let bytes = photocraft_io::export(proxy, &format!("estimate.{}", s_fmt(f)), &options).ok()?.bytes;
+    let bytes = photocraft_io::export(proxy, &format!("estimate.{}", s_fmt(f)), &settings(f).io_options()).ok()?.bytes;
     Some(scaled_estimate(bytes.len(), doc, proxy, f))
+}
+
+fn write_size(f: &mut Map<String, Value>, size: ExportSize, sizing: &str) {
+    f.insert("width".into(), json!(size.width));
+    f.insert("height".into(), json!(size.height));
+    f.insert("scale".into(), json!(size.scale));
+    f.insert("sizing".into(), json!(sizing));
+}
+
+/// Scale, width and height. A scale edit sets both sides; a side edit sets exact pixels and, when
+/// the link is on, the other side. The widget is compared with the value it was given so a field
+/// that only clamps an out-of-range scale does not overwrite an exact pixel size.
+fn size_fields(ui: &mut egui::Ui, f: &mut Map<String, Value>, src_w: f64, src_h: f64) {
+    let t = Tokens::get(ui.ctx());
+    let stored = n(f, "scale", 100.0);
+    let passed = stored.clamp(1.0, 1000.0).round();
+    let mut sc = passed as f32;
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(tl!("Scale")).color(t.text_dim));
+        crate::widgets::value_field(ui, &mut sc, 1.0..=1000.0, "%", 70.0);
+    });
+    let sc_r = f64::from(sc).round().clamp(1.0, 1000.0);
+    if (sc_r - passed).abs() > 0.01
+        && let Ok(size) = resize_from_scale(src_w, src_h, sc_r)
+    {
+        write_size(f, size, "scale");
+    }
+    let lock = f.get("lockAspect").and_then(Value::as_bool).unwrap_or(true);
+    let stored_w = n(f, "width", src_w.max(1.0));
+    let mut width = stored_w.clamp(1.0, MAX_PX) as f32;
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(tl!("Width")).color(t.text_dim));
+        crate::widgets::value_field(ui, &mut width, 1.0..=MAX_PX as f32, "px", 70.0);
+    });
+    let width_r = f64::from(width).round();
+    if (width_r - stored_w.round()).abs() > 0.01
+        && let Ok(size) = resize_from_side(src_w, src_h, width_r, n(f, "height", src_h.max(1.0)), lock, true)
+    {
+        write_size(f, size, "pixels");
+    }
+    let stored_h = n(f, "height", src_h.max(1.0));
+    let mut height = stored_h.clamp(1.0, MAX_PX) as f32;
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(tl!("Height")).color(t.text_dim));
+        crate::widgets::value_field(ui, &mut height, 1.0..=MAX_PX as f32, "px", 70.0);
+    });
+    let height_r = f64::from(height).round();
+    if (height_r - stored_h.round()).abs() > 0.01
+        && let Ok(size) = resize_from_side(src_w, src_h, n(f, "width", src_w.max(1.0)), height_r, lock, false)
+    {
+        write_size(f, size, "pixels");
+    }
+    let mut linked = lock;
+    if crate::widgets::checkbox(ui, &mut linked, tl!("Constrain proportions")).changed() {
+        f.insert("lockAspect".into(), json!(linked));
+        if linked && let Ok(size) = resize_from_side(src_w, src_h, n(f, "width", src_w.max(1.0)), n(f, "height", src_h.max(1.0)), true, true) {
+            write_size(f, size, "pixels");
+        }
+    }
+}
+
+fn apply_preset(f: &mut Map<String, Value>, settings: &photocraft_engine::export_preset_cmds::ExportPresetSettings, src_w: f64, src_h: f64) {
+    f.insert("format".into(), json!(settings.format));
+    f.insert("quality".into(), json!(settings.quality));
+    f.insert("lossless".into(), json!(settings.lossless));
+    f.insert("transparency".into(), json!(settings.transparency));
+    f.insert("scale".into(), json!(settings.scale));
+    f.insert("lockAspect".into(), json!(settings.lock_aspect));
+    f.insert("sizing".into(), json!(settings.sizing));
+    f.insert("metadata".into(), json!(settings.metadata));
+    f.insert("profile".into(), json!(settings.profile));
+    f.insert("embedProfile".into(), json!(settings.embed_profile));
+    f.insert("tgaBits".into(), json!(settings.tga_bits));
+    if settings.sizing == "pixels" {
+        f.insert("width".into(), json!(settings.width));
+        f.insert("height".into(), json!(settings.height));
+    } else if let Ok(size) = resize_from_scale(src_w, src_h, settings.scale) {
+        f.insert("width".into(), json!(size.width));
+        f.insert("height".into(), json!(size.height));
+        f.insert("scale".into(), json!(size.scale));
+    }
+}
+
+fn preset_settings(f: &Map<String, Value>) -> Value {
+    let metadata = s(f, "metadata");
+    let metadata = if ["none", "exif", "all"].contains(&metadata.as_str()) { metadata } else { "none".into() };
+    let bits = s(f, "tgaBits");
+    let bits = if ["auto", "24", "32"].contains(&bits.as_str()) { bits } else { "auto".into() };
+    let scale = n(f, "scale", 100.0);
+    let scale = if scale.is_finite() { scale.clamp(1.0, 1000.0) } else { 100.0 };
+    json!({
+        "format": s_fmt(f),
+        "quality": n(f, "quality", 85.0).clamp(1.0, 100.0).round(),
+        "lossless": lossless(f),
+        "transparency": f.get("transparency").and_then(Value::as_bool).unwrap_or(true),
+        "scale": scale,
+        "width": n(f, "width", 1.0).clamp(1.0, MAX_PX).round(),
+        "height": n(f, "height", 1.0).clamp(1.0, MAX_PX).round(),
+        "lockAspect": f.get("lockAspect").and_then(Value::as_bool).unwrap_or(true),
+        "sizing": if s(f, "sizing") == "pixels" { "pixels" } else { "scale" },
+        "metadata": metadata,
+        "profile": if s(f, "profile") == "srgb" { "srgb" } else { "document" },
+        "embedProfile": f.get("embedProfile").and_then(Value::as_bool).unwrap_or(true),
+        "tgaBits": bits,
+    })
+}
+
+fn preset_fields(app: &mut PhotocraftApp, ui: &mut egui::Ui, f: &mut Map<String, Value>, src_w: f64, src_h: f64) {
+    let t = Tokens::get(ui.ctx());
+    ui.add_space(8.0);
+    let names: Vec<String> = app.session.presets.export_presets.iter().map(|p| p.name.clone()).collect();
+    if !names.is_empty() {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(tl!("Preset")).color(t.text_dim));
+            let mut selected = s(f, "__preset");
+            let mut opts = Vec::with_capacity(names.len() + 1);
+            opts.push(("".to_string(), "—"));
+            for name in &names {
+                opts.push((name.clone(), name.as_str()));
+            }
+            if crate::widgets::dropdown(ui, "export-preset", &mut selected, &opts, 130.0) {
+                f.insert("__preset".into(), json!(selected));
+                if let Some(preset) = app.session.presets.export_presets.iter().find(|p| p.name == s(f, "__preset")).cloned() {
+                    apply_preset(f, &preset.settings, src_w, src_h);
+                }
+            }
+        });
+        if !s(f, "__preset").is_empty() && crate::widgets::secondary_button(ui, tl!("Delete"), 84.0).clicked() {
+            let name = s(f, "__preset");
+            match app.run("file.export.presets.delete", json!({"name": name})) {
+                Ok(_) => {
+                    f.remove("__preset");
+                    f.remove("__presetError");
+                }
+                Err(e) => {
+                    f.insert("__presetError".into(), json!(e));
+                }
+            }
+        }
+    }
+    if f.get("__savingPreset").and_then(Value::as_bool) != Some(true) {
+        if crate::widgets::secondary_button(ui, tl!("Save Preset…"), 160.0).clicked() {
+            f.insert("__savingPreset".into(), json!(true));
+            f.remove("__presetError");
+        }
+    } else {
+        let enter = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+        let label = ui.label(tl!("Preset Name"));
+        let mut name = s(f, "__presetName");
+        ui.add(egui::TextEdit::singleline(&mut name).id_salt("export-preset-name").desired_width(160.0).char_limit(255)).labelled_by(label.id);
+        f.insert("__presetName".into(), json!(name));
+        ui.horizontal(|ui| {
+            if crate::widgets::secondary_button(ui, tl!("Save"), 70.0).clicked() || enter {
+                match app.run("file.export.presets.save", json!({"name": name, "settings": preset_settings(f)})) {
+                    Ok(v) => {
+                        if let Some(saved) = v.get("preset").and_then(|p| p.get("name")).and_then(Value::as_str) {
+                            f.insert("__preset".into(), json!(saved));
+                        }
+                        f.remove("__savingPreset");
+                        f.remove("__presetName");
+                        f.remove("__presetError");
+                    }
+                    Err(e) => {
+                        f.insert("__presetError".into(), json!(e));
+                    }
+                }
+            }
+            if crate::widgets::secondary_button(ui, tl!("Cancel"), 70.0).clicked() {
+                f.remove("__savingPreset");
+                f.remove("__presetError");
+            }
+        });
+    }
+    if let Some(error) = f.get("__presetError").and_then(Value::as_str) {
+        ui.add(egui::Label::new(error).wrap());
+    }
 }
 
 pub fn body(app: &mut PhotocraftApp, ui: &mut egui::Ui, f: &mut Map<String, Value>) {
@@ -430,7 +708,7 @@ pub fn body(app: &mut PhotocraftApp, ui: &mut egui::Ui, f: &mut Map<String, Valu
     ui.horizontal_top(|ui| {
         // Left: settings.
         ui.vertical(|ui| {
-            ui.set_width(220.0);
+            ui.set_width(248.0);
             ui.label(egui::RichText::new(tl!("File Settings")).font(crate::theme::semibold(12.0)).color(t.text));
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(tl!("Format")).color(t.text_dim));
@@ -470,25 +748,35 @@ pub fn body(app: &mut PhotocraftApp, ui: &mut egui::Ui, f: &mut Map<String, Valu
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(tl!("Metadata")).color(t.text_dim));
                 let mut m = s(f, "metadata");
-                let opts: Vec<(String, &str)> = vec![("none".into(), tl!("None")), ("all".into(), tl!("All"))];
+                let opts: Vec<(String, &str)> = vec![("none".into(), tl!("None")), ("exif".into(), tl!("EXIF")), ("all".into(), tl!("All"))];
                 if crate::widgets::dropdown(ui, "export-metadata", &mut m, &opts, 130.0) {
                     f.insert("metadata".into(), json!(m));
                 }
             });
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(tl!("Color Profile")).color(t.text_dim));
+                let mut profile = s(f, "profile");
+                if profile != "srgb" {
+                    profile = "document".into();
+                }
+                let opts: Vec<(String, &str)> = vec![("document".into(), tl!("Document Profile")), ("srgb".into(), tl!("Convert to sRGB"))];
+                if crate::widgets::dropdown(ui, "export-profile", &mut profile, &opts, 130.0) {
+                    f.insert("profile".into(), json!(profile));
+                }
+            });
+            let mut embed = f.get("embedProfile").and_then(Value::as_bool).unwrap_or(true);
+            crate::widgets::checkbox(ui, &mut embed, tl!("Embed Color Profile"));
+            f.insert("embedProfile".into(), json!(embed));
             ui.add_space(8.0);
             ui.label(egui::RichText::new(tl!("Image Size")).font(crate::theme::semibold(12.0)).color(t.text));
-            let mut sc = n(f, "scale", 100.0) as f32;
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(tl!("Scale")).color(t.text_dim));
-                crate::widgets::value_field(ui, &mut sc, 1.0..=1000.0, "%", 70.0);
-            });
-            f.insert("scale".into(), json!(sc.round()));
             let (bw, bh) = (n(f, "__w", f64::from(doc.size.width)), n(f, "__h", f64::from(doc.size.height)));
-            let (w, h) = scaled_size(bw, bh, f64::from(sc) / 100.0);
+            size_fields(ui, f, bw, bh);
+            let (w, h) = (n(f, "width", bw), n(f, "height", bh));
             ui.label(egui::RichText::new(format!("{w} × {h} px")).color(t.text_dim).size(11.5));
             if fmt == "ico" && (w > 256.0 || h > 256.0) {
                 ui.label(egui::RichText::new(tl!("ICO is limited to 256 × 256 pixels")).color(t.warning));
             }
+            preset_fields(app, ui, f, bw, bh);
         });
         ui.add_space(12.0);
         // Right: preview + estimated size.
@@ -496,14 +784,19 @@ pub fn body(app: &mut PhotocraftApp, ui: &mut egui::Ui, f: &mut Map<String, Valu
             let layer = f.get("__layer").and_then(Value::as_u64);
             let key = egui::Id::new(("export-preview", doc.id.0, app.session.active().map_or(0, |s| s.revision), layer));
             let sig = format!(
-                "{}{}{}{}{}{}{}",
+                "{}{}{}{}{}{}{}{}{}{}{}{}",
                 s_fmt(f),
                 n(f, "quality", 85.0),
                 lossless(f),
                 f.get("transparency").map(|v| v.to_string()).unwrap_or_default(),
                 n(f, "scale", 100.0),
+                n(f, "width", 0.0),
+                n(f, "height", 0.0),
                 s(f, "metadata"),
-                s(f, "tgaBits")
+                s(f, "tgaBits"),
+                s(f, "profile"),
+                f.get("embedProfile").and_then(Value::as_bool).unwrap_or(true),
+                s(f, "sizing")
             );
             let cached: Option<CachedPreview> = ui.data(|d| d.get_temp(key));
             let preview = match cached.filter(|cached| cached.signature == sig) {
@@ -614,7 +907,10 @@ pub fn quick_export_png(app: &mut PhotocraftApp) -> Result<Value, String> {
         let fmt = serde_json::to_value(prefs.quick_export_format).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_else(|| "png".into());
         let same = serde_json::to_value(prefs.quick_export_location).ok().is_some_and(|v| v == "sameFolder");
         let saved = app.session.active().is_some_and(|d| d.path.is_some());
-        if same && saved {
+        // Same Folder writes beside the document's file without asking, except when that would
+        // replace the file itself (a document opened from photo.png): then the save dialog asks,
+        // so replacing it is the user's choice (#6599).
+        if same && saved && !photocraft_engine::web_cmds::quick_export_target_is_own_file(&app.session) {
             return quick_export(app, json!({}));
         }
         let st = app.session.active().ok_or("no document")?;
@@ -900,5 +1196,121 @@ mod tests {
         }
         f.insert("format".into(), json!("png"));
         assert_eq!(settings(&f).tga_bits, None, "only TGA has bits per pixel");
+    }
+
+    #[test]
+    fn exact_pixels_lock_aspect_and_leave_the_source() {
+        let linked = resize_from_scale(400.0, 200.0, 50.0).unwrap();
+        assert_eq!((linked.width, linked.height, linked.scale), (200.0, 100.0, 50.0));
+        let from_width = resize_from_side(400.0, 200.0, 100.0, 200.0, true, true).unwrap();
+        assert_eq!((from_width.width, from_width.height), (100.0, 50.0));
+        let from_height = resize_from_side(400.0, 200.0, 100.0, 40.0, true, false).unwrap();
+        assert_eq!((from_height.width, from_height.height), (80.0, 40.0));
+        let free = resize_from_side(400.0, 200.0, 100.0, 80.0, false, true).unwrap();
+        assert_eq!((free.width, free.height), (100.0, 80.0));
+        assert!(resize_from_scale(400.0, 200.0, 0.0).is_err());
+        assert!(resize_from_side(400.0, 200.0, 0.0, 10.0, false, true).is_err());
+        assert!(resize_from_side(10.0, 10.0, 400_000.0, 10.0, false, true).is_err());
+
+        let doc = Document::with_background(
+            "x",
+            photocraft_doc::Size::new(400, 200),
+            photocraft_doc::ColorMode::Rgb,
+            photocraft_doc::SampleType::U8,
+            photocraft_doc::Color::WHITE,
+        );
+        let before = doc.clone();
+        let mut f = Map::new();
+        f.insert("format".into(), json!("png"));
+        f.insert("scale".into(), json!(100));
+        f.insert("sizing".into(), json!("pixels"));
+        f.insert("width".into(), json!(120));
+        f.insert("height".into(), json!(40));
+        let out = export_document(&doc, &f, None).unwrap();
+        assert_eq!((out.size.width, out.size.height), (120, 40), "explicit pixels win over the percent scale");
+        let proxy = export_document(&doc, &f, Some(20)).unwrap();
+        assert_eq!((proxy.size.width, proxy.size.height), (20, 7));
+        assert_eq!(doc, before, "export leaves the source document unchanged");
+    }
+
+    #[test]
+    fn profile_and_metadata_follow_the_existing_exporter() {
+        use photocraft_cms::Builtin;
+
+        let mut f = Map::new();
+        f.insert("format".into(), json!("jpg"));
+        assert!(settings(&f).embed_metadata, "a missing metadata choice keeps EXIF and resolution");
+        assert!(settings(&f).embed_icc);
+        f.insert("metadata".into(), json!("none"));
+        f.insert("embedProfile".into(), json!(false));
+        let none = settings(&f);
+        assert!(!none.xmp_all && !none.embed_metadata && !none.embed_icc);
+        f.insert("metadata".into(), json!("exif"));
+        let exif = settings(&f);
+        assert!(!exif.xmp_all && exif.embed_metadata);
+        f.insert("metadata".into(), json!("all"));
+        f.insert("embedProfile".into(), json!(true));
+        let all = settings(&f);
+        assert!(all.xmp_all && all.embed_metadata && all.embed_icc);
+
+        let mut doc = Document::with_background(
+            "x",
+            photocraft_doc::Size::new(8, 8),
+            photocraft_doc::ColorMode::Rgb,
+            photocraft_doc::SampleType::U8,
+            photocraft_doc::Color::WHITE,
+        );
+        doc.icc_profile = Some(Builtin::DisplayP3.profile().to_bytes());
+        doc.metadata.xmp = Some("<x:xmpmeta>secret</x:xmpmeta>".into());
+        let before = doc.clone();
+        f.insert("profile".into(), json!("srgb"));
+        f.insert("width".into(), json!(8));
+        f.insert("height".into(), json!(8));
+        f.insert("metadata".into(), json!("none"));
+        f.insert("embedProfile".into(), json!(false));
+        let converted = export_document(&doc, &f, None).unwrap();
+        let parsed = photocraft_cms::Profile::parse(converted.icc_profile.as_deref().unwrap()).unwrap();
+        assert!(parsed.same_colors(Builtin::Srgb.profile()), "Convert to sRGB replaces the document profile");
+        let stripped = photocraft_io::export(&converted, "out.jpg", &settings(&f).io_options()).unwrap().bytes;
+        assert!(!stripped.windows(b"ICC_PROFILE".len()).any(|w| w == b"ICC_PROFILE"));
+        assert!(!stripped.windows(b"secret".len()).any(|w| w == b"secret"));
+        f.insert("metadata".into(), json!("all"));
+        f.insert("embedProfile".into(), json!(true));
+        let kept = photocraft_io::export(&converted, "out.jpg", &settings(&f).io_options()).unwrap().bytes;
+        assert!(kept.windows(b"ICC_PROFILE".len()).any(|w| w == b"ICC_PROFILE"));
+        assert!(kept.windows(b"secret".len()).any(|w| w == b"secret"));
+        assert_eq!(doc, before);
+    }
+
+    #[test]
+    fn applying_a_preset_restores_its_size_mode() {
+        use photocraft_engine::export_preset_cmds::ExportPresetSettings;
+
+        let pixels = ExportPresetSettings {
+            format: "png".into(),
+            quality: 80,
+            lossless: false,
+            transparency: true,
+            scale: 100.0,
+            width: 64,
+            height: 32,
+            lock_aspect: false,
+            sizing: "pixels".into(),
+            metadata: "exif".into(),
+            profile: "document".into(),
+            embed_profile: false,
+            tga_bits: "auto".into(),
+        };
+        let mut f = Map::new();
+        apply_preset(&mut f, &pixels, 400.0, 200.0);
+        assert_eq!(f.get("width"), Some(&json!(64)));
+        assert_eq!(f.get("height"), Some(&json!(32)));
+        assert_eq!(f.get("sizing"), Some(&json!("pixels")));
+        assert_eq!(f.get("embedProfile"), Some(&json!(false)));
+        let scale = ExportPresetSettings { sizing: "scale".into(), scale: 25.0, ..pixels };
+        apply_preset(&mut f, &scale, 400.0, 200.0);
+        assert_eq!(f.get("width"), Some(&json!(100.0)));
+        assert_eq!(f.get("height"), Some(&json!(50.0)));
+        assert_eq!(f.get("sizing"), Some(&json!("scale")));
     }
 }

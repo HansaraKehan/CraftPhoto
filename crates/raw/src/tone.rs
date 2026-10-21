@@ -711,6 +711,19 @@ mod tests {
     }
 
     #[test]
+    fn retone_lifts_shadows_with_a_curve_from_black() {
+        // A curve whose first knot is black: its first segment must not divide by log₂ 0.
+        let (w, h) = (96, 64);
+        let curve = [[0.0, 0.0], [0.05, 0.12], [0.3, 0.6], [1.0, 1.0]];
+        let px: Vec<[f32; 4]> = (0..w * h).map(|i| if i % w < 48 { [0.12, 0.11, 0.1, 1.0] } else { [0.7, 0.63, 0.56, 1.0] }).collect();
+        let mut out = px.clone();
+        retone(&mut out, w, h, &curve, SHADOWS);
+        assert!(out.iter().flatten().all(|v| v.is_finite()));
+        assert!(out[30 * w + 10][0] > px[30 * w + 10][0] + 0.05, "{:?}", out[30 * w + 10]);
+        assert!((out[30 * w + 80][0] - px[30 * w + 80][0]).abs() < 0.03, "{:?}", out[30 * w + 80]);
+    }
+
+    #[test]
     fn retone_changes_nothing_at_zero_and_matches_the_develop_stage() {
         let (w, h) = (300, 120);
         let y = bands(w, h, 1.0);

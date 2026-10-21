@@ -448,6 +448,51 @@ pub fn clean_mask(mask: &[bool], w: usize, h: usize, frac: f32, hole_frac: f32) 
     out
 }
 
+/// Fills the holes of `mask` (4-connected background areas not touching the border) by what
+/// they look like: a hole up to `speck_frac` of the mask's area always fills; a larger one, up
+/// to `hole_frac`, only when its pixels fit the foreground model `fg` better than `bg` on
+/// average, so an enclosed patch of backdrop stays open.
+pub fn fill_holes_by_model(mask: &[bool], img: &RgbImage, fg: &Gmm, bg: &Gmm, speck_frac: f32, hole_frac: f32) -> Vec<bool> {
+    let (w, h) = (img.w, img.h);
+    let mut out = mask.to_vec();
+    let area = out.iter().filter(|v| **v).count();
+    let max_speck = (area as f32 * speck_frac) as usize;
+    let max_hole = (area as f32 * hole_frac) as usize;
+    let inv: Vec<bool> = out.iter().map(|v| !v).collect();
+    let (hl, hs) = components4(&inv, w, h);
+    let mut touches = vec![false; hs.len()];
+    for x in 0..w {
+        touches[hl[x] as usize] = true;
+        touches[hl[(h - 1) * w + x] as usize] = true;
+    }
+    for y in 0..h {
+        touches[hl[y * w] as usize] = true;
+        touches[hl[y * w + w - 1] as usize] = true;
+    }
+    // Summed data costs per hole; only holes small enough to be candidates are evaluated.
+    let mut cost = vec![(0.0f64, 0.0f64); hs.len()];
+    for (i, l) in hl.iter().enumerate() {
+        let l = *l as usize;
+        if l == 0 || touches[l] || hs[l] > max_hole || hs[l] <= max_speck {
+            continue;
+        }
+        if let Some(p) = img.px.get(i) {
+            cost[l].0 += f64::from(fg.neg_log(*p));
+            cost[l].1 += f64::from(bg.neg_log(*p));
+        }
+    }
+    for (o, l) in out.iter_mut().zip(&hl) {
+        let l = *l as usize;
+        if l == 0 || touches[l] || hs[l] > max_hole {
+            continue;
+        }
+        if hs[l] <= max_speck || cost[l].0 <= cost[l].1 {
+            *o = true;
+        }
+    }
+    out
+}
+
 fn components4(mask: &[bool], w: usize, h: usize) -> (Vec<u32>, Vec<usize>) {
     let mut lab = vec![0u32; w * h];
     let mut sizes = vec![0usize];

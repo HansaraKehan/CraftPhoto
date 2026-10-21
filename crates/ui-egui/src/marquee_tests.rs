@@ -147,6 +147,23 @@ fn shift_during_the_drag_draws_a_square_and_the_readout_follows() {
     assert!(h.query_by_label("W:").is_none() && h.query_by_label_contains(" px").is_none(), "the readout goes away with the drag");
 }
 
+/// #5472: a ⇧ square pressed between pixels read 101 × 102 and selected that, because each axis
+/// snapped to the pixel grid on its own. The readout and the selection are square, and the
+/// Elliptical Marquee's circle too.
+#[test]
+fn shift_square_pressed_between_pixels_has_equal_sides() {
+    for tool in [Tool::RectMarquee, Tool::EllipseMarquee] {
+        let mut h = harness(tool);
+        press_at(&mut h, 50.3, 50.7, Modifiers::NONE);
+        mods(&mut h, Modifiers::SHIFT);
+        move_to(&mut h, 150.8, 90.0);
+        assert!(readout(&h, 102, 102), "{tool:?}: the square covers every pixel it touched, on both axes");
+        release_at(&mut h, 150.8, 90.0, Modifiers::SHIFT);
+        mods(&mut h, Modifiers::NONE);
+        assert_eq!(selection(&h), Rect::new(50, 50, 152, 152), "{tool:?}");
+    }
+}
+
 /// #204: Preferences › Tools › Show Transformation Values off hides the readout, not the marquee.
 #[test]
 fn show_transformation_values_off_hides_the_readout() {
@@ -529,6 +546,38 @@ fn mouse_drag_inside_the_selection_moves_it() {
     assert_eq!(selection(&h), Rect::new(120, 90, 220, 170), "moved by (20, 10)");
 }
 
+/// #6290: with a fresh app's View › Snap To, a selection moved through the real canvas snaps its
+/// edges to a guide and the document bounds. Layers' targets were clipped to the selection, so
+/// it snapped back to its own starting edges and centre (shown as layer alignments) instead.
+#[test]
+fn a_moved_selection_snaps_to_guides_and_the_document_not_its_start() {
+    for (to, want) in [
+        // Right edge 3 px left of the guide at x = 200; 3 px down stays put (not back to y = 52).
+        ([145.0, 103.0], Rect::new(100, 55, 200, 105)),
+        // 5 and 7 px from the document's top-left corner (its centre was 3 px off its start).
+        ([53.0, 55.0], Rect::new(0, 0, 100, 50)),
+    ] {
+        let mut h = harness(Tool::RectMarquee);
+        h.state_mut().run("view.newGuide", json!({"orientation": "vertical", "position": 200})).unwrap();
+        h.state_mut().run("select.rect", json!({"x": 52, "y": 52, "width": 100, "height": 50})).unwrap();
+        h.run_steps(2);
+        drag_to(&mut h, [100.0, 100.0], to);
+        let up = screen(&h, to[0], to[1]);
+        button(&mut h, up, false, Modifiers::NONE);
+        h.run_steps(2);
+        assert_eq!(selection(&h), want, "dragged to {to:?}");
+    }
+}
+
+/// #5646: the Move tool keeps Photoshop's arrow pointer instead of the 4-way move cursor (the
+/// hover outline still marks the layer under the pointer).
+#[test]
+fn the_move_tool_keeps_the_arrow_pointer() {
+    let mut h = harness(Tool::Move);
+    move_to(&mut h, 200.0, 150.0);
+    assert_eq!(h.output().platform_output.cursor_icon, egui::CursorIcon::Default);
+}
+
 /// #1428: hovering inside the ants with a marquee shows the move cursor (a press there drags the
 /// outline); outside it is the marquee's own cursor.
 #[test]
@@ -545,12 +594,14 @@ fn hovering_inside_the_selection_shows_the_move_cursor() {
 }
 
 /// #1428: with a marquee, the arrow keys nudge the selection outline 1 px, ⇧ 10 px (Photoshop);
-/// each press is one undoable step.
+/// each press is one undoable step with Bundle Arrow-Key Nudges off, a run of them one step with
+/// it on (#2259, the default).
 #[test]
 fn arrow_keys_nudge_the_selection_outline() {
     use egui::Key;
-    for tool in [Tool::RectMarquee, Tool::EllipseMarquee] {
+    for (tool, bundle) in [(Tool::RectMarquee, false), (Tool::EllipseMarquee, false), (Tool::RectMarquee, true), (Tool::EllipseMarquee, true)] {
         let mut h = harness(tool);
+        h.state_mut().session.edit_prefs(|p| p.tools.bundle_nudges = bundle);
         press_at(&mut h, 100.0, 80.0, Modifiers::NONE);
         release_at(&mut h, 200.0, 160.0, Modifiers::NONE);
         let drawn = selection(&h);
@@ -569,9 +620,15 @@ fn arrow_keys_nudge_the_selection_outline() {
         h.key_press_modifiers(Modifiers::SHIFT, Key::ArrowLeft);
         h.run_steps(1);
         assert_eq!(selection(&h), shifted(-9, 9), "{tool:?} shift-left 10 px");
-        assert_eq!(h.state().session.active().unwrap().history.past_len(), steps + 4, "one step per press");
+        let nudges = h.state().session.active().unwrap().history.past_len() - steps;
         h.state_mut().session.undo();
-        assert_eq!(selection(&h), shifted(1, 9), "{tool:?} undo takes back one nudge");
+        if bundle {
+            assert_eq!(nudges, 1, "{tool:?} four quick presses, one step");
+            assert_eq!(selection(&h), drawn, "{tool:?} undo takes back the run");
+        } else {
+            assert_eq!(nudges, 4, "{tool:?} one step per press");
+            assert_eq!(selection(&h), shifted(1, 9), "{tool:?} undo takes back one nudge");
+        }
     }
 }
 

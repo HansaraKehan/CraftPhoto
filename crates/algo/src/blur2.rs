@@ -335,7 +335,7 @@ pub(crate) fn lens_blur(src: &Image, out: Rect, ctx: &Ctx, spec: &LensSpec) -> V
                 }
                 src.get(x, y, n - 1)
             }
-            DepthSource::LayerMask => spec.depth_map?.get(x, y, 0),
+            DepthSource::LayerMask | DepthSource::Channel => spec.depth_map?.get(x, y, 0),
         };
         Some(if spec.invert { 1.0 - d } else { d })
     };

@@ -50,6 +50,8 @@ pub fn fall_back(app: &mut PhotocraftApp, fault: &photocraft_gpu::Fault) {
     app.prefs_rt.gpu_style = None;
     app.perf.gpu = false;
     app.perf.gpu_fallback = Some(fault.to_string());
+    // The CPU canvas has no GPU memory budget: GPU Memory Full no longer applies.
+    app.perf.gpu_layer_fit = None;
     app.perf.gpu_info.canvas = "cpu".into();
     app.perf.gpu_info.lost = Some(fault.to_string());
     let title = if fault.is_lost() { LOST_MESSAGE } else { ERROR_MESSAGE };

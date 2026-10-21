@@ -347,3 +347,56 @@ fn clearing_warnings_of_an_unknown_comp_is_an_error() {
     assert_eq!(doc(&s).layer_comps, before);
     assert_eq!(s.execute("layerComp.updateWarnings", json!({})).unwrap()["count"], 1);
 }
+
+/// Apply Layer Comp is recorded by the comp's name, not its document-local id: played in another
+/// document it applies that document's comp of the name, or stops when there is none (#7181).
+#[test]
+fn a_recorded_apply_layer_comp_finds_the_comp_by_name() {
+    let (mut s, _, _) = session(8);
+    s.execute("layerComp.new", json!({"name": "Wanted"})).unwrap();
+    let wanted = doc(&s).layer_comps[0].id;
+    s.execute("actions.record", json!({"name": "ApplyWanted"})).unwrap();
+    s.execute("layerComp.apply", json!({"comp": wanted})).unwrap();
+    s.execute("actions.stop", json!({})).unwrap();
+    // `{}` and `null` apply the last applied comp; they are recorded by name too.
+    s.execute("actions.record", json!({"name": "ApplyLast"})).unwrap();
+    s.execute("layerComp.apply", json!({})).unwrap();
+    s.execute("actions.stop", json!({})).unwrap();
+    s.execute("actions.record", json!({"name": "ApplyNull"})).unwrap();
+    s.execute("layerComp.apply", Value::Null).unwrap();
+    s.execute("actions.stop", json!({})).unwrap();
+    for action in ["ApplyWanted", "ApplyLast", "ApplyNull"] {
+        let steps = s.execute("actions.get", json!({"action": action})).unwrap()["steps"].clone();
+        assert_eq!(steps, json!([["layerComp.apply", {"comp": "Wanted"}]]), "{action}");
+    }
+
+    // A second document whose comp with the recorded id is another one.
+    let (mut other, _, ob) = session(8);
+    other.actions = s.actions.clone();
+    let show = |s: &mut Session, visible: bool| {
+        s.edit("t", |d, _| {
+            d.layer_mut(ob).unwrap().visible = visible;
+            Ok(())
+        })
+        .unwrap();
+    };
+    show(&mut other, false);
+    other.execute("layerComp.new", json!({"name": "Different"})).unwrap();
+    show(&mut other, true);
+    other.execute("layerComp.new", json!({"name": "Wanted"})).unwrap();
+    assert_eq!(doc(&other).layer_comps[0].id, wanted, "the recorded id names `Different` here");
+    show(&mut other, false);
+    other.execute("actions.play", json!({"action": "ApplyWanted"})).unwrap();
+    let applied = doc(&other).last_applied_comp.and_then(|id| doc(&other).comp(id)).map(|c| c.name.clone());
+    assert_eq!(applied.as_deref(), Some("Wanted"));
+    assert!(doc(&other).layer(ob).unwrap().visible, "Wanted shows the layer");
+
+    // A document without a comp of that name stops the action instead of applying another one.
+    other.execute("layerComp.delete", json!({"comp": "Wanted"})).unwrap();
+    show(&mut other, false);
+    let before = (doc(&other).last_applied_comp, doc(&other).layer(ob).unwrap().visible);
+    let played = other.execute("actions.play", json!({"action": "ApplyWanted"})).unwrap();
+    assert_eq!(played["ran"], 0, "{played}");
+    assert!(played["failed"]["error"].as_str().unwrap().contains("no layer comp named \"Wanted\""), "{played}");
+    assert_eq!((doc(&other).last_applied_comp, doc(&other).layer(ob).unwrap().visible), before, "the document is unchanged");
+}

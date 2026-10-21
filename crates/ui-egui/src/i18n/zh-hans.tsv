@@ -561,6 +561,10 @@
 # Field Blur pins (#3373)
 	No pin selected	未选择图钉
 	Click the image to add a pin; drag a pin to move it, or its ring to change its blur. Delete removes the selected pin.	单击图像以添加图钉；拖动图钉可移动它，拖动其圆环可更改模糊程度。按 Delete 键删除所选图钉。
+	Drag the handles on the outline to resize and turn it, the square to round its corners, and the dots inside to set where the blur starts.	拖动轮廓上的手柄可调整大小并旋转，拖动方块可将角变圆，拖动内部的点可设置模糊开始的位置。
+	Drag the pin to move the band, or its ring to change its blur. Drag the solid lines to widen the sharp band, the dashed lines to set the transition, and the dots to turn it.	拖动图钉可移动条带，拖动其圆环可更改模糊程度。拖动实线可加宽清晰条带，拖动虚线可设置过渡，拖动圆点可旋转。
+	Drag the handles on the outline to resize and turn it; the ring sets the blur angle.	拖动轮廓上的手柄可调整大小并旋转；圆环设置模糊角度。
+	Blur Angle	模糊角度
 	Iris Blur…	光圈模糊…
 	Tilt-Shift…	移轴模糊…
 	Path Blur…	路径模糊…
@@ -768,6 +772,7 @@
 	Brush Settings	画笔设置
 	Brushes	画笔
 	Channels	通道
+	Channel	通道
 	Character	字符
 	Character Styles	字符样式
 	Clone Source	仿制源
@@ -988,7 +993,6 @@
 	Contiguous	连续
 	Contrast	对比度
 	Control:	控制：
-	Convert document's colors to the working space	将文档颜色转换到工作空间
 	Convert to sRGB	转换为 sRGB
 	Copies	份数
 	Copper	铜色
@@ -1044,6 +1048,7 @@
 	Delete Group	删除组
 	Delete Layer Mask	删除图层蒙版
 	Delete Layers	删除图层
+	Add Shortcut	添加快捷键
 	Delete Shortcut	删除快捷键
 	Delete Timeline	删除时间轴
 	Delete Tool Preset	删除工具预设
@@ -1241,6 +1246,7 @@
 	Levels	色阶
 	Lighten	变亮
 	Lightness	明度
+	Result	结果
 	Lights	亮部
 	Limits:	限制：
 	Linear Gradient	线性渐变
@@ -1579,7 +1585,6 @@
 	Use Default	使用默认值
 	Use Legacy	使用旧版
 	Use Measurement Scale	使用测量比例
-	Use the embedded profile (instead of the working space)	使用嵌入的配置文件（替代工作空间）
 	Uses the foreground and background colors.	使用前景色和背景色。
 	Variables bind a layer's visibility, text or pixels to a named data slot.	变量将图层的可见性、文字或像素绑定到具名数据项。
 	Vertical scale	垂直缩放
@@ -1906,6 +1911,8 @@
 	Camera Raw Defaults	Camera Raw 默认设置
 	Canvas border	画布边框
 	Show canvas dots	显示画布圆点
+	Clip thumbnails to layer bounds	将缩略图裁剪到图层边界
+	Clip Thumbnails to Layer Bounds	将缩略图裁剪到图层边界
 	Canvas color	画布颜色
 	Canvas custom color	画布自定颜色
 	Color picker	拾色器
@@ -2094,7 +2101,8 @@
 	Expand group  (⌥-click: all groups)	展开组  (⌥-单击：所有组)
 	Fade steps	渐隐步数
 	Hide the layer's effects  (⌥-click: all layers)	隐藏图层效果  (⌥-单击：所有图层)
-	Import Brushes… (.abr)	导入画笔… (.abr)
+	Import Brushes… (.abr or image)	导入画笔… (.abr 或图像)
+	Import Brush from Image…	从图像导入画笔…
 	Move Group Down	向下移动组
 	Move Group Up	向上移动组
 	Reset the brush to the defaults	将画笔重置为默认值
@@ -2213,6 +2221,11 @@ cameraRaw	Blending	混合
 	Apply the pen's tilt and rotation to the tip shape	将笔的倾斜和旋转应用于笔尖形状
 	Mixer Brush	混合器画笔
 	Wet	湿润
+	Current Brush Load	当前画笔载入
+	Load Brush	载入画笔
+	Clean Brush	清理画笔
+	Load the brush after each stroke	每次描边后载入画笔
+	Clean the brush after each stroke	每次描边后清理画笔
 	Mix	混合
 	Wetness Jitter	湿润度抖动
 	Mix Jitter	混合抖动
@@ -2261,7 +2274,6 @@ cameraRaw	Blending	混合
 	Cancelled opening {name}	已取消打开 {name}
 	The document “{name}” does not have an embedded {mode} profile.	文档“{name}”没有嵌入的 {mode} 配置文件。
 	The document “{name}” has an embedded color profile that does not match the current {mode} working space.	文档“{name}”嵌入的颜色配置文件与当前的 {mode} 工作空间不匹配。
-	Embedded: {embedded}	嵌入：{embedded}
 	Working: {working}	工作空间：{working}
 	Developing {name}	正在处理 {name}
 	Cancelled {label}	已取消 {label}
@@ -2449,7 +2461,6 @@ cameraRaw	Blending	混合
 	Redrawing	正在重绘
 	This redraw took {seconds} s on the CPU.	此次 CPU 重绘耗时 {seconds} 秒。
 	Edits that change the whole document, such as a layer's blend mode, opacity or visibility, redraw all of it.	更改整个文档的编辑（如图层的混合模式、不透明度或可见性）会重绘整个文档。
-	Its layers don't fit the GPU memory budget. Raising Memory usage in Preferences › Performance raises the budget, up to a quarter of this computer's memory.	图层超出 GPU 内存预算。在 首选项 › 性能 中提高内存使用量可增加预算，最多为本机内存的四分之一。
 	The GPU compositor wasn't used: {reason}	未使用 GPU 合成器：{reason}
 fontWeight	Thin	极细
 fontWeight	ExtraLight	特细
@@ -2515,6 +2526,8 @@ fontWeight	Italic	斜体
 	Color Picker (Layer Style Color)	拾色器（图层样式颜色）
 	Auto Hide Notifications	自动隐藏通知
 	Notification Duration (seconds)	通知持续时间（秒）
+	Bundle Arrow-Key Nudges	合并方向键微移
+	Nudge Bundle Pause (ms)	微移合并间隔（毫秒）
 	Appearance Mode	外观模式
 	Dark Theme	深色主题
 	Light Theme	浅色主题
@@ -2641,7 +2654,28 @@ cameraData	Lens	镜头
 	Snap to Origin	贴紧原点
 	Search settings…	搜索设置…
 	No matching settings	没有匹配的设置
+# Edit › Content-Aware Fill workspace
+	Sampling Brush Tool	取样画笔工具
+	Sampling Area Overlay	取样区域叠加
+	Show Sampling Area	显示取样区域
+	Indicates	指示
+	Sampling Area	取样区域
+	Excluded Area	排除区域
+	Sampling Area Options	取样区域选项
+	Rectangular	矩形
+	Fill Settings	填充设置
+	Rotation Adaptation	旋转适应
+	Very High	非常高
+	High	高
+	Low	低
+	Full	完全
+	Mirror	镜像
+	Output Settings	输出设置
+	Output To	输出到
+	Duplicate Layer	复制图层
+	Contract	收缩
 	Loading fonts…	正在加载字体…
+	Response curve	响应曲线
 	Tool	工具
 	Simulate Pressure	模拟压力
 	Stroke Path…	描边路径…
@@ -2714,11 +2748,13 @@ curves	Smooth	平滑
 	Light Red	浅红色
 	Medium Blue	中蓝色
 	Light Gray	浅灰色
+	Stop	停止
 	Object Finder	对象查找程序
 	No object found there — drag a rectangle around it	那里未找到对象 — 请在其周围拖动矩形
 	Remove after each stroke	每次描边后移除
 	Apply the removal ({key})	应用移除 ({key})
 	Strokes to remove: {n} (Enter applies, Esc cancels)	待移除的描边：{n}（Enter 应用，Esc 取消）
+	Show home recent files	在主屏幕上显示最近的文件
 	Clear Brush Controls	清除画笔控件
 	Reset All Locked Settings	复位所有锁定的设置
 	Copy Texture to Other Tools	将纹理复制到其他工具
@@ -2745,6 +2781,10 @@ curves	Smooth	平滑
 	Action playback stopped	动作播放已停止
 	Step {step} is waiting for its dialog	步骤 {step} 正在等待其对话框
 @plural	{n} action|{n} actions	{n} 个动作
+	Background (Default)	背景（默认）
+	Content-Aware Fill	内容识别填充
+# Batch / Image Processor
+	Include All Subfolders	包含所有子文件夹
 	Auto Add/Delete	自动添加/删除
 
 # Native Windows printing qualification
@@ -2754,3 +2794,91 @@ curves	Smooth	平滑
 	Sent to {printer}	已发送到 {printer}
 	set in Print Settings…	在打印设置中设置…
 	ICO is limited to 256 × 256 pixels	ICO 最大为 256 × 256 像素
+# Embedded Profile Mismatch: profile names beside the choices, Remember this choice
+	Use the embedded profile ({profile})	使用嵌入的配置文件（{profile}）
+	Convert to the working space ({profile})	转换到工作空间（{profile}）
+	Remember this choice for future images	以后打开的图像都使用此选择
+	Turn the prompt back on with Ask On Mismatch in Edit › Color Settings.	可在 编辑 › 颜色设置 中打开 Ask On Mismatch，重新显示此提示。
+	Button Mode	按钮模式
+	Button Mode On	按钮模式 开
+
+# Darken / Lighten Interface (⇧⌘F1 / ⇧⌘F2)
+	Darken Interface	界面变暗
+	Lighten Interface	界面变亮
+# Bevel & Emboss Technique.
+	Technique	方法
+	Chisel Hard	雕刻清晰
+	Chisel Soft	雕刻柔和
+	Open color-less EXR as ACEScg	将无色彩空间信息的 EXR 以 ACEScg 打开
+# Export As metadata and profile options
+	Color Profile	颜色配置文件
+	EXIF	EXIF
+
+# View › Guides › right-click a guide
+	Edit Selected Guides	编辑所选参考线
+	Clear Selected Guides	清除所选参考线
+	Pasting from other apps is unavailable	无法从其他应用粘贴
+	PhotoCraft can't reach the system clipboard in this session. On Wayland, a Flatpak sandbox hides the protocol that images from other apps are read through.	PhotoCraft 在此会话中无法访问系统剪贴板。在 Wayland 上，Flatpak 沙盒会隐藏读取其他应用图像所用的协议。
+	To paste from other apps, start PhotoCraft under XWayland: `{command}`	要从其他应用粘贴，请在 XWayland 下启动 PhotoCraft：`{command}`
+	Nothing to paste: PhotoCraft can't read the system clipboard here	没有可粘贴的内容：PhotoCraft 在此无法读取系统剪贴板
+	Delete this set	删除此组
+	New Set…	新建组…
+	PhotoCraft Defaults	PhotoCraft 默认值
+	Save a list of these shortcuts as a web page	将这些快捷键的列表存储为网页
+	Save the changes to this set	将更改存储到此组
+	Save these shortcuts as a .kys file	将这些快捷键存储为 .kys 文件
+	Save these shortcuts as a new set	将这些快捷键存储为新组
+	Set deleted.	已删除组。
+	Set saved.	已存储组。
+	Set:	组：
+	Summarize…	摘要…
+	There are too many sets: delete one first.	组太多：请先删除一个。
+	set name	组名称
+	{set} (modified)	{set}（已修改）
+	Random	随机
+	Show file name in title	标题中显示文件名
+	Accept and Go to Conflict	接受并转到冲突
+	Changes undone.	已撤消更改。
+	Choose a new shortcut for this command, or leave it without one.	为此命令选择新的快捷键，或保留为无快捷键。
+	Put this command's shortcuts back as they were	将此命令的快捷键恢复原样
+	Take the shortcut from the other command and select it	从另一个命令移除该快捷键并选中它
+	Undo Changes	撤消更改
+	{shortcut} is reserved by the system and can't be assigned.	{shortcut} 由系统保留，无法指定。
+	Low-Latency Drawing (vsync off, applies at next launch)	低延迟绘画（关闭垂直同步，下次启动时生效）
+# Free Transform: a new layer while the box is open (#5859)
+	Free Transform is still being applied; try again when it has finished.	自由变换仍在应用中；请在完成后重试。
+	The transform couldn't be applied.	无法应用变换。
+# Preferences › Performance › GPU Memory; the status bar and slow-redraw notice
+	Its layers need {needed} of GPU memory; the budget leaves them {budget}.	其图层需要 {needed} GPU 内存；预算只留给它们 {budget}。
+	Set GPU Memory in Preferences › Performance to what your graphics card can hold, at most 3/8 of its memory. Automatic follows Memory Usage, within a quarter of this computer's memory and 3/8 of the card's, and doesn't count the document against a card whose memory is known. The status bar shows GPU Memory Full while they don't fit.	在 首选项 › 性能 中将 GPU 内存设置为显卡能容纳的大小，最多为其显存的 3/8。自动跟随内存使用量，不超过本机内存的四分之一和显卡显存的 3/8，且在显存已知的显卡上不把文档计入。在图层放不下期间，状态栏显示“GPU 内存已满”。
+	GPU Memory Full	GPU 内存已满
+	The layers need {needed} of GPU memory and may hold {budget}, so edits that redraw the whole document do it on the CPU. Click to set GPU Memory.	图层需要 {needed} GPU 内存，但只能占用 {budget}，因此重绘整个文档的编辑会在 CPU 上进行。点击以设置 GPU 内存。
+	GPU memory budget: {budget}	GPU 内存预算：{budget}
+	This document's layers: {needed} of {budget} for layers	此文档的图层：图层可用 {budget} 中的 {needed}
+	This document's layers need {needed} but may hold {budget}: whole-document redraws use the CPU	此文档的图层需要 {needed}，但只能占用 {budget}：整个文档的重绘使用 CPU
+	GPU Memory (MB, 0 = Automatic)	GPU 内存（MB，0 = 自动）
+	Replace	替换
+	{name} was changed by another app after it was opened or saved here.	{name} 在此处打开或存储后已被其他应用更改。
+	Replace it with this document, or cancel and use File › Save As to keep both.	用此文档替换它，或取消并使用“文件 › 另存为”以保留两者。
+	Decrease Brush Size	减小画笔大小
+	Increase Brush Size	增大画笔大小
+	Decrease Brush Hardness	减小画笔硬度
+	Increase Brush Hardness	增大画笔硬度
+	Memory Usage	内存使用
+	Per-document RAM limit (MB)	每个文档的 RAM 上限 (MB)
+	Installed RAM: {ram} MB; this limit: {percent}%	已安装 RAM：{ram} MB；此上限：{percent}%
+	Limits each open document's pixels plus History. Oldest undo states are discarded when the limit is exceeded.	限制每个打开文档的像素加历史记录。超出上限时会丢弃最旧的撤销状态。
+	Applies immediately when saved. Memory is not reserved in advance.	保存后立即生效。不会预先占用内存。
+	With GPU Memory set to Automatic, this also limits the GPU layer budget. That budget is capped at one quarter of installed RAM and, when known, three eighths of the graphics card's memory, with a 512 MB minimum. Raising this limit beyond those caps does not increase the GPU budget.	当 GPU 内存为自动时，这也会限制 GPU 图层预算。上限为安装 RAM 的四分之一，以及（若已知）显存的八分之三，最低 512 MB。超过这些上限不会增加 GPU 预算。
+	Use	使用
+	In Front	前面
+	Behind	后面
+	Blend	混合
+
+# DDS Options (#1327)
+	DDS Options	DDS 选项
+	Compression	压缩
+	Generate Mipmaps	生成 Mipmap
+
+# Graphics Adapter preference (#1885)
+	GPU adapter	GPU 适配器

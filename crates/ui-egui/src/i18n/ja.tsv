@@ -556,6 +556,9 @@
 # Field Blur pins (#3373)
 	No pin selected	ピンが選択されていません
 	Click the image to add a pin; drag a pin to move it, or its ring to change its blur. Delete removes the selected pin.	画像をクリックしてピンを追加します。ピンをドラッグして移動し、リングをドラッグしてぼかしを変更します。Delete キーで選択したピンを削除します。
+	Drag the handles on the outline to resize and turn it, the square to round its corners, and the dots inside to set where the blur starts.	輪郭上のハンドルをドラッグしてサイズ変更と回転、四角形で角の丸み、内側の点でぼかしの開始位置を設定します。
+	Drag the pin to move the band, or its ring to change its blur. Drag the solid lines to widen the sharp band, the dashed lines to set the transition, and the dots to turn it.	ピンをドラッグして帯を移動し、リングでぼかしを変更します。実線で鮮明な帯の幅、破線で移行範囲、点で回転を調整します。
+	Drag the handles on the outline to resize and turn it; the ring sets the blur angle.	輪郭上のハンドルをドラッグしてサイズ変更と回転を行います。リングでぼかしの角度を設定します。
 	Iris Blur…	虹彩絞りぼかし…
 	Tilt-Shift…	チルトシフト…
 	Path Blur…	パスぼかし…
@@ -985,7 +988,6 @@
 	Contiguous	隣接
 	Contrast	コントラスト
 	Control:	コントロール:
-	Convert document's colors to the working space	ドキュメントの色を作業用スペースに変換
 	Convert to sRGB	sRGB に変換
 	Copies	部数
 	Copper	銅
@@ -1040,6 +1042,7 @@
 	Delete Group	グループを削除
 	Delete Layer Mask	レイヤーマスクを削除
 	Delete Layers	レイヤーを削除
+	Add Shortcut	ショートカットを追加
 	Delete Shortcut	ショートカットを削除
 	Delete Timeline	タイムラインを削除
 	Delete Tool Preset	ツールプリセットを削除
@@ -1565,7 +1568,6 @@
 	Use Default	既定を使用
 	Use Legacy	従来方式を使用
 	Use Measurement Scale	測定スケールを使用
-	Use the embedded profile (instead of the working space)	埋め込みプロファイルを使用 (作業用スペースの代わり)
 	Variables bind a layer's visibility, text or pixels to a named data slot.	変数は、レイヤーの表示状態・テキスト・ピクセルを、名前付きのデータ枠に結び付けます。
 	Vertical scale	垂直比率
 	Vibrance	自然な彩度
@@ -1893,6 +1895,8 @@
 	Camera Raw Defaults	Camera Raw の既定値
 	Canvas border	カンバスの境界
 	Show canvas dots	カンバスのドットを表示
+	Clip thumbnails to layer bounds	サムネールをレイヤーの境界でクリップ
+	Clip Thumbnails to Layer Bounds	サムネールをレイヤーの境界でクリップ
 	Canvas color	カンバスの色
 	Canvas custom color	カンバスのカスタム色
 	Color picker	カラーピッカー
@@ -2084,6 +2088,8 @@
 	Fade steps	フェードのステップ数
 	Hide the layer's effects  ({key}-click: all layers)	レイヤーの効果を隠す ({key}+クリック: すべてのレイヤー)
 	Import Brushes… (.abr)	ブラシを読み込み…(.abr)
+	Import Brushes… (.abr or image)	ブラシを読み込み…(.abr または画像)
+	Import Brush from Image…	画像からブラシを読み込み…
 	Move Group Down	グループを下へ移動
 	Move Group Up	グループを上へ移動
 	Reset the brush to the defaults	ブラシを既定に戻す
@@ -2147,6 +2153,11 @@
 	Mixer Brush Tool	混合ブラシツール
 	Color Replacement Tool	色の置き換えツール
 	Wet	ウェット
+	Current Brush Load	現在のブラシの絵の具
+	Load Brush	ブラシに補充
+	Clean Brush	ブラシを洗浄
+	Load the brush after each stroke	ストロークごとにブラシに補充
+	Clean the brush after each stroke	ストロークごとにブラシを洗浄
 	Mix	混合
 	Wetness Jitter	ウェットのジッター
 	Mix Jitter	混合のジッター
@@ -2194,7 +2205,6 @@
 	Cancelled opening {name}	{name} を開くのをキャンセルしました
 	The document “{name}” does not have an embedded {mode} profile.	ドキュメント「{name}」には埋め込み {mode} プロファイルがありません。
 	The document “{name}” has an embedded color profile that does not match the current {mode} working space.	ドキュメント「{name}」の埋め込みカラープロファイルは、現在の {mode} 作業用スペースと一致しません。
-	Embedded: {embedded}	埋め込み: {embedded}
 	Working: {working}	作業用スペース: {working}
 	Developing {name}	{name} を現像中
 	Cancelled {label}	{label} をキャンセルしました
@@ -2408,7 +2418,6 @@ cameraRaw	Color	カラー
 	Redrawing	再描画中
 	This redraw took {seconds} s on the CPU.	この再描画は CPU で {seconds} 秒かかりました。
 	Edits that change the whole document, such as a layer's blend mode, opacity or visibility, redraw all of it.	レイヤーの描画モード、不透明度、表示/非表示など、ドキュメント全体に関わる編集では全体が再描画されます。
-	Its layers don't fit the GPU memory budget. Raising Memory usage in Preferences › Performance raises the budget, up to a quarter of this computer's memory.	レイヤーが GPU メモリの予算に収まりません。環境設定 › パフォーマンスのメモリ使用量を増やすと、このコンピューターのメモリの4分の1まで予算が増えます。
 	The GPU compositor wasn't used: {reason}	GPU コンポジターは使用されませんでした: {reason}
 fontWeight	Thin	極細
 fontWeight	ExtraLight	特細
@@ -3517,6 +3526,8 @@ fontWeight	Italic	斜体
 	Color Picker (Layer Style Color)	カラーピッカー (レイヤースタイルの色)
 	Auto Hide Notifications	通知を自動的に隠す
 	Notification Duration (seconds)	通知の表示時間 (秒)
+	Bundle Arrow-Key Nudges	矢印キーの移動をまとめる
+	Nudge Bundle Pause (ms)	移動をまとめる間隔（ms）
 	Appearance Mode	外観モード
 	Dark Theme	ダークテーマ
 	Light Theme	ライトテーマ
@@ -3640,7 +3651,24 @@ cameraData	Lens	レンズ
 	Snap to Origin	原点にスナップ
 	Search settings…	設定を検索…
 	No matching settings	一致する設定はありません
+# Edit › Content-Aware Fill workspace
+	Sampling Brush Tool	サンプリングブラシツール
+	Sampling Area Overlay	サンプリング領域のオーバーレイ
+	Show Sampling Area	サンプリング領域を表示
+	Indicates	表示対象
+	Sampling Area	サンプリング領域
+	Excluded Area	除外された領域
+	Sampling Area Options	サンプリング領域オプション
+	Rectangular	長方形
+	Fill Settings	塗りつぶし設定
+	Rotation Adaptation	回転への適応
+	Very High	非常に高い
+	Full	フル
+	Mirror	ミラー
+	Output Settings	出力設定
+	Output To	出力先
 	Loading fonts…	フォントを読み込み中…
+	Response curve	応答カーブ
 	Simulate Pressure	筆圧をシミュレート
 	Stroke Path…	パスのストローク…
 	Background Eraser	背景消しゴム
@@ -3718,7 +3746,8 @@ curves	Smooth	スムーズ
 	No object found there — drag a rectangle around it	そこにオブジェクトが見つかりません — 周囲に矩形をドラッグしてください
 	Remove after each stroke	ストロークごとに削除
 	Apply the removal ({key})	削除を適用 ({key})
-	Strokes to remove: {n} (Enter applies, Esc cancels)	削除するストローク: {n} (Enter で適用、Esc で取り消し)
+	Strokes to remove: {n} (Enter applies, Esc cancels)	削除するストローク: {n}（Enter で適用、Esc で取り消し）
+	Show home recent files	ホーム画面に最近使ったファイルを表示
 
 # Actions panel: Load/Save Actions (.atn) and kept Photoshop steps
 	Load Actions…	アクションを読み込み…
@@ -3742,6 +3771,9 @@ curves	Smooth	スムーズ
 	Action playback stopped	アクションの再生を停止しました
 	Step {step} is waiting for its dialog	ステップ {step} はダイアログを待っています
 @plural	{n} action|{n} actions	アクション {n} 個
+	Background (Default)	背景（既定）
+# Batch / Image Processor
+	Include All Subfolders	すべてのサブフォルダーを含める
 
 # Liquify tool names (shown via tl!(tool.label()) in the UI, so they are not found by the static scan)
 	Forward Warp	前方ワープ
@@ -3821,3 +3853,84 @@ curves	Smooth	スムーズ
 	Reset All Locked Settings	ロックされた設定をすべて初期化
 	Copy Texture to Other Tools	テクスチャを他のツールにコピー
 	ICO is limited to 256 × 256 pixels	ICO は 256 × 256 ピクセルまでです
+# Embedded Profile Mismatch: profile names beside the choices, Remember this choice
+	Use the embedded profile ({profile})	埋め込みプロファイルを使用 ({profile})
+	Convert to the working space ({profile})	作業用スペースに変換 ({profile})
+	Remember this choice for future images	今後の画像でもこの選択を使用
+	Turn the prompt back on with Ask On Mismatch in Edit › Color Settings.	確認を再び表示するには、編集 › カラー設定 の Ask On Mismatch をオンにします。
+	Button Mode	ボタンモード
+	Button Mode On	ボタンモード オン
+# Darken / Lighten Interface (⇧⌘F1 / ⇧⌘F2)
+	Darken Interface	インターフェイスを暗くする
+	Lighten Interface	インターフェイスを明るくする
+# Bevel & Emboss Technique.
+	Technique	テクニック
+	Chisel Hard	チゼルハード
+	Chisel Soft	チゼルソフト
+	Open color-less EXR as ACEScg	色空間のないEXRをACEScgとして開く
+# View › Guides › right-click a guide
+	Edit Selected Guides	選択したガイドを編集
+	Clear Selected Guides	選択したガイドを消去
+	Pasting from other apps is unavailable	他のアプリからの貼り付けは利用できません
+	PhotoCraft can't reach the system clipboard in this session. On Wayland, a Flatpak sandbox hides the protocol that images from other apps are read through.	このセッションでは PhotoCraft がシステムのクリップボードにアクセスできません。Wayland では、Flatpak のサンドボックスが他のアプリの画像を読み取るためのプロトコルを隠します。
+	To paste from other apps, start PhotoCraft under XWayland: `{command}`	他のアプリから貼り付けるには、XWayland 上で PhotoCraft を起動してください: `{command}`
+	Nothing to paste: PhotoCraft can't read the system clipboard here	貼り付けるものがありません: ここでは PhotoCraft がシステムのクリップボードを読み取れません
+	Delete this set	このセットを削除
+	New Set…	新規セット…
+	PhotoCraft Defaults	PhotoCraft 初期設定
+	Save a list of these shortcuts as a web page	これらのショートカットの一覧を Web ページとして保存
+	Save the changes to this set	このセットへの変更を保存
+	Save these shortcuts as a .kys file	これらのショートカットを .kys ファイルとして保存
+	Save these shortcuts as a new set	これらのショートカットを新規セットとして保存
+	Set deleted.	セットを削除しました。
+	Set saved.	セットを保存しました。
+	Set:	セット：
+	Summarize…	概要…
+	There are too many sets: delete one first.	セットが多すぎます。先に 1 つ削除してください。
+	set name	セット名
+	{set} (modified)	{set}（変更あり）
+	Show file name in title	タイトルにファイル名を表示
+	Accept and Go to Conflict	適用して競合へ移動
+	Changes undone.	変更を取り消しました。
+	Choose a new shortcut for this command, or leave it without one.	このコマンドに新しいショートカットを選択するか、なしのままにしてください。
+	Put this command's shortcuts back as they were	このコマンドのショートカットを元に戻す
+	Take the shortcut from the other command and select it	もう一方のコマンドからショートカットを外して選択
+	Undo Changes	変更を取り消し
+	{shortcut} is reserved by the system and can't be assigned.	{shortcut} はシステムで予約されているため割り当てられません。
+	Low-Latency Drawing (vsync off, applies at next launch)	低遅延描画（垂直同期オフ、次回起動時に適用）
+# Free Transform: a new layer while the box is open (#5859)
+	Free Transform is still being applied; try again when it has finished.	自由変形を適用中です。完了してからもう一度お試しください。
+	The transform couldn't be applied.	変形を適用できませんでした。
+# Preferences › Performance › GPU Memory; the status bar and slow-redraw notice
+	Its layers need {needed} of GPU memory; the budget leaves them {budget}.	レイヤーには {needed} の GPU メモリが必要ですが、予算で使えるのは {budget} です。
+	Set GPU Memory in Preferences › Performance to what your graphics card can hold, at most 3/8 of its memory. Automatic follows Memory Usage, within a quarter of this computer's memory and 3/8 of the card's, and doesn't count the document against a card whose memory is known. The status bar shows GPU Memory Full while they don't fit.	環境設定 › パフォーマンスの GPU メモリを、グラフィックカードが保持できる量（最大でメモリの 3/8）に設定してください。自動はメモリ使用量に従い、このコンピューターのメモリの4分の1とカードの 3/8 の範囲内で、メモリ量がわかるカードではドキュメント分を差し引きません。収まらない間、ステータスバーに「GPU メモリ不足」と表示されます。
+	GPU Memory Full	GPU メモリ不足
+	The layers need {needed} of GPU memory and may hold {budget}, so edits that redraw the whole document do it on the CPU. Click to set GPU Memory.	レイヤーには {needed} の GPU メモリが必要ですが、使えるのは {budget} のため、ドキュメント全体を再描画する編集は CPU で行われます。クリックして GPU メモリを設定します。
+	GPU memory budget: {budget}	GPU メモリ予算: {budget}
+	This document's layers: {needed} of {budget} for layers	このドキュメントのレイヤー: レイヤー用 {budget} のうち {needed}
+	This document's layers need {needed} but may hold {budget}: whole-document redraws use the CPU	このドキュメントのレイヤーには {needed} が必要ですが、使えるのは {budget} です: ドキュメント全体の再描画は CPU で行われます
+	GPU Memory (MB, 0 = Automatic)	GPU メモリ（MB、0 = 自動）
+	Replace	置き換え
+	{name} was changed by another app after it was opened or saved here.	{name} は、ここで開くか保存した後に別のアプリで変更されました。
+	Replace it with this document, or cancel and use File › Save As to keep both.	この書類で置き換えるか、キャンセルしてファイル › 名前を付けて保存で両方を残してください。
+	Decrease Brush Size	ブラシサイズを小さく
+	Increase Brush Size	ブラシサイズを大きく
+	Decrease Brush Hardness	ブラシの硬さを下げる
+	Increase Brush Hardness	ブラシの硬さを上げる
+	Memory Usage	メモリ使用量
+	Per-document RAM limit (MB)	ドキュメントあたりの RAM 上限 (MB)
+	Installed RAM: {ram} MB; this limit: {percent}%	搭載 RAM: {ram} MB、この上限: {percent}%
+	Limits each open document's pixels plus History. Oldest undo states are discarded when the limit is exceeded.	開いている各ドキュメントのピクセルと履歴を制限します。上限を超えると最も古い取り消し状態が破棄されます。
+	Applies immediately when saved. Memory is not reserved in advance.	保存するとすぐに適用されます。メモリは事前に予約されません。
+	With GPU Memory set to Automatic, this also limits the GPU layer budget. That budget is capped at one quarter of installed RAM and, when known, three eighths of the graphics card's memory, with a 512 MB minimum. Raising this limit beyond those caps does not increase the GPU budget.	GPU メモリが自動のとき、GPU レイヤー予算も制限します。上限は搭載 RAM の 1/4、判明していればグラフィックメモリの 3/8、最低 512 MB です。これ以上に上げても GPU 予算は増えません。
+	Use	使用
+	In Front	前面
+	Behind	背面
+
+# DDS Options (#1327)
+	DDS Options	DDS オプション
+	Compression	圧縮
+	Generate Mipmaps	ミップマップを生成
+
+# Graphics Adapter preference (#1885)
+	GPU adapter	GPU アダプター

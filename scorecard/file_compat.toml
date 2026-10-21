@@ -71,9 +71,9 @@ note = "io svg.rs: paths, groups, text outlines as shape layers (gradients appro
 [[item]]
 id = "FILE-215-10"
 target = "Multi-page PDF save, PDF presentation, layer comps to PDF, vector/text output, PDF import"
-status = "missing"
+status = "partial"
 issue = 215
-note = "Only print_cmds.rs:133 print_pdf (raster print page)"
+note = "io pdf.rs: Save As / Save a Copy / CLI write one flattened RGB/Gray/CMYK page with ICC (#3401); print PDFs in print_cmds. Multi-page save, presentation, comps, vector/text output and PDF import (#2541) remain"
 
 [[item]]
 id = "FILE-215-11"

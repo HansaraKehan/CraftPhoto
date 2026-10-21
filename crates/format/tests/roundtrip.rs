@@ -5,7 +5,7 @@ use common::*;
 use photocraft_color::{ColorMode, SampleType};
 use photocraft_doc::text::{CharStyle, ParagraphStyle, TextRun};
 use photocraft_doc::text_styles::{CharacterStyleDef, ParagraphStyleDef};
-use photocraft_doc::{Document, Layer, LayerContent, LayerId, Slice, TextLayer};
+use photocraft_doc::{Document, Layer, LayerContent, LayerId, Slice, TextLayer, VarKind, VariableDef};
 use photocraft_format::*;
 use photocraft_raster::Rgba8Image;
 
@@ -211,6 +211,29 @@ fn exhausted_document_ids_and_maximal_text_runs_roundtrip() {
     assert_eq!(text.char_runs()[1].len, 1);
     assert_eq!(text.char_runs()[1].style.size_pt, 24.0);
     assert_eq!(text.paragraph_runs().iter().map(|r| r.len).sum::<usize>(), text.text.len());
+}
+
+#[test]
+fn text_run_baseline_roundtrips() {
+    use photocraft_doc::text::FontBaseline;
+    let mut doc = Document::new("scripts", photocraft_doc::Size::new(2, 1), ColorMode::Rgb, SampleType::U8);
+    doc.layers.push(Layer::new(
+        "Text",
+        LayerContent::Text(TextLayer {
+            text: "H2O2".into(),
+            runs: vec![
+                TextRun { len: 1, style: CharStyle::default() },
+                TextRun { len: 1, style: CharStyle { baseline: FontBaseline::Subscript, ..Default::default() } },
+                TextRun { len: 1, style: CharStyle::default() },
+                TextRun { len: 1, style: CharStyle { baseline: FontBaseline::Superscript, ..Default::default() } },
+            ],
+            ..Default::default()
+        }),
+    ));
+    let loaded = load_from_bytes(&save_to_bytes(&doc, &SaveOptions::default()).unwrap()).unwrap();
+    let LayerContent::Text(text) = &loaded.layers.last().unwrap().content else { panic!("text layer must roundtrip") };
+    let baselines: Vec<FontBaseline> = text.char_runs().iter().map(|r| r.style.baseline).collect();
+    assert_eq!(baselines, [FontBaseline::Normal, FontBaseline::Subscript, FontBaseline::Normal, FontBaseline::Superscript]);
 }
 
 #[test]
@@ -728,4 +751,26 @@ fn a_non_finite_float_is_refused_at_save_rather_than_breaking_every_later_load()
     doc.insert_above(None, Layer::new("adj", LayerContent::Adjustment(Adjustment::Exposure { exposure: 0.5, offset: 0.0, gamma: 1.0 })));
     let back = load_from_bytes(&save_to_bytes(&doc, &SaveOptions::default()).unwrap()).unwrap();
     assert_eq!(back, doc);
+}
+
+#[test]
+fn variables_follow_layer_id_remapping() {
+    let mut doc = rich_doc(ColorMode::Rgb, SampleType::U8);
+    let id_of = |d: &Document, name: &str| d.walk().into_iter().find(|(_, _, l)| l.name == name).unwrap().2.id;
+    doc.variables.defs = vec![
+        VariableDef { name: "head".into(), layer: id_of(&doc, "Paint"), kind: VarKind::TextReplacement },
+        VariableDef { name: "badge".into(), layer: id_of(&doc, "Inner"), kind: VarKind::Visibility },
+        VariableDef { name: "gone".into(), layer: LayerId(u64::MAX), kind: VarKind::Visibility },
+    ];
+    let bytes = save_to_bytes(&doc, &SaveOptions::default()).unwrap();
+    // Preserved ids keep every definition exactly as saved, dangling ones included.
+    assert_eq!(load_from_bytes(&bytes).unwrap(), doc);
+    // Remapped ids carry the definitions to the copied layers; a dangling target stays
+    // dangling and must not collide with a live layer (#4969).
+    let back = load_from_bytes_with(&bytes, &LoadOptions { preserve_ids: false, ..Default::default() }).unwrap();
+    let defs = &back.variables.defs;
+    assert_eq!(defs.iter().find(|d| d.name == "head").unwrap().layer, id_of(&back, "Paint"));
+    assert_eq!(defs.iter().find(|d| d.name == "badge").unwrap().layer, id_of(&back, "Inner"));
+    let gone = defs.iter().find(|d| d.name == "gone").unwrap().layer;
+    assert!(back.walk().into_iter().all(|(_, _, l)| l.id != gone), "dangling target must not address a live layer");
 }

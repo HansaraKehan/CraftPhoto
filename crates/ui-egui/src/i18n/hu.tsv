@@ -563,6 +563,9 @@
 	Field Blur…	Mezőelmosás…
 	No pin selected	Nincs kijelölt tű
 	Click the image to add a pin; drag a pin to move it, or its ring to change its blur. Delete removes the selected pin.	Kattints a képre tű hozzáadásához; húzd a tűt az áthelyezéséhez, vagy a gyűrűjét az elmosás módosításához. A Delete törli a kijelölt tűt.
+	Drag the handles on the outline to resize and turn it, the square to round its corners, and the dots inside to set where the blur starts.	Húzd a körvonal fogantyúit az átméretezéshez és az elforgatáshoz, a négyzetet a sarkok lekerekítéséhez, a belső pontokat pedig annak beállításához, hol kezdődjön az elmosás.
+	Drag the pin to move the band, or its ring to change its blur. Drag the solid lines to widen the sharp band, the dashed lines to set the transition, and the dots to turn it.	Húzd a tűt a sáv áthelyezéséhez, vagy a gyűrűjét az elmosás módosításához. Húzd a folytonos vonalakat az éles sáv szélesítéséhez, a szaggatott vonalakat az átmenet beállításához, a pontokat pedig a sáv elforgatásához.
+	Drag the handles on the outline to resize and turn it; the ring sets the blur angle.	Húzd a körvonal fogantyúit az átméretezéshez és az elforgatáshoz; a gyűrű az elmosás szögét állítja be.
 	Fill Path…	Útvonal kitöltése…
 	Fill Screen	Képernyő kitöltése
 	Filter	Szűrő
@@ -606,6 +609,7 @@
 	HSB/HSL	HSB/HSL
 	Huge	Óriási
 	Image Processor	Képfeldolgozó
+	Include All Subfolders	Az összes almappa belefoglalása
 	Indexed Color…	Indexelt szín…
 	Info	Információ
 	Install Plug-in	Bővítmény telepítése
@@ -1190,7 +1194,7 @@
 	Capture Brush Size in Preset	Ecsetméret rögzítése az előbeállításban
 	Include Tool Settings	Eszközbeállítások belefoglalása
 	Include Color	Szín belefoglalása
-	Enter a name for the brush preset	Adjon nevet az ecset-előbeállításnak
+	Enter a name for the brush preset	Adj nevet az ecset-előbeállításnak
 	A brush preset with this name already exists	Már van ilyen nevű ecset-előbeállítás
 	New Crop Preset…	Új körbevágási előbeállítás…
 	New Tool Preset	Új eszköz-előbeállítás
@@ -1403,6 +1407,11 @@
 	Warp:	Hajlítás:
 	Weight	Vastagság
 	Wet	Nedvesség
+	Current Brush Load	Az ecset jelenlegi töltete
+	Load Brush	Ecset feltöltése
+	Clean Brush	Ecset tisztítása
+	Load the brush after each stroke	Az ecset feltöltése minden ecsetvonás után
+	Clean the brush after each stroke	Az ecset tisztítása minden ecsetvonás után
 	Wet Edges	Nedves szélek
 	Wetness Jitter	Nedvesség ingadozása
 	Width	Szélesség
@@ -2486,9 +2495,8 @@ navigator	Zoom	Nagyítás mértéke
 	Camera Raw Filter ({layer})	Camera Raw szűrő ({layer})
 	Camera Raw isn't open	A Camera Raw nincs megnyitva
 	Cancelled opening {name}	Megnyitás megszakítva: {name}
-	The document “{name}” does not have an embedded {mode} profile.	A(z) „{name}” dokumentumnak nincs beágyazott {mode}-profilja.
-	The document “{name}” has an embedded color profile that does not match the current {mode} working space.	A(z) „{name}” dokumentum beágyazott színprofilja nem egyezik az aktuális {mode}-munkaszíntérrel.
-	Embedded: {embedded}	Beágyazott: {embedded}
+	The document “{name}” does not have an embedded {mode} profile.	Nincs beágyazott profil ({mode}) ebben a dokumentumban: „{name}”
+	The document “{name}” has an embedded color profile that does not match the current {mode} working space.	A dokumentum beágyazott színprofilja nem egyezik az aktuális munkaszíntérrel ({mode}): „{name}”
 	Working: {working}	Munkaszíntér: {working}
 	Cancelled {label}	Megszakítva: {label}
 	Clarity	Tisztaság
@@ -2702,7 +2710,6 @@ cameraRaw	Yellow	Sárga
 	Contents:	Tartalom:
 	Contributors	Közreműködők
 	Contributors: {contributors} · Commits: {commits}	Közreműködők: {contributors} · Commitok: {commits}
-	Convert document's colors to the working space	A dokumentum színeinek átalakítása a munkaszíntérbe
 	Convert to sRGB	Átalakítás sRGB-re
 	Cool	Hideg
 	Copies	Példányszám
@@ -2731,6 +2738,7 @@ cameraRaw	Yellow	Sárga
 	Defaults	Alapértékek
 	Delete	Törlés
 	Delete Shortcut	Billentyűparancs törlése
+	Add Shortcut	Billentyűparancs hozzáadása
 	Description	Leírás
 	Diffusion	Diffúzió
 	DirectX 12	DirectX 12
@@ -2855,6 +2863,8 @@ cameraRaw	Yellow	Sárga
 	No saved presets yet.	Még nincs mentett előbeállítás.
 	Not a web colour: click for the nearest web colour	Nem webes szín: kattints a legközelebbi webes színért
 	Notification Duration (seconds)	Értesítés időtartama (másodperc)
+	Bundle Arrow-Key Nudges	Nyílbillentyűs mozgatások összevonása
+	Nudge Bundle Pause (ms)	Összevonási szünet (ms)
 	Number	Szám
 	OK	OK
 	Only Web Colors	Csak webes színek
@@ -3001,7 +3011,6 @@ cameraRaw	Yellow	Sárga
 	URLs	URL-ek
 	Use Default	Alapértelmezés használata
 	Use shift key for tool switch	Eszközváltás a Shift billentyűvel
-	Use the embedded profile (instead of the working space)	A beágyazott profil használata (a munkaszíntér helyett)
 	Username	Felhasználónév
 	Version {version}	Verzió: {version}
 	Vulkan	Vulkan
@@ -3126,6 +3135,7 @@ cameraRaw	Yellow	Sárga
 	Concise	Tömör
 	Constrain proportions	Arányok megtartása
 	Constraints	Megkötések
+	Background (Default)	Háttér (alapértelmezett)
 	Content-Aware Fill	Tartalomérzékeny kitöltés
 	Content-Aware Move Tool	Tartalomérzékeny mozgatás
 	Contract	Szűkítés
@@ -3307,7 +3317,6 @@ cameraRaw	Yellow	Sárga
 	Interpret Footage	Videoanyag értelmezése
 	Interval	Intervallum
 	Invalid {mode} profile	Érvénytelen profil ({mode})
-	Its layers don't fit the GPU memory budget. Raising Memory usage in Preferences › Performance raises the budget, up to a quarter of this computer's memory.	A dokumentum rétegei nem férnek el a GPU memóriakeretében. Ha a Beállítások › Teljesítmény alatt növeled a memóriahasználatot, a keret is nő, legfeljebb a számítógép memóriájának negyedéig.
 	Join us on Discord	Csatlakozz hozzánk a Discordon
 	Keep Using CPU	Marad a CPU
 	Kernel	Szűrőmag
@@ -3536,6 +3545,8 @@ cameraRaw	Yellow	Sárga
 	shortcut	billentyűparancs
 	Shortcut	Billentyűparancs
 	Show canvas dots	Vászonpontok megjelenítése
+	Clip thumbnails to layer bounds	Bélyegképek levágása a réteg határaira
+	Clip Thumbnails to Layer Bounds	Bélyegképek levágása a réteg határaira
 	Show channels in color	Csatornák megjelenítése színesen
 	Show crosshair in brush tip	Szálkereszt az ecsethegyben
 	Show extension panels	Bővítménypanelek megjelenítése
@@ -4011,7 +4022,25 @@ cameraRaw	Yellow	Sárga
 	The layer or its mask changed. Drag the mask onto the Trash again.	A réteg vagy a maszkja megváltozott. Húzd újra a maszkot a Kukába.
 	Transform On Drop	Átalakítás elengedéskor
 	Vanishing Point is not active	Az Enyészpont nem aktív
+# Edit › Content-Aware Fill workspace
+	Excluded Area	Kizárt terület
+	Fill Settings	Kitöltési beállítások
+	Full	Teljes
+	Indicates	Jelzi
+	Mirror	Tükrözés
+	Output Settings	Kimeneti beállítások
+	Output To	Kimenet célja
+	Rectangular	Téglalap
+	Rotation Adaptation	Elforgatás-adaptáció
+	Sampling Area	Mintavételi terület
+	Sampling Area Options	Mintavételi terület beállításai
+	Sampling Area Overlay	Mintavételi terület átfedése
+	Sampling Brush Tool	Mintavételi ecset
+	Show Sampling Area	Mintavételi terület megjelenítése
+	Very High	Nagyon magas
 	Vanishing Point: click four corners to create a plane	Enyészpont: sík létrehozásához kattints a négy sarokra
+	Response curve	Válaszgörbe
+	Show home recent files	Legutóbbi fájlok megjelenítése a kezdőképernyőn
 	Clear Brush Controls	Ecsetvezérlők törlése
 	Reset All Locked Settings	Összes zárolt beállítás visszaállítása
 	Copy Texture to Other Tools	Textúra másolása más eszközökre
@@ -4042,7 +4071,7 @@ cameraRaw	Yellow	Sárga
 	Drag to pan · Scroll to zoom · Double-click to fit	Húzás: mozgatás · Görgetés: nagyítás · Dupla kattintás: igazítás
 	Gradient Preset Options	Színátmenet-előbeállítás beállításai
 	Import .GRD	.GRD importálása
-	Choose a gradient file (.grd).	Válasszon színátmenetfájlt (.grd).
+	Choose a gradient file (.grd).	Válassz színátmenetfájlt (.grd).
 	Save Settings…	Beállítások mentése…
 	Load Settings…	Beállítások betöltése…
 	Save these settings as a Camera Raw .xmp file	A beállítások mentése Camera Raw .xmp-fájlként
@@ -4065,3 +4094,84 @@ cameraRaw	Yellow	Sárga
 	Ink Characteristics	Festék jellemzői
 	Solidity:	Fedőképesség:
 	Redrawing	Újrarajzolás
+# Embedded Profile Mismatch: profile names beside the choices, Remember this choice
+	Use the embedded profile ({profile})	A beágyazott profil használata ({profile})
+	Convert to the working space ({profile})	Átalakítás a munkaszíntérbe ({profile})
+	Remember this choice for future images	A választás megjegyzése a későbbi képekhez
+	Turn the prompt back on with Ask On Mismatch in Edit › Color Settings.	A kérdést a Szerkesztés › Színbeállítások „Profileltérés: rákérdezés megnyitáskor” beállításával kapcsolhatod vissza.
+	Button Mode	Gomb mód
+	Button Mode On	Gomb mód be
+
+# Darken / Lighten Interface (⇧⌘F1 / ⇧⌘F2)
+	Darken Interface	Felület sötétítése
+	Lighten Interface	Felület világosítása
+# Bevel & Emboss Technique.
+	Technique	Technika
+	Chisel Hard	Kemény vésés
+	Chisel Soft	Lágy vésés
+	Open color-less EXR as ACEScg	Színinformáció nélküli EXR megnyitása ACEScg-ként
+
+# View › Guides › right-click a guide
+	Edit Selected Guides	Kijelölt segédvonalak szerkesztése
+	Clear Selected Guides	Kijelölt segédvonalak törlése
+	Pasting from other apps is unavailable	A beillesztés más alkalmazásokból nem érhető el
+	PhotoCraft can't reach the system clipboard in this session. On Wayland, a Flatpak sandbox hides the protocol that images from other apps are read through.	A PhotoCraft ebben a munkamenetben nem fér hozzá a rendszer vágólapjához. Waylanden a Flatpak homokozó elrejti azt a protokollt, amelyen keresztül más alkalmazások képei olvashatók.
+	To paste from other apps, start PhotoCraft under XWayland: `{command}`	Ha más alkalmazásokból szeretne beilleszteni, indítsa a PhotoCraftot XWayland alatt: `{command}`
+	Nothing to paste: PhotoCraft can't read the system clipboard here	Nincs mit beilleszteni: a PhotoCraft itt nem tudja olvasni a rendszer vágólapját
+	Delete this set	Készlet törlése
+	New Set…	Új készlet…
+	PhotoCraft Defaults	PhotoCraft alapértelmezések
+	Save a list of these shortcuts as a web page	A billentyűparancsok listájának mentése weboldalként
+	Save the changes to this set	A készlet változásainak mentése
+	Save these shortcuts as a .kys file	A billentyűparancsok mentése .kys fájlként
+	Save these shortcuts as a new set	A billentyűparancsok mentése új készletként
+	Set deleted.	Készlet törölve.
+	Set saved.	Készlet mentve.
+	Set:	Készlet:
+	Summarize…	Összegzés…
+	There are too many sets: delete one first.	Túl sok készlet van: előbb töröljön egyet.
+	set name	készlet neve
+	{set} (modified)	{set} (módosítva)
+	Show file name in title	Fájlnév megjelenítése a címben
+	Accept and Go to Conflict	Elfogadás és ugrás az ütközéshez
+	Changes undone.	Változások visszavonva.
+	Choose a new shortcut for this command, or leave it without one.	Válasszon új billentyűparancsot ehhez a parancshoz, vagy hagyja nélküle.
+	Put this command's shortcuts back as they were	A parancs billentyűparancsainak visszaállítása
+	Take the shortcut from the other command and select it	A billentyűparancs elvétele a másik parancstól, és annak kijelölése
+	Undo Changes	Változások visszavonása
+	{shortcut} is reserved by the system and can't be assigned.	A(z) {shortcut} a rendszer számára fenntartott, nem rendelhető hozzá.
+	Low-Latency Drawing (vsync off, applies at next launch)	Kis késleltetésű rajzolás (vsync nélkül, a következő indításkor lép életbe)
+# Free Transform: a new layer while the box is open (#5859)
+	Free Transform is still being applied; try again when it has finished.	A szabad alakítás alkalmazása még folyamatban van; próbáld újra, ha befejeződött.
+	The transform couldn't be applied.	Az átalakítás nem alkalmazható.
+# Preferences › Performance › GPU Memory; the status bar and slow-redraw notice
+	Its layers need {needed} of GPU memory; the budget leaves them {budget}.	A rétegeknek {needed} GPU-memória kell; a keret {budget} hagy nekik.
+	Set GPU Memory in Preferences › Performance to what your graphics card can hold, at most 3/8 of its memory. Automatic follows Memory Usage, within a quarter of this computer's memory and 3/8 of the card's, and doesn't count the document against a card whose memory is known. The status bar shows GPU Memory Full while they don't fit.	A Beállítások › Teljesítmény alatt állítsd a GPU-memóriát arra, amennyit a videokártyád elbír, legfeljebb a memóriája 3/8-ára. Az Automatikus a memóriahasználatot követi, a számítógép memóriájának negyedén és a kártya 3/8-án belül, és ismert memóriájú kártyánál nem számítja bele a dokumentumot. Amíg nem férnek el, az állapotsor a GPU-memória megtelt üzenetet mutatja.
+	GPU Memory Full	GPU-memória megtelt
+	The layers need {needed} of GPU memory and may hold {budget}, so edits that redraw the whole document do it on the CPU. Click to set GPU Memory.	A rétegeknek {needed} GPU-memória kell, és {budget} foglalhatnak, ezért a teljes dokumentumot újrarajzoló szerkesztések a CPU-n futnak. Kattints a GPU-memória beállításához.
+	GPU memory budget: {budget}	GPU-memóriakeret: {budget}
+	This document's layers: {needed} of {budget} for layers	A dokumentum rétegei: {needed} / {budget} a rétegeknek
+	This document's layers need {needed} but may hold {budget}: whole-document redraws use the CPU	A dokumentum rétegeinek {needed} kell, de {budget} foglalhatnak: a teljes dokumentum újrarajzolása a CPU-n fut
+	GPU Memory (MB, 0 = Automatic)	GPU-memória (MB, 0 = Automatikus)
+	{name} was changed by another app after it was opened or saved here.	A(z) {name} fájlt egy másik alkalmazás módosította, miután itt megnyitották vagy mentették.
+	Replace it with this document, or cancel and use File › Save As to keep both.	Cserélje le erre a dokumentumra, vagy válassza a Mégse gombot, és a Fájl › Mentés másként paranccsal tartsa meg mindkettőt.
+	Decrease Brush Size	Ecsetméret csökkentése
+	Increase Brush Size	Ecsetméret növelése
+	Decrease Brush Hardness	Ecsetkeménység csökkentése
+	Increase Brush Hardness	Ecsetkeménység növelése
+	Memory Usage	Memóriahasználat
+	Per-document RAM limit (MB)	Dokumentumonkénti RAM-korlát (MB)
+	Installed RAM: {ram} MB; this limit: {percent}%	Telepített RAM: {ram} MB; ez a korlát: {percent}%
+	Limits each open document's pixels plus History. Oldest undo states are discarded when the limit is exceeded.	Minden nyitott dokumentum pixeljeit és előzményeit korlátozza. A legrégebbi visszavonási állapotok törlődnek a korlát túllépésekor.
+	Applies immediately when saved. Memory is not reserved in advance.	Mentéskor azonnal érvényes. A memória nincs előre lefoglalva.
+	With GPU Memory set to Automatic, this also limits the GPU layer budget. That budget is capped at one quarter of installed RAM and, when known, three eighths of the graphics card's memory, with a 512 MB minimum. Raising this limit beyond those caps does not increase the GPU budget.	Automatikus GPU-memóriánál a GPU-rétegkeretet is korlátozza. Felső határ a RAM negyede és, ha ismert, a kártyamemória háromnyolcada, minimum 512 MB. Magasabb korlát a GPU-keretet nem növeli.
+	Use	Használat
+	In Front	Elöl
+	Behind	Mögött
+
+# DDS Options (#1327)
+	DDS Options	DDS-beállítások
+	Generate Mipmaps	Mipmapek létrehozása
+
+# Graphics Adapter preference (#1885)
+	GPU adapter	GPU-adapter

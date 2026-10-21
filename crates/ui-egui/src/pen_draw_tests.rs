@@ -123,6 +123,23 @@ fn alt_breaks_the_handle_being_dragged_and_grabs_the_last_outgoing_handle() {
 }
 
 #[test]
+fn opening_a_new_document_finishes_the_previous_pen_path() {
+    let mut h = harness();
+    click(&mut h, [20.0, 20.0]);
+    click(&mut h, [120.0, 20.0]);
+    assert_eq!(h.state().ui.pen.as_ref().map(|p| p.knots.len()), Some(2));
+    let original = h.state().session.active().unwrap().doc.id;
+
+    h.state_mut().run("file.new", json!({"width": 300, "height": 200})).unwrap();
+    assert!(h.state().ui.pen.is_none(), "the Pen draft must not overlay the new document");
+    let docs = h.state().session.documents();
+    assert_eq!(docs.len(), 2);
+    assert_eq!(docs[0].doc.id, original);
+    assert_eq!(docs[0].doc.work_path.as_ref().unwrap().subpaths[0].knots.len(), 2);
+    assert!(docs[1].doc.work_path.is_none(), "the new document starts with no path");
+}
+
+#[test]
 fn dragging_on_the_first_anchor_closes_with_its_handles_in_one_step() {
     let mut h = harness();
     let before = h.state().session.active().unwrap().history.past_len();
@@ -153,4 +170,108 @@ fn dragging_on_the_first_anchor_closes_with_its_handles_in_one_step() {
     let k = &sp.knots[0];
     assert!(sp.closed && sp.knots.len() == 3);
     assert!(near([k.in_ctrl.x, k.in_ctrl.y], [0.0, 20.0]) && near([k.out_ctrl.x, k.out_ctrl.y], [40.0, 20.0]), "{k:?}");
+}
+
+/// #5702: a finished work path showed again whenever the Pen came back, and ⌫ / Delete reached
+/// Edit › Clear (the pixels under it) instead, so the path looked impossible to delete. With the
+/// Pen the key deletes the path, in one undoable step, and leaves the pixels; other tools keep
+/// Edit › Clear.
+#[test]
+fn delete_with_the_pen_deletes_the_finished_work_path_not_the_pixels() {
+    let mut h = harness();
+    h.state_mut().run("layer.new.layer", json!({})).unwrap();
+    h.state_mut()
+        .session
+        .edit("paint", |doc, a| {
+            doc.layer_mut(a.unwrap()).unwrap().surface_mut().unwrap().fill_rect(photocraft_geom::Rect::new(0, 0, 200, 150), &[1.0, 0.0, 0.0, 1.0]);
+            Ok(())
+        })
+        .unwrap();
+    for p in [[20.0, 20.0], [120.0, 20.0], [120.0, 100.0]] {
+        click(&mut h, p);
+    }
+    h.key_press(Key::Enter);
+    h.run_steps(2);
+    let work = |h: &Harness<'static, PhotocraftApp>| h.state().session.active().unwrap().doc.work_path.is_some();
+    let red = |h: &Harness<'static, PhotocraftApp>| {
+        let st = h.state().session.active().unwrap();
+        st.doc.layer(st.active_layer.unwrap()).unwrap().surface().unwrap().rgba(60, 60) == [1.0, 0.0, 0.0, 1.0]
+    };
+    assert!(work(&h) && h.state().ui.pen.is_none(), "a finished work path");
+    let steps = h.state().session.active().unwrap().history.past_len();
+
+    h.key_press(Key::Delete);
+    h.run_steps(2);
+    assert!(!work(&h), "Delete deletes the work path");
+    assert!(red(&h), "and leaves the pixels under it");
+    assert_eq!(h.state().session.active().unwrap().history.past_len(), steps + 1, "one History step");
+    h.state_mut().run("edit.undo", json!({})).unwrap();
+    assert!(work(&h), "Undo brings it back");
+
+    h.state_mut().ui.tool = Tool::PathSelection;
+    h.key_press(Key::Backspace);
+    h.run_steps(2);
+    assert!(!work(&h), "Backspace with Path Selection deletes it too");
+    h.state_mut().run("edit.undo", json!({})).unwrap();
+
+    h.state_mut().ui.tool = Tool::Brush;
+    h.key_press(Key::Delete);
+    h.run_steps(2);
+    assert!(work(&h), "another tool's Delete is Edit › Clear, not Delete Path");
+}
+
+fn space(h: &mut Harness<'static, PhotocraftApp>, down: bool) {
+    h.event(egui::Event::Key { key: Key::Space, physical_key: None, pressed: down, repeat: false, modifiers: Modifiers::NONE });
+    h.run_steps(1);
+}
+
+/// Did the last frame paint the Pen's path in progress: an accent polyline starting at `at`, its
+/// first anchor on screen (`vector_ui::draw_overlay`)?
+fn pen_path_painted(h: &Harness<'static, PhotocraftApp>, at: Pos2) -> bool {
+    let accent = crate::theme::Tokens::get(&h.ctx).accent;
+    h.output().shapes.iter().any(|c| match &c.shape {
+        egui::Shape::Path(p) => {
+            p.stroke.width == 1.5
+                && matches!(p.stroke.color, egui::epaint::ColorMode::Solid(col) if col == accent)
+                && p.points.len() >= 2
+                && p.points[0].distance(at) < 1.0
+        }
+        _ => false,
+    })
+}
+
+/// #6592: holding Space to pan with the Hand keeps the Pen's path in progress, and shows it, as in
+/// Photoshop.
+#[test]
+fn space_pan_keeps_the_pen_path_in_progress_visible() {
+    let mut h = harness();
+    click(&mut h, [20.0, 20.0]);
+    click(&mut h, [100.0, 20.0]);
+    assert_eq!(h.state().ui.pen.as_ref().map(|p| p.knots.len()), Some(2));
+    let p = screen(&h, [150.0, 100.0]);
+    h.event(egui::Event::PointerMoved(p));
+    h.run_steps(1);
+    assert!(pen_path_painted(&h, screen(&h, [20.0, 20.0])), "drawn before Space");
+    space(&mut h, true);
+    assert!(pen_path_painted(&h, screen(&h, [20.0, 20.0])), "drawn with Space held, before the drag");
+    let c0 = h.state().ui.views[0].center;
+    button(&mut h, p, true, Modifiers::NONE);
+    for i in 1..=5 {
+        // A pan frame paints the image and its overlays with the view it started with.
+        let first = screen(&h, [20.0, 20.0]);
+        h.event(egui::Event::PointerMoved(p + vec2(10.0 * i as f32, 0.0)));
+        h.run_steps(1);
+        let pen = h.state().ui.pen.as_ref().map(|p| p.knots.len());
+        let painted = pen_path_painted(&h, first);
+        assert_eq!(pen, Some(2), "the path in progress is kept while panning (step {i})");
+        assert!(painted, "the path in progress is drawn while panning (step {i})");
+    }
+    button(&mut h, p + vec2(50.0, 0.0), false, Modifiers::NONE);
+    space(&mut h, false);
+    h.run_steps(1);
+    let c1 = h.state().ui.views[0].center;
+    assert!((c1[0] - (c0[0] - 50.0)).abs() < 0.5, "Space-drag panned: {c0:?} -> {c1:?}");
+    assert_eq!(h.state().ui.tool, Tool::Pen);
+    assert_eq!(h.state().ui.pen.as_ref().map(|p| p.knots.len()), Some(2), "the path in progress survives the pan");
+    assert!(pen_path_painted(&h, screen(&h, [20.0, 20.0])), "drawn after the pan");
 }

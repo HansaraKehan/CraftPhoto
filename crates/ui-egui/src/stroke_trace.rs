@@ -113,11 +113,30 @@ impl StrokeTrace {
     /// Reads `PHOTOCRAFT_STROKE_TRACE` (off on the web, where there is no clock).
     pub fn from_env() -> Self {
         #[cfg(not(target_arch = "wasm32"))]
-        if let Some(v) = std::env::var_os("PHOTOCRAFT_STROKE_TRACE").filter(|v| !v.is_empty()) {
-            let output = if v == "1" || v == "stderr" { Output::Stderr } else { Output::Csv(v.into()) };
-            return Self { output, ..Default::default() };
+        if let Some(v) = std::env::var_os("PHOTOCRAFT_STROKE_TRACE") {
+            return Self::from_value(&v.to_string_lossy());
         }
         Self::default()
+    }
+
+    /// A trace set by value: `""`, `"0"` or `"off"` is off, `"1"` or `"stderr"` prints
+    /// summaries, anything else is a CSV path (`--stroke-trace`, `PHOTOCRAFT_STROKE_TRACE`; the
+    /// control channel's `ui.set {"strokeTrace"}` passes only on or off, never a path).
+    pub fn from_value(v: &str) -> Self {
+        let v = v.trim();
+        let output = match v {
+            _ if cfg!(target_arch = "wasm32") => Output::Off,
+            "" | "0" | "off" | "false" => Output::Off,
+            "1" | "stderr" | "true" => Output::Stderr,
+            path => Output::Csv(path.into()),
+        };
+        Self { output, ..Default::default() }
+    }
+
+    /// Switch the output, keeping the last summary.
+    pub fn set(&mut self, v: &str) {
+        let last = self.last.take();
+        *self = Self { last, ..Self::from_value(v) };
     }
 
     pub fn enabled(&self) -> bool {
@@ -263,6 +282,19 @@ mod tests {
         frame(&mut off, 0.0, 1.0, true);
         frame(&mut off, 16.0, 1.0, false);
         assert!(off.last.is_none() && off.rows.is_empty());
+    }
+
+    #[test]
+    fn a_trace_is_set_by_value() {
+        assert_eq!(StrokeTrace::from_value("off").output, Output::Off);
+        assert_eq!(StrokeTrace::from_value(" 0 ").output, Output::Off);
+        assert_eq!(StrokeTrace::from_value("stderr").output, Output::Stderr);
+        assert_eq!(StrokeTrace::from_value("true").output, Output::Stderr);
+        assert_eq!(StrokeTrace::from_value("t.csv").output, Output::Csv("t.csv".into()));
+        let mut t = on();
+        t.last = Some(Summary::default());
+        t.set("off");
+        assert!(!t.enabled() && t.last.is_some(), "turning it off keeps the last summary");
     }
 
     #[test]

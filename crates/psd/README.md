@@ -20,6 +20,8 @@ A standalone reader and writer for Adobe Photoshop **PSD** (version 1) and **PSB
 ```rust
 // Top level
 PsdFile::from_bytes(&[u8]) -> Result<PsdFile>
+PsdFile::from_bytes_and_merged(&[u8], want) -> Result<(PsdFile, Option<Result<Vec<u8>>>)>
+                                            // + decode_merged() when want(&file): ZIP inflated once
 PsdFile::to_bytes(&self) -> Result<Vec<u8>>
 PsdFile::open(path) / save(path)            // native only
 PsdFile { header, color_mode_data, resources, layer_info, layer_info_placement,
@@ -112,10 +114,12 @@ testgen::{all_cases, merged_only, layered, small, sample_descriptor, pattern_pla
 | Actions (`.atn`) | ✓ | ✓ | ✓ | `atn::parse` / `atn::write`: version-16 sets (Photoshop 6+): actions with function key, modifiers and colour; steps with event code or string name, panel name, enabled/dialog flags and their descriptor. Exact round trip; version-12 (Photoshop 5) files are rejected as unsupported |
 
 Pattern channel subrectangles are padded with zeroes to the tile rectangle. All channel
-metadata and the total padded size are checked against `MAX_DECODED_BYTES` before any
-plane is decoded. Fully populated channels reuse their decoded buffer without a second
-copy; allocations for padded channels return an error on failure. There is no additional
-padding-specific size limit.
+metadata is checked before any plane is decoded, against one `PatternBudget` shared by every
+pattern of a parse (a block, a `.pat` file): `MAX_DECODED_BYTES` decoded and 512 MiB of zero
+padding in total. `parse_pattern_block_with` lets several blocks of one document share a budget;
+`.abr` patterns are charged to the file's sample budget. All channels of a pattern must have the
+same depth. Fully populated channels reuse their decoded buffer without a second copy;
+allocations for padded channels return an error on failure.
 
 ### Preserved raw, not yet typed (parsers planned for M8)
 

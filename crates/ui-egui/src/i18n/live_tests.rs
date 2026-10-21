@@ -43,6 +43,46 @@ fn ukrainian_native_app_menu_keeps_product_and_language_names() {
 }
 
 #[test]
+fn ukrainian_color_picker_titles_draw_in_the_selected_language() {
+    with_language(Lang::EN, || {
+        for (target, expected) in [("foreground", "Вибір кольору (основний колір)"), ("background", "Вибір кольору (колір тла)")]
+        {
+            let mut h = harness();
+            h.state_mut().run("prefs.set", json!({"path": "interface.language", "value": "uk"})).unwrap();
+            crate::color_picker_ui::open(h.state_mut(), target);
+            h.run_steps(4);
+            let text = drawn_text(&h);
+            assert!(text.iter().any(|text| text == expected), "missing title {expected}");
+            assert!(!text.iter().any(|text| text.starts_with("Color Picker")), "no English picker title");
+        }
+        assert_eq!(tr(lang("uk"), "Color Picker (Custom Canvas Color)"), "Вибір кольору (власний колір полотна)");
+    });
+}
+
+#[test]
+fn ukrainian_rasterize_prompts_explain_the_loss_of_editable_content() {
+    use crate::rasterize_prompt::Kind;
+
+    for kind in Kind::ALL {
+        let translated = tr(lang("uk"), kind.message());
+        assert_ne!(translated, kind.message(), "{kind:?}: the warning must be translated");
+        assert!(translated.contains("більше не можна буде редагувати"), "{kind:?}: explain the loss of editability");
+    }
+    with_language(Lang::EN, || {
+        let mut h = harness();
+        h.state_mut().run("prefs.set", json!({"path": "interface.language", "value": "uk"})).unwrap();
+        h.state_mut().run("type.create", json!({"text": "Editable text"})).unwrap();
+        let layer = h.state().session.active().unwrap().active_layer.unwrap();
+        crate::rasterize_prompt::open(h.state_mut(), Kind::Type, layer, crate::state::Tool::Brush, [10.0, 10.0, 1.0]);
+        h.run_steps(4);
+        let expected = tr(lang("uk"), Kind::Type.message());
+        let text = drawn_text(&h);
+        assert!(text.iter().any(|text| text == expected), "the actual dialog draws the Ukrainian warning");
+        assert!(!text.iter().any(|text| text == Kind::Type.message()));
+    });
+}
+
+#[test]
 fn french_and_korean_plural_messages_keep_placeholders() {
     for (n, expected) in [(0, "0 élément"), (1, "1 élément"), (2, "2 éléments"), (21, "21 éléments")] {
         assert_eq!(trn(lang("fr"), n, "{n} item", "{n} items"), expected);

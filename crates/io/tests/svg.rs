@@ -221,6 +221,57 @@ fn text_becomes_outline_shapes_or_warns_without_a_font() {
     assert!(dark > 4, "glyph strokes cross the middle row: {dark}");
 }
 
+/// #4806: text placed by a `transform` (Illustrator writes `matrix(1 0 0 1 x y)` on every text
+/// element), on the text or on a group around it, lands where resvg draws it. usvg leaves the
+/// glyph outlines' absolute transforms at identity, so reading them dropped the transform: the
+/// text went off the canvas or kept its untransformed place and size.
+#[test]
+fn transformed_text_lands_where_resvg_draws_it() {
+    let font = "font-size=\"24\" font-family=\"DejaVu Sans, Arial, Helvetica, sans-serif\" fill=\"black\"";
+    let cases = [
+        format!("<text transform=\"translate(10 40)\" {font}>IHI</text>"),
+        format!("<text transform=\"matrix(1 0 0 1 10 40)\" {font}>IHI</text>"),
+        format!("<text transform=\"translate(10 0)\" x=\"20\" y=\"40\" {font}>IHI</text>"),
+        format!("<text transform=\"scale(2)\" x=\"5\" y=\"25\" {font}>IHI</text>"),
+        format!("<g transform=\"translate(10 40)\"><text {font}>IHI</text></g>"),
+        format!("<g transform=\"translate(60 0)\"><g transform=\"rotate(90)\"><text x=\"5\" y=\"20\" {font}>IHI</text></g></g>"),
+    ];
+    for c in cases {
+        let svg = format!("<svg {NS} width=\"120\" height=\"60\">{c}</svg>");
+        let r = open(&svg);
+        let d = &r.document;
+        if d.layers.is_empty() {
+            // No font at all on this machine: the import says so instead.
+            assert!(r.warnings.iter().any(|w| w.contains("font")), "{:?}", r.warnings);
+            return;
+        }
+        assert!(matches!(d.layers[0].content, LayerContent::Group(_)), "text stays outline shapes: {c}");
+        let imported = photocraft_compose::flatten(d);
+        let reference = svg::rasterize(svg.as_bytes(), 1.0).unwrap();
+        let (mut both, mut either) = (0usize, 0usize);
+        let (mut a_box, mut b_box) = ([i32::MAX, i32::MAX, i32::MIN, i32::MIN], [i32::MAX, i32::MAX, i32::MIN, i32::MIN]);
+        let grow = |bx: &mut [i32; 4], x: i32, y: i32| *bx = [bx[0].min(x), bx[1].min(y), bx[2].max(x), bx[3].max(y)];
+        for y in 0..60 {
+            for x in 0..120 {
+                let (a, b) = (imported.get(x, y)[3] > 0.5, reference.get(x, y)[3] > 0.5);
+                if a {
+                    grow(&mut a_box, x, y);
+                }
+                if b {
+                    grow(&mut b_box, x, y);
+                }
+                both += usize::from(a && b);
+                either += usize::from(a || b);
+            }
+        }
+        assert!(either > 50, "resvg draws the text on the canvas: {c}");
+        // Same place and size to the pixel; the outlines are filled by a different rasteriser, so
+        // the edges of thin stems may differ by half a pixel.
+        assert!(a_box.iter().zip(b_box).all(|(a, b)| (a - b).abs() <= 1), "imported {a_box:?}, resvg {b_box:?}: {c}");
+        assert!(both * 10 >= either * 7, "imported glyphs cover what resvg draws ({both} of {either} px): {c}");
+    }
+}
+
 #[test]
 fn size_comes_from_the_viewbox_and_huge_drawings_shrink_to_fit() {
     let r = open(&format!("<svg {NS} viewBox=\"0 0 300 150\"><rect width=\"300\" height=\"150\"/></svg>"));

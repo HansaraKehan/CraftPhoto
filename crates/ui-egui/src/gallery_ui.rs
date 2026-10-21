@@ -92,6 +92,8 @@ pub struct GalleryDialog {
     thumb_src: Surface,
     thumbs: Vec<Option<TextureHandle>>,
     pub preview_ms: f64,
+    /// Editing smart filter `index` of the layer: OK updates it instead of adding a filter.
+    pub smart_filter: Option<usize>,
     history: EditHistory<Vec<EffectLayer>>,
 }
 
@@ -104,6 +106,7 @@ impl GalleryDialog {
             "zoom": if self.zoom > 0.0 { json!(self.zoom) } else { json!("fit") },
             "previewMs": self.preview_ms,
             "rendering": self.rendering().is_some(),
+            "smartFilter": self.smart_filter,
         })
     }
 
@@ -269,18 +272,12 @@ fn image(surf: &Surface, w: usize, h: usize) -> egui::ColorImage {
     egui::ColorImage::new([w, h], px.iter().map(|p| Color32::from_rgba_unmultiplied(p[0], p[1], p[2], if alpha { p[3] } else { 255 })).collect())
 }
 
-/// Opens the dialog on the active layer, starting from the last gallery stack used.
-pub fn open(app: &mut PhotocraftApp) -> Result<(), String> {
-    let (layer, src, _) = crate::distort_ui::active_pixels(app)?;
-    let st = app.session.active().ok_or("no document")?;
-    let canvas = st.doc.bounds();
-    let layer_name = st.doc.layer(layer).map(|l| l.name.clone()).unwrap_or_default();
-    let last = app.session.journal.iter().rev().find(|(id, _)| id == "filter.filterGallery").map(|(_, p)| p.clone());
-    let mut effects: Vec<EffectLayer> = last
-        .as_ref()
-        .and_then(|p| p.get("effects").and_then(Value::as_array).cloned())
-        .unwrap_or_default()
-        .iter()
+/// The effect layers of a `filter.filterGallery` params object (unknown filters are skipped).
+fn effects_from(p: &Value) -> Vec<EffectLayer> {
+    p.get("effects")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
         .filter_map(|e| {
             let f = GalleryFilter::from_key(e.get("filter")?.as_str()?)?;
             let mut l = EffectLayer::new(f);
@@ -290,7 +287,56 @@ pub fn open(app: &mut PhotocraftApp) -> Result<(), String> {
             l.visible = e.get("visible").and_then(Value::as_bool).unwrap_or(true);
             Some(l)
         })
-        .collect();
+        .collect()
+}
+
+/// A recorded `[r, g, b, a]` colour param.
+fn colour_param(p: &Value, key: &str) -> Option<[f32; 4]> {
+    let a = p.get(key)?.as_array()?;
+    let c = |j: usize, d: f32| a.get(j).and_then(Value::as_f64).map_or(Some(d), |v| Some(v as f32).filter(|v| v.is_finite()));
+    Some([c(0, 0.0)?, c(1, 0.0)?, c(2, 0.0)?, c(3, 1.0)?])
+}
+
+/// Opens the dialog on the active layer, starting from the last gallery stack used.
+pub fn open(app: &mut PhotocraftApp) -> Result<(), String> {
+    let (layer, src, _) = crate::distort_ui::active_pixels(app)?;
+    let last = app.session.journal.iter().rev().find(|(id, _)| id == "filter.filterGallery").map(|(_, p)| p.clone());
+    let effects = last.as_ref().map(effects_from).unwrap_or_default();
+    let (fg, bg) = (app.session.tools.foreground, app.session.tools.background);
+    open_on(app, layer, src, effects, [fg, bg], None)
+}
+
+/// Re-opens Filter Gallery smart filter `index` of smart object `layer` with its recorded stack,
+/// previewing on the pixels below it; OK updates that filter (`layer.smartFilter.setParams`).
+pub fn open_smart_filter(app: &mut PhotocraftApp, layer: LayerId, index: usize) -> Result<(), String> {
+    let st = app.session.active().ok_or("no document")?;
+    let Some(photocraft_doc::LayerContent::Smart(sm)) = st.doc.layer(layer).map(|l| &l.content) else {
+        return Err("the layer is not a smart object".into());
+    };
+    let filter = sm.smart_filters.get(index).ok_or("no such smart filter")?;
+    if filter.command != "filter.filterGallery" {
+        return Err("the smart filter is not a Filter Gallery filter".into());
+    }
+    let p = filter.params.clone();
+    let src = photocraft_engine::smart_cmds::render_below_filter(&st.doc, sm, index)
+        .map_err(|e| e.to_string())?
+        .ok_or("the smart object's contents are unavailable (missing linked file?)")?;
+    let fg = colour_param(&p, "foreground").unwrap_or(app.session.tools.foreground);
+    let bg = colour_param(&p, "background").unwrap_or(app.session.tools.background);
+    open_on(app, layer, src, effects_from(&p), [fg, bg], Some(index))
+}
+
+fn open_on(
+    app: &mut PhotocraftApp,
+    layer: LayerId,
+    src: Surface,
+    mut effects: Vec<EffectLayer>,
+    colours: [[f32; 4]; 2],
+    smart_filter: Option<usize>,
+) -> Result<(), String> {
+    let st = app.session.active().ok_or("no document")?;
+    let canvas = st.doc.bounds();
+    let layer_name = st.doc.layer(layer).map(|l| l.name.clone()).unwrap_or_default();
     if effects.is_empty() {
         effects.push(EffectLayer::new(GalleryFilter::ColoredPencil));
     }
@@ -312,8 +358,8 @@ pub fn open(app: &mut PhotocraftApp) -> Result<(), String> {
         effects,
         selected: sel,
         open: open_cats,
-        foreground: app.session.tools.foreground,
-        background: app.session.tools.background,
+        foreground: colours[0],
+        background: colours[1],
         zoom: 0.0,
         center: [(canvas.x0 + canvas.x1) as f32 / 2.0, (canvas.y0 + canvas.y1) as f32 / 2.0],
         tex: None,
@@ -325,6 +371,7 @@ pub fn open(app: &mut PhotocraftApp) -> Result<(), String> {
         thumb_src,
         thumbs: vec![None; GalleryFilter::ALL.len()],
         preview_ms: 0.0,
+        smart_filter,
         history,
     });
     Ok(())
@@ -335,6 +382,9 @@ pub fn commit(app: &mut PhotocraftApp) -> Result<Value, String> {
     let Some(d) = app.distort.gallery.take() else { return Err("the Filter Gallery is not open".into()) };
     if !d.effects.iter().any(|e| e.visible) {
         return Ok(json!({"committed": false}));
+    }
+    if let Some(index) = d.smart_filter {
+        return app.run("layer.smartFilter.setParams", json!({"layer": d.layer.0, "index": index, "params": d.params()}));
     }
     let mut p = d.params();
     p["layer"] = json!(d.layer.0);
@@ -857,6 +907,51 @@ mod tests {
         assert_eq!(app.distort.gallery.as_ref().unwrap().effects.len(), 2);
         control(&mut app, &json!({"cancel": true})).unwrap();
         assert_eq!(app.session.active().unwrap().history.past_len(), before + 1, "cancel records nothing");
+    }
+
+    #[test]
+    fn smart_filter_double_click_edits_the_stored_gallery_stack() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        app.run("layer.smartObjects.convertToSmartObject", json!({})).unwrap();
+        let stack = json!({"effects": [{"filter": "chrome", "params": {"detail": 2, "smoothness": 9}, "visible": true}], "foreground": [1.0, 0.0, 0.0, 1.0], "background": [0.0, 0.0, 1.0, 1.0]});
+        app.run("filter.filterGallery", stack).unwrap();
+        app.run("filter.blur.gaussianBlur", json!({"radius": 2.0})).unwrap();
+        let layer = app.session.active().unwrap().active_layer.unwrap();
+        let smart = |app: &PhotocraftApp| match &app.session.active().unwrap().doc.layer(layer).unwrap().content {
+            photocraft_doc::LayerContent::Smart(sm) => sm.clone(),
+            _ => panic!("not a smart object"),
+        };
+        let steps = app.session.active().unwrap().history.past_len();
+
+        let sm = smart(&app);
+        crate::smart_ui::open_editor(&mut app, &ctx, layer.0, &sm, 0);
+        assert!(app.ui.dialogs.is_empty(), "no generic parameter form");
+        let d = app.distort.gallery.as_ref().expect("the gallery dialog opens");
+        assert_eq!((d.smart_filter, d.foreground, d.background), (Some(0), [1.0, 0.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]));
+        assert_eq!(d.effects.len(), 1);
+        assert_eq!((d.effects[0].filter, &d.effects[0].params["detail"]), (GalleryFilter::Chrome, &json!(2)));
+        // The preview starts from the pixels below the filter (no blur, no chrome).
+        let below = photocraft_engine::smart_cmds::render_below_filter(&app.session.active().unwrap().doc, &sm, 0).unwrap().unwrap();
+        let d = app.distort.gallery.as_ref().unwrap();
+        assert_eq!(d.src.read_region(d.canvas), below.read_region(d.canvas));
+
+        control(&mut app, &json!({"params": {"detail": 7}})).unwrap();
+        control(&mut app, &json!({"commit": true})).unwrap();
+        assert!(app.distort.gallery.is_none());
+        let sm = smart(&app);
+        assert_eq!(sm.smart_filters.len(), 2, "edited in place, not added");
+        assert_eq!(sm.smart_filters[0].command, "filter.filterGallery");
+        assert_eq!(sm.smart_filters[0].params["effects"][0]["params"]["detail"], json!(7));
+        assert_eq!(sm.smart_filters[0].params["foreground"], json!([1.0, 0.0, 0.0, 1.0]));
+        assert_eq!(app.session.active().unwrap().history.past_len(), steps + 1);
+        app.run("edit.undo", json!({})).unwrap();
+        assert_eq!(smart(&app).smart_filters[0].params["effects"][0]["params"]["detail"], json!(2));
+
+        // Not a gallery filter / no such filter: an error, no dialog.
+        assert!(open_smart_filter(&mut app, layer, 1).is_err());
+        assert!(open_smart_filter(&mut app, layer, 9).is_err());
+        assert!(app.distort.gallery.is_none());
     }
 
     #[test]

@@ -98,7 +98,7 @@ pub fn effect_defaults(kind: &str) -> Value {
         }
         "patternOverlay" => json!({"blend": "Normal", "opacity": 100, "pattern": "", "angle": 0, "scale": 100, "link": true}),
         "bevelEmboss" => {
-            json!({"style": "inner", "depth": 100, "direction": "up", "size": 5, "soften": 0, "angle": 120, "useGlobalLight": true, "altitude": 30, "glossContour": "Linear", "contour": false, "contourName": "Linear", "contourRange": 50, "contourAntiAlias": false})
+            json!({"style": "inner", "technique": "smooth", "depth": 100, "direction": "up", "size": 5, "soften": 0, "angle": 120, "useGlobalLight": true, "altitude": 30, "glossContour": "Linear", "contour": false, "contourName": "Linear", "contourRange": 50, "contourAntiAlias": false})
         }
         "satin" => {
             json!({"blend": "Multiply", "color": "#000000", "opacity": 50, "angle": 19, "distance": 11, "size": 14, "contour": "Linear", "antiAlias": true, "invert": true})
@@ -594,6 +594,9 @@ fn overlay_gradient(g: &mut Gradient, p: &Value) {
 /// a dialog round trip never touches what it doesn't model: an imported
 /// gradient stroke keeps its gradient while its opacity is edited.
 pub fn overlay_effect(fx: &mut Effect, p: &Value) {
+    if crate::commands::check_f32_values("layer.layerStyle", p).is_err() {
+        return;
+    }
     fn set_color(p: &Value, k: &str, c: &mut Color) {
         if let Some(x) = color_of(p, k) {
             *c = x;
@@ -821,6 +824,7 @@ pub fn overlay_effect(fx: &mut Effect, p: &Value) {
 /// Builds an effect of `kind` from JSON params (Photoshop units: opacity,
 /// spread, range in percent; sizes in px; angles in degrees).
 pub fn effect_from_params(kind: &str, p: &Value) -> Option<Effect> {
+    crate::commands::check_f32_values("layer.layerStyle", p).ok()?;
     let mut fx = fresh_effect(kind)?;
     overlay_effect(&mut fx, p);
     Some(fx)
@@ -856,6 +860,7 @@ const MAX_EFFECTS: usize = 256;
 /// mismatches and malformed snapshots are errors, never panics.
 fn replace_effects(s: &mut Session, p: &Value) -> Result<Value> {
     const CMD: &str = "layer.layerStyle.replace";
+    crate::commands::check_f32_values(CMD, p)?;
     let id = crate::commands::layer_param(s, p)?;
     let entries = p.get("effects").and_then(Value::as_array).ok_or_else(|| bad(CMD, "need `effects`: [{kind, params, fx?}]"))?;
     if entries.len() > MAX_EFFECTS {
@@ -895,14 +900,17 @@ fn replace_effects(s: &mut Session, p: &Value) -> Result<Value> {
         }
         let mode = doc.mode;
         let l = doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?;
+        // The list's master switch (`layer.setEffectsVisible`, the Layers panel's "Effects" eye)
+        // survives the edit: the dialog models per-effect state, not the switch (#3648). A layer
+        // with no effects yet still has the default `enabled: true`, so its style shows.
         l.effects.items = list.into_iter().map(|e| e.in_mode(mode)).collect();
-        l.effects.enabled = true;
         Ok(())
     })?;
     Ok(json!({ "layer": id.0, "effects": count }))
 }
 
 fn set_effect(s: &mut Session, p: &Value, kind: &str) -> Result<Value> {
+    crate::commands::check_f32_values(&format!("layer.layerStyle.{kind}"), p)?;
     let fx = effect_from_params(kind, p).ok_or_else(|| EngineError::Other(format!("unknown effect {kind}")))?;
     let (fx, pattern) = crate::pattern_cmds::resolve_effect(s, fx)?;
     let label = format!("Layer Style: {}", fx.label());
@@ -915,7 +923,8 @@ fn set_effect(s: &mut Session, p: &Value, kind: &str) -> Result<Value> {
         // Colours in the document's mode, as Image › Mode keeps them.
         let fx = fx.in_mode(doc.mode);
         let l = doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?;
-        l.effects.enabled = true;
+        // Adding or replacing one effect leaves the list's master switch alone (#3648); a fresh
+        // effects list already has the default `enabled: true`, so a first effect still shows.
         match l.effects.items.iter_mut().find(|e| same_kind(e, &fx)) {
             Some(slot) if !add => *slot = fx,
             _ => l.effects.items.push(fx),
@@ -933,6 +942,7 @@ fn make_default(s: &mut Session, p: &Value) -> Result<Value> {
         Some(v) if v.is_object() => v.clone(),
         _ => return Err(bad(CMD, "`params` must be an object")),
     };
+    crate::commands::check_f32_values(CMD, &params)?;
     s.presets.layer_defaults.insert(kind.to_string(), params);
     s.presets_changed();
     Ok(json!({"kind": kind}))
@@ -1149,17 +1159,25 @@ mod tests {
     /// blur kernel of 2^62 taps ("capacity overflow"), or ran for minutes at 1e6. The blur width
     /// is capped at the effect reach, so the document still renders, quickly.
     #[test]
-    fn oversized_satin_and_bevel_sizes_render() {
-        for (cmd, p) in [
-            ("satin", json!({"size": 1e308})),
-            ("satin", json!({"size": 1_000_000})),
-            ("bevelEmboss", json!({"size": 1e308})),
-            ("bevelEmboss", json!({"soften": 1e308})),
-            ("bevelEmboss", json!({"size": 1_000_000, "soften": 1_000_000})),
+    fn oversized_satin_and_bevel_sizes_stay_saveable_and_render() {
+        for (cmd, p, accepted) in [
+            ("satin", json!({"size": 1e308}), false),
+            ("satin", json!({"size": 1e30}), true),
+            ("satin", json!({"size": 1_000_000}), true),
+            ("bevelEmboss", json!({"size": 1e308}), false),
+            ("bevelEmboss", json!({"soften": 1e308}), false),
+            ("bevelEmboss", json!({"size": 1e30, "soften": 1e30}), true),
+            ("bevelEmboss", json!({"size": 1_000_000, "soften": 1_000_000}), true),
         ] {
             let mut s = session();
             s.execute("edit.fill", json!({"color": "#ff0000"})).unwrap();
-            s.execute(&format!("layer.layerStyle.{cmd}"), p.clone()).unwrap();
+            let result = s.execute(&format!("layer.layerStyle.{cmd}"), p.clone());
+            if accepted {
+                result.unwrap();
+            } else {
+                assert!(matches!(result, Err(EngineError::BadParams { .. })));
+            }
+            photocraft_format::save_to_bytes(&s.active().unwrap().doc, &Default::default()).unwrap();
             let start = std::time::Instant::now();
             s.execute("document.pixel", json!({"x": 0, "y": 0})).unwrap_or_else(|e| panic!("{cmd} {p}: {e}"));
             assert!(start.elapsed().as_secs() < 20, "{cmd} {p}: {:?}", start.elapsed());
@@ -1195,6 +1213,62 @@ mod tests {
         assert!(effects(&s).is_empty());
         s.execute("edit.undo", json!({})).unwrap();
         assert_eq!(effects(&s).len(), 1);
+    }
+
+    fn pixel(s: &mut Session) -> Vec<f32> {
+        serde_json::from_value(s.execute("document.pixel", json!({"x": 3, "y": 3})).unwrap()).unwrap()
+    }
+
+    fn list_enabled(s: &Session) -> bool {
+        let d = s.active().unwrap();
+        d.doc.layer(d.active_layer.unwrap()).unwrap().effects.enabled
+    }
+
+    /// #3648: the Layers panel's "Effects" eye (`layer.setEffectsVisible`) must survive a Layer
+    /// Style dialog OK: the dialog's whole-list replace re-creates the items but leaves the
+    /// list's master switch alone.
+    #[test]
+    fn replacing_the_list_keeps_a_disabled_effect_list_disabled() {
+        let mut s = session();
+        s.execute("edit.fill", json!({"contents": "color", "color": "#ff0000"})).unwrap();
+        s.execute("layer.layerStyle.colorOverlay", json!({"color": "#0000ff"})).unwrap();
+        let shown = pixel(&mut s);
+        s.execute("layer.setEffectsVisible", json!({"visible": false})).unwrap();
+        let hidden = pixel(&mut s);
+        assert_ne!(hidden, shown, "the eye really hides the style");
+        let r = s.execute("layer.layerStyle.replace", json!({"effects": [{"kind": "colorOverlay", "params": {"color": "#00ff00"}}]})).unwrap();
+        assert_eq!(r["effects"], 1, "the list itself is updated");
+        assert!(!list_enabled(&s), "the whole-list switch survives the edit");
+        assert!(effects(&s)[0].enabled(), "the effect's own state is updated");
+        assert_eq!(pixel(&mut s), hidden, "a disabled list still draws nothing");
+        s.execute("layer.setEffectsVisible", json!({"visible": true})).unwrap();
+        assert_ne!(pixel(&mut s), hidden, "re-showing the list draws the edited effect");
+    }
+
+    /// #3648: adding or replacing one effect (`layer.layerStyle.<kind>`) also leaves the master
+    /// switch as the user left it.
+    #[test]
+    fn set_effect_keeps_a_disabled_effect_list_disabled() {
+        let mut s = session();
+        s.execute("edit.fill", json!({"contents": "color", "color": "#ff0000"})).unwrap();
+        s.execute("layer.layerStyle.colorOverlay", json!({"color": "#0000ff"})).unwrap();
+        s.execute("layer.setEffectsVisible", json!({"visible": false})).unwrap();
+        let hidden = pixel(&mut s);
+        s.execute("layer.layerStyle.colorOverlay", json!({"color": "#00ff00"})).unwrap();
+        assert!(!list_enabled(&s), "the whole-list switch survives the edit");
+        assert!(effects(&s)[0].enabled(), "the effect's own state is updated");
+        assert_eq!(pixel(&mut s), hidden, "a disabled list still draws nothing");
+    }
+
+    /// A layer that never had effects keeps the default: its first effect shows.
+    #[test]
+    fn a_first_effect_shows_on_a_layer_that_never_had_effects() {
+        let mut s = session();
+        s.execute("edit.fill", json!({"contents": "color", "color": "#ff0000"})).unwrap();
+        let plain = pixel(&mut s);
+        s.execute("layer.layerStyle.colorOverlay", json!({"color": "#00ff00"})).unwrap();
+        assert!(list_enabled(&s), "a fresh effects list defaults to enabled");
+        assert_ne!(pixel(&mut s), plain, "the first effect renders");
     }
 
     /// #3102: an effect row dropped on the Delete button deletes only that effect, in one step.

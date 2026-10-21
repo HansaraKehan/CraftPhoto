@@ -67,20 +67,14 @@ impl Encoding {
     pub(crate) fn of(gamma: f32) -> Self {
         Encoding(if gamma.is_finite() && gamma > 0.0 { gamma.clamp(0.5, 4.0) } else { 0.0 })
     }
+    /// A value in this encoding as linear light.
     pub(crate) fn decode(self, v: f32) -> f32 {
         if self.0 > 0.0 { v.max(0.0).powf(self.0) } else { srgb_to_linear(v) }
     }
+    /// Linear light back into this encoding, the inverse of [`Encoding::decode`].
     pub(crate) fn encode(self, v: f32) -> f32 {
         if self.0 > 0.0 { v.max(0.0).powf(1.0 / self.0) } else { linear_to_srgb(v) }
     }
-}
-
-fn srgb_encode(v: f32) -> f32 {
-    linear_to_srgb(v)
-}
-
-fn srgb_decode(v: f32) -> f32 {
-    srgb_to_linear(v)
 }
 
 fn luma_linear(c: [f32; 3]) -> f32 {

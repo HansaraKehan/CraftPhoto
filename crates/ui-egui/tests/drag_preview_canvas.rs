@@ -295,3 +295,27 @@ fn a_held_marquee_drag_keeps_requesting_frames() {
     assert!(d.is_some_and(|d| d <= Duration::from_millis(100)), "mid-drag repaint request: {d:?}");
     button(&mut h, 300.0, 220.0, false);
 }
+
+#[test]
+fn the_spot_healing_trail_is_a_dark_half_opaque_tint() {
+    // #7342: the trail was white at a quarter opacity, invisible on white and faint elsewhere.
+    // Photoshop shows the area to heal in half-opaque dark grey.
+    let _gpu = photocraft_testkit::gpu_lock();
+    let Some(mut h) = harness(1.0) else { return };
+    h.run_steps(4);
+    for bg in ["white", "#808080"] {
+        setup(&mut h, bg, "spotHealing");
+        let app = h.state_mut();
+        app.session.tools.brush.size = 40.0;
+        app.session.tools.brush.hardness = 1.0;
+        let before = render(&mut h);
+        drag_to(&mut h, [80.0, 150.0], [320.0, 150.0]);
+        let img = render(&mut h);
+        let p = screen(&h, 200.0, 150.0);
+        let (was, now) = (before.luma(p.x as i64, p.y as i64).unwrap_or(0), img.luma(p.x as i64, p.y as i64).unwrap_or(0));
+        assert!(f32::from(now) < f32::from(was) * 0.6, "spot healing trail on {bg}: luma {was} -> {now}, not dark enough");
+        assert!(f32::from(now) > f32::from(was) * 0.4, "spot healing trail on {bg}: luma {was} -> {now}, should stay see-through");
+        button(&mut h, 320.0, 150.0, false);
+        h.run_steps(2);
+    }
+}

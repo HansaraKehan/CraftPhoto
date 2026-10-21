@@ -338,6 +338,38 @@ fn a_committed_stroke_refreshes_only_what_each_cache_had_not_shown() {
     assert_eq!(c.since(99), None, "not a key of this stroke");
 }
 
+/// A stroke that grows a layer with a Gradient Overlay lays the one gradient out again over the
+/// whole layer (#4053): the canvas, which already showed the live stroke, still repaints where
+/// the earlier strokes are, not just the new stroke's own pixels (it repainted nothing, leaving
+/// one gradient per stroke).
+#[test]
+fn a_committed_stroke_repaints_a_gradient_overlay_over_the_whole_layer() {
+    let mut h = harness();
+    h.state_mut().run("layer.new.layer", json!({})).unwrap();
+    h.state_mut().run("layer.layerStyle.gradientOverlay", json!({"from": "#ff0000", "to": "#0000ff", "angle": 0})).unwrap();
+    h.state_mut().run("tools.setBrush", json!({"brush": {"size": 10, "hardness": 1.0}})).unwrap();
+    let drag = |h: &mut Harness<'static, PhotocraftApp>, pts: &[(f32, f32)]| {
+        move_to(h, pts[0].0, pts[0].1);
+        button(h, pts[0].0, pts[0].1, true);
+        for (x, y) in &pts[1..] {
+            move_to(h, *x, *y);
+        }
+        let (x, y) = pts[pts.len() - 1];
+        button(h, x, y, false);
+        h.run_steps(2);
+    };
+    drag(&mut h, &[(20.0, 20.0), (30.0, 25.0), (40.0, 30.0)]);
+    drag(&mut h, &[(150.0, 60.0), (160.0, 70.0), (170.0, 80.0)]);
+    let app = h.state();
+    let idx = app.session.active_index().unwrap();
+    let st = app.session.active().unwrap();
+    let c = app.committed_stroke.as_ref().expect("the commit took the live stroke's pixels");
+    assert_eq!(c.revision, st.revision);
+    // A cache that showed the live stroke's last step.
+    let missed = crate::canvas::damage_since(app, idx, (st.revision - 1, c.last_key()), (st.revision, 0), 0, st.last_damage).unwrap();
+    assert!(missed.contains(25, 25), "the gradient around the first stroke is repainted: {missed:?}");
+}
+
 #[test]
 fn the_stroke_trace_times_each_frame_of_a_stroke_and_ends_on_release() {
     // The app's hooks around the canvas (`raw_input_hook` starts a frame, `ui` ends it); the

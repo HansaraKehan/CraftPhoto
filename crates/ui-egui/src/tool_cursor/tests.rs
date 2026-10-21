@@ -272,6 +272,40 @@ fn ordinary_brush_cursor_is_not_part_of_the_canvas_draw_list() {
     assert!(output.shapes.iter().any(|s| matches!(s.shape, egui::Shape::Circle(_))), "the full tip is not silently shrunk");
 }
 
+#[test]
+#[cfg(target_os = "linux")]
+fn scaled_wayland_paints_the_brush_outline_instead_of_an_os_bitmap() {
+    // Hyprland ignores the viewport winit sizes cursor bitmaps with: at 1.25 the outline was
+    // 1.25× too large and its centre 0.2 × its half-width right of and below where the brush
+    // painted. Off scale 1 on Wayland the outline is painted at the pointer, at its true size.
+    let run = |ctx: &egui::Context, native_ppp: f32| {
+        let mut input = egui::RawInput::default();
+        input.viewports.entry(egui::ViewportId::ROOT).or_default().native_pixels_per_point = Some(native_ppp);
+        let mut output = ctx.run_ui(input, |ui| {
+            let icon = circle(ui.painter(), pos2(100.0, 100.0), 20.0, false);
+            ui.ctx().set_cursor_icon(icon);
+        });
+        output.textures_delta.clear();
+        let circles: Vec<_> =
+            output.shapes.iter().filter_map(|s| if let egui::Shape::Circle(c) = &s.shape { Some((c.center, c.radius)) } else { None }).collect();
+        (output.platform_output.cursor_image.is_some(), output.platform_output.cursor_icon, circles)
+    };
+    let ctx = egui::Context::default();
+    ctx.add_plugin(CursorLifecycle);
+    set_wayland(&ctx, true);
+    for ppp in [1.25, 1.5, 2.0] {
+        let (bitmap, icon, circles) = run(&ctx, ppp);
+        assert!(!bitmap, "{ppp}: no OS bitmap");
+        assert_eq!(icon, CursorIcon::None, "{ppp}: the painted outline is the pointer");
+        assert!(!circles.is_empty() && circles.iter().all(|&(c, r)| c == pos2(100.0, 100.0) && r == 20.0), "{ppp}: {circles:?}");
+    }
+    let (bitmap, _, circles) = run(&ctx, 1.0);
+    assert!(bitmap && circles.is_empty(), "Wayland at scale 1 keeps the low-latency bitmap");
+    set_wayland(&ctx, false);
+    let (bitmap, _, circles) = run(&ctx, 1.25);
+    assert!(bitmap && circles.is_empty(), "X11 at 1.25 keeps the bitmap");
+}
+
 /// Run explicitly for visual QA: native cursors are absent from GPU screenshots.
 #[test]
 #[ignore = "writes target/tool-cursor-preview.png for visual inspection"]
@@ -456,5 +490,28 @@ fn circle_bitmaps_evaluate_only_the_ring_and_match_every_pixel() {
                 assert_eq!(image.rgba[i..i + 4], want, "radius {radius} at {scale}×, pixel ({col}, {row})");
             }
         }
+    }
+}
+
+/// The arrow is the handle's direction as the view shows it: turned with a rotated view and
+/// mirrored with a flipped one.
+#[test]
+fn resize_follows_the_view() {
+    use CursorIcon::{ResizeHorizontal as H, ResizeNeSw as NeSw, ResizeNwSe as NwSe, ResizeVertical as V};
+    let view = |rotation: f32, flip: bool| ViewXform {
+        rect: egui::Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0)),
+        zoom: 1.0,
+        center: [0.0, 0.0],
+        flip,
+        rotation,
+        aspect: 1.0,
+    };
+    // Right, down-right, down and down-left in the document.
+    let directions = [[1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [-1.0, 1.0]];
+    for (rotation, flip, want) in
+        [(0.0, false, [H, NwSe, V, NeSw]), (90.0, false, [V, NeSw, H, NwSe]), (45.0, false, [NwSe, V, NeSw, H]), (0.0, true, [H, NeSw, V, NwSe])]
+    {
+        let got = directions.map(|d| resize(d, &view(rotation, flip)));
+        assert_eq!(got, want, "view turned {rotation}°, flip {flip}");
     }
 }

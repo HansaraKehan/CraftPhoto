@@ -63,7 +63,8 @@ pub fn rotated_size(size: Size, deg: f64) -> Size {
 
 pub(crate) fn rotate_arbitrary(s: &mut Session, p: &Value) -> Result<Value> {
     const CMD: &str = "image.rotation.arbitrary";
-    let angle = f64::from(num(p, "angle", 0.0));
+    // At full precision: an f32 angle can grow the canvas 1 px past what `rotated_size` gives callers.
+    let angle = p.get("angle").and_then(Value::as_f64).unwrap_or(0.0);
     if !angle.is_finite() || angle.abs() > 3600.0 {
         return Err(bad(CMD, "angle out of range"));
     }
@@ -75,15 +76,18 @@ pub(crate) fn rotate_arbitrary(s: &mut Session, p: &Value) -> Result<Value> {
     if deg.rem_euclid(360.0).abs() < 1e-9 {
         return Ok(json!({"width": s.active().map(|d| d.doc.size.width), "height": s.active().map(|d| d.doc.size.height)}));
     }
-    let bg = s.tools.background;
+    // The Background stays opaque, whatever the background colour's alpha.
+    let bg = [s.tools.background[0], s.tools.background[1], s.tools.background[2], 1.0];
     // Color Sampler points turn with the canvas (the same map the edit applies to the geometry).
+    // They are pixel indices, so map the pixel's centre, as the warp samples the pixels.
     {
         let old = s.active().ok_or(EngineError::NoDocument)?.doc.size;
         let new = rotated_size(old, deg);
         let (sn, cs) = deg.to_radians().sin_cos();
         let (cx, cy) = (f64::from(old.width) / 2.0, f64::from(old.height) / 2.0);
         let (nx, ny) = (f64::from(new.width) / 2.0, f64::from(new.height) / 2.0);
-        s.set_sampler_map(Affine { m: [cs, sn, -sn, cs, nx - (cs * cx - sn * cy), ny - (sn * cx + cs * cy)] });
+        let a = Affine { m: [cs, sn, -sn, cs, nx - (cs * cx - sn * cy), ny - (sn * cx + cs * cy)] };
+        s.set_sampler_map(Affine::translate(0.5, 0.5).then(&a).then(&Affine::translate(-0.5, -0.5)));
     }
     let size = s.edit("Rotate Canvas", |doc, _| {
         let old = doc.size;
@@ -108,7 +112,8 @@ pub(crate) fn rotate_arbitrary(s: &mut Session, p: &Value) -> Result<Value> {
                 let rotated = photocraft_algo::transform::warp_surface(surf, src, &h, interp)?;
                 let mut base = Surface::new(fmt);
                 let fill = photocraft_raster::from_rgba(&fmt, bg);
-                base.write_region(canvas, &fill.repeat(canvas.width() as usize * canvas.height() as usize));
+                // One shared tile per full tile, not a canvas-sized float buffer.
+                base.fill_rect(canvas, &fill);
                 crate::transform_cmds::composite_over(&mut base, &rotated);
                 base.prune();
                 *surf = base;
@@ -444,6 +449,10 @@ fn parse_inks(cmd: &str, v: &Value, n: usize) -> Result<Vec<DuotoneInk>> {
         if let Some(pts) = ink.get("curve").and_then(Value::as_array) {
             let mut curve: Vec<CurvePoint> =
                 pts.iter().filter_map(|p| Some(CurvePoint { input: p.get(0)?.as_f64()? as f32 / 100.0, output: p.get(1)?.as_f64()? as f32 / 100.0 })).collect();
+            // 1e39 is a valid JSON number but inf as f32, and a .pcraft with an inf curve can't be saved.
+            if curve.iter().any(|p| !p.input.is_finite() || !p.output.is_finite()) {
+                return Err(bad(cmd, "curve points must be finite numbers 0..100"));
+            }
             curve.sort_by(|a, b| a.input.total_cmp(&b.input));
             if curve.len() >= 2 {
                 d.curve = curve;

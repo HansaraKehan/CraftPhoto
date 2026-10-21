@@ -534,6 +534,9 @@
 	Field Blur…	Alan Bulanıklığı…
 	No pin selected	Seçili pim yok
 	Click the image to add a pin; drag a pin to move it, or its ring to change its blur. Delete removes the selected pin.	Pim eklemek için görüntüye tıklayın; taşımak için pimi, bulanıklığını değiştirmek için halkasını sürükleyin. Delete seçili pimi siler.
+	Drag the handles on the outline to resize and turn it, the square to round its corners, and the dots inside to set where the blur starts.	Yeniden boyutlandırmak ve döndürmek için dış çizgideki tutamaçları, köşeleri yuvarlamak için kareyi, bulanıklığın nerede başlayacağını belirlemek için içerideki noktaları sürükleyin.
+	Drag the pin to move the band, or its ring to change its blur. Drag the solid lines to widen the sharp band, the dashed lines to set the transition, and the dots to turn it.	Bandı taşımak için pimi, bulanıklığını değiştirmek için halkasını sürükleyin. Keskin bandı genişletmek için düz çizgileri, geçişi ayarlamak için kesikli çizgileri, döndürmek için noktaları sürükleyin.
+	Drag the handles on the outline to resize and turn it; the ring sets the blur angle.	Yeniden boyutlandırmak ve döndürmek için dış çizgideki tutamaçları sürükleyin; halka bulanıklık açısını belirler.
 	Iris Blur…	İris Bulanıklığı…
 	Tilt-Shift…	Tilt-Shift…
 	Path Blur…	Yol Bulanıklığı…
@@ -946,7 +949,6 @@
 	Contiguous	Bitişik
 	Contrast	Kontrast
 	Control:	Kontrol:
-	Convert document's colors to the working space	Belgenin renklerini çalışma alanına dönüştürün
 	Convert to sRGB	sRGB'ye dönüştür
 	Copies	Kopyalar
 	Copper	Bakır
@@ -1004,6 +1006,7 @@
 	Delete Layer Mask	Katman Maskesini Sil
 	Delete Layers	Katmanları Sil
 	Delete Shortcut	Kısayolu Sil
+	Add Shortcut	Kısayol Ekle
 	Delete Timeline	Zaman Çizelgesini Sil
 	Delete Tool Preset	Araç Ön Ayarını Sil
 	Delete count group	Sayım grubunu sil
@@ -1521,7 +1524,6 @@
 	Use Default	Varsayılanı Kullan
 	Use Legacy	Eskiyi Kullan
 	Use Measurement Scale	Ölçüm Ölçeğini Kullan
-	Use the embedded profile (instead of the working space)	Gömülü profili kullanın (çalışma alanı yerine)
 	Variables bind a layer's visibility, text or pixels to a named data slot.	Değişkenler bir katmanın görünürlüğünü, metnini veya piksellerini adlandırılmış bir veri yuvasına bağlar.
 	Vertical scale	Dikey ölçek
 	Vibrance	Canlılık
@@ -1841,6 +1843,8 @@
 	Camera Raw Defaults	Camera Raw Varsayılanları
 	Canvas border	Kanvas kenarlığı
 	Show canvas dots	Kanvas noktalarını göster
+	Clip thumbnails to layer bounds	Küçük resimleri katman sınırlarına kırp
+	Clip Thumbnails to Layer Bounds	Küçük resimleri katman sınırlarına kırp
 	Canvas color	Kanvas rengi
 	Canvas custom color	Kanvas özel rengi
 	Color picker	Renk seçici
@@ -2088,6 +2092,11 @@
 	Mixer Brush Tool	Karıştırıcı Fırça Aracı
 	Color Replacement Tool	Renk Değiştirme Aracı
 	Wet	Islaklık
+	Current Brush Load	Geçerli Fırça Yükü
+	Load Brush	Fırçayı Yükle
+	Clean Brush	Fırçayı Temizle
+	Load the brush after each stroke	Her vuruştan sonra fırçayı yükle
+	Clean the brush after each stroke	Her vuruştan sonra fırçayı temizle
 	Mix	Karışım
 	Wetness Jitter	Islaklık Titreme
 	Mix Jitter	Karıştırma Titreşimi
@@ -2136,7 +2145,6 @@
 	Cancelled opening {name}	{name} açılışı iptal edildi
 	The document “{name}” does not have an embedded {mode} profile.	'{name}' belgesinde gömülü bir {mode} profili yok.
 	The document “{name}” has an embedded color profile that does not match the current {mode} working space.	'{name}' belgesinin gömülü renk profili geçerli {mode} çalışma alanıyla eşleşmiyor.
-	Embedded: {embedded}	Gömülü: {embedded}
 	Working: {working}	Çalışma alanı: {working}
 	Developing {name}	{name} geliştiriliyor
 	Cancelled {label}	{label} iptal edildi
@@ -2407,7 +2415,6 @@ layerLabel	No Color	Renk Yok
 	Large document: redrawing on the CPU	Büyük belge: CPU'da yeniden çizim
 	This redraw took {seconds} s on the CPU.	Bu yeniden çizim CPU'da {seconds} saniye sürdü.
 	Edits that change the whole document, such as a layer's blend mode, opacity or visibility, redraw all of it.	Bir katmanın karışım modu, opaklığı veya görünürlüğü gibi belgenin tamamını değiştiren düzenlemeler, belgenin tamamını yeniden çizer.
-	Its layers don't fit the GPU memory budget. Raising Memory usage in Preferences › Performance raises the budget, up to a quarter of this computer's memory.	Katmanları GPU bellek bütçesine uymuyor. Tercihler'de Bellek kullanımını artırma › Performans, bütçeyi bu bilgisayarın belleğinin dörtte birine kadar artırır.
 	The GPU compositor wasn't used: {reason}	GPU dizgicisi kullanılmadı: {reason}
 cameraRaw	Light	Açık Tonlar
 fontWeight	Thin	İnce
@@ -3289,6 +3296,7 @@ cameraRaw	Color	Renk
 	Compose	Oluştur
 	Condensed	Yoğunlaştırılmış
 	Conditional Mode Change	Koşullu Mod Değişikliği
+	Background (Default)	Arka plan (varsayılan)
 	Content-Aware Fill	İçeriğe Uygun Dolgu
 	Convert Frames > Video Layers	Çerçeveleri Dönüştür > Video Katmanları
 	Convert to Linked	Bağlantılıya Dönüştür
@@ -3358,6 +3366,7 @@ cameraRaw	Color	Renk
 	How often fastening points are placed by themselves	Sabitleme noktalarının kendi başlarına ne sıklıkla yerleştirildiği
 	ISO Speed	ISO Hızı
 	Image Processor	Görüntü İşlemcisi
+	Include All Subfolders	Tüm Alt Klasörleri Dahil Et
 	In	içinde
 	Install Plug-in	Eklentiyi Yükle
 	Interpret Footage	Görüntüyü Yorumlama
@@ -3642,6 +3651,8 @@ cameraRaw	Whites	Beyazlar
 	Color Picker (Layer Style Color)	Renk Seçici (Katman Stili Rengi)
 	Auto Hide Notifications	Bildirimleri Otomatik Gizle
 	Notification Duration (seconds)	Bildirim Süresi (saniye)
+	Bundle Arrow-Key Nudges	Ok tuşlarıyla kaydırmaları birleştir
+	Nudge Bundle Pause (ms)	Kaydırma birleştirme duraklaması (ms)
 	Appearance Mode	Görünüm Modu
 	Presentation	Sunum
 	Next Appearance Mode	Sonraki Görünüm Modu
@@ -3823,6 +3834,24 @@ cameraData	Lens	Lens
 @plural	{n} step|{n} steps	{n} adım
 @plural	{warning} (+{n} more brush preset warning)|{warning} (+{n} more brush preset warnings)	{warning} (+{n} fırça ön ayarı uyarısı daha)
 @plural	{what} with {n} warning|{what} with {n} warnings	{what}, {n} uyarı ile
+# Edit › Content-Aware Fill workspace
+	Excluded Area	Hariç Tutulan Alan
+	Fill Settings	Dolgu Ayarları
+	Full	Tam
+	Indicates	Gösterir
+	Mirror	Yansıt
+	Output Settings	Çıkış Ayarları
+	Output To	Çıkış Hedefi
+	Rectangular	Dikdörtgen
+	Rotation Adaptation	Döndürme Uyarlaması
+	Sampling Area	Örnekleme Alanı
+	Sampling Area Options	Örnekleme Alanı Seçenekleri
+	Sampling Area Overlay	Örnekleme Alanı Kaplaması
+	Sampling Brush Tool	Örnekleme Fırçası Aracı
+	Show Sampling Area	Örnekleme Alanını Göster
+	Very High	Çok Yüksek
+	Response curve	Yanıt eğrisi
+	Show home recent files	Ana ekranda son dosyaları göster
 	Clear Brush Controls	Fırça Denetimlerini Temizle
 	Reset All Locked Settings	Tüm Kilitli Ayarları Sıfırla
 	Copy Texture to Other Tools	Dokuyu Diğer Araçlara Kopyala
@@ -3876,3 +3905,84 @@ cameraData	Lens	Lens
 	Ink Characteristics	Mürekkep Özellikleri
 	Solidity:	Doluluk:
 	Redrawing	Yeniden çiziliyor
+# Embedded Profile Mismatch: profile names beside the choices, Remember this choice
+	Use the embedded profile ({profile})	Gömülü profili kullanın ({profile})
+	Convert to the working space ({profile})	Çalışma alanına dönüştürün ({profile})
+	Remember this choice for future images	Bu seçimi sonraki görüntüler için hatırla
+	Turn the prompt back on with Ask On Mismatch in Edit › Color Settings.	Soruyu Düzen › Renk Ayarları'ndaki Ask On Mismatch ile yeniden açabilirsiniz.
+	Button Mode	Düğme modu
+	Button Mode On	Düğme modu açık
+
+# Darken / Lighten Interface (⇧⌘F1 / ⇧⌘F2)
+	Darken Interface	Arayüzü koyulaştır
+	Lighten Interface	Arayüzü açıklaştır
+# Bevel & Emboss Technique.
+	Technique	Teknik
+	Chisel Hard	Sert Keski
+	Chisel Soft	Yumuşak Keski
+	Open color-less EXR as ACEScg	Renk bilgisi olmayan EXR'yi ACEScg olarak aç
+
+# View › Guides › right-click a guide
+	Edit Selected Guides	Seçili Kılavuzları Düzenle
+	Clear Selected Guides	Seçili Kılavuzları Temizle
+	Pasting from other apps is unavailable	Diğer uygulamalardan yapıştırma kullanılamıyor
+	PhotoCraft can't reach the system clipboard in this session. On Wayland, a Flatpak sandbox hides the protocol that images from other apps are read through.	PhotoCraft bu oturumda sistem panosuna erişemiyor. Wayland'de Flatpak korumalı alanı, diğer uygulamalardaki görüntülerin okunduğu protokolü gizler.
+	To paste from other apps, start PhotoCraft under XWayland: `{command}`	Diğer uygulamalardan yapıştırmak için PhotoCraft'ı XWayland altında başlatın: `{command}`
+	Nothing to paste: PhotoCraft can't read the system clipboard here	Yapıştırılacak bir şey yok: PhotoCraft burada sistem panosunu okuyamıyor
+	Delete this set	Bu Kümeyi Sil
+	New Set…	Yeni Küme…
+	PhotoCraft Defaults	PhotoCraft Varsayılanları
+	Save a list of these shortcuts as a web page	Bu kısayolların listesini web sayfası olarak kaydet
+	Save the changes to this set	Bu kümedeki değişiklikleri kaydet
+	Save these shortcuts as a .kys file	Bu kısayolları .kys dosyası olarak kaydet
+	Save these shortcuts as a new set	Bu kısayolları yeni bir küme olarak kaydet
+	Set deleted.	Küme silindi.
+	Set saved.	Küme kaydedildi.
+	Set:	Küme:
+	Summarize…	Özetle…
+	There are too many sets: delete one first.	Çok fazla küme var: önce birini silin.
+	set name	küme adı
+	{set} (modified)	{set} (değiştirildi)
+	Show file name in title	Başlıkta dosya adını göster
+	Accept and Go to Conflict	Kabul Et ve Çakışmaya Git
+	Changes undone.	Değişiklikler geri alındı.
+	Choose a new shortcut for this command, or leave it without one.	Bu komut için yeni bir kısayol seçin veya kısayolsuz bırakın.
+	Put this command's shortcuts back as they were	Bu komutun kısayollarını eski haline getir
+	Take the shortcut from the other command and select it	Kısayolu diğer komuttan al ve o komutu seç
+	Undo Changes	Değişiklikleri Geri Al
+	{shortcut} is reserved by the system and can't be assigned.	{shortcut} sistem tarafından ayrılmıştır ve atanamaz.
+	Low-Latency Drawing (vsync off, applies at next launch)	Düşük gecikmeli çizim (dikey eşitleme kapalı, sonraki açılışta geçerli)
+# Free Transform: a new layer while the box is open (#5859)
+	Free Transform is still being applied; try again when it has finished.	Serbest Dönüştürme hâlâ uygulanıyor; bittiğinde yeniden deneyin.
+	The transform couldn't be applied.	Dönüştürme uygulanamadı.
+# Preferences › Performance › GPU Memory; the status bar and slow-redraw notice
+	Its layers need {needed} of GPU memory; the budget leaves them {budget}.	Katmanlarının {needed} GPU belleğine ihtiyacı var; bütçe onlara {budget} bırakıyor.
+	Set GPU Memory in Preferences › Performance to what your graphics card can hold, at most 3/8 of its memory. Automatic follows Memory Usage, within a quarter of this computer's memory and 3/8 of the card's, and doesn't count the document against a card whose memory is known. The status bar shows GPU Memory Full while they don't fit.	Tercihler › Performans içindeki GPU Belleği'ni ekran kartınızın kaldırabileceği miktara, en fazla belleğinin 3/8'ine ayarlayın. Otomatik, Bellek kullanımını izler; bu bilgisayarın belleğinin dörtte biri ve kartın belleğinin 3/8'i içinde kalır, belleği bilinen bir kartta belgeyi hesaba katmaz. Sığmadıkları sürece durum çubuğu GPU Belleği Dolu gösterir.
+	GPU Memory Full	GPU Belleği Dolu
+	The layers need {needed} of GPU memory and may hold {budget}, so edits that redraw the whole document do it on the CPU. Click to set GPU Memory.	Katmanların {needed} GPU belleğine ihtiyacı var ve en fazla {budget} kullanabilirler; bu yüzden tüm belgeyi yeniden çizen düzenlemeler bunu CPU'da yapar. GPU Belleği'ni ayarlamak için tıklayın.
+	GPU memory budget: {budget}	GPU bellek bütçesi: {budget}
+	This document's layers: {needed} of {budget} for layers	Bu belgenin katmanları: katmanlar için {budget} içinden {needed}
+	This document's layers need {needed} but may hold {budget}: whole-document redraws use the CPU	Bu belgenin katmanlarının {needed} belleğe ihtiyacı var ama en fazla {budget} kullanabilirler: tüm belgenin yeniden çizimi CPU'yu kullanır
+	GPU Memory (MB, 0 = Automatic)	GPU Belleği (MB, 0 = Otomatik)
+	{name} was changed by another app after it was opened or saved here.	{name}, burada açıldıktan veya kaydedildikten sonra başka bir uygulama tarafından değiştirildi.
+	Replace it with this document, or cancel and use File › Save As to keep both.	Bu belgeyle değiştirin ya da iptal edip ikisini de korumak için Dosya › Farklı Kaydet'i kullanın.
+	Decrease Brush Size	Fırça boyutunu küçült
+	Increase Brush Size	Fırça boyutunu büyüt
+	Decrease Brush Hardness	Fırça sertliğini azalt
+	Increase Brush Hardness	Fırça sertliğini artır
+	Memory Usage	Bellek kullanımı
+	Per-document RAM limit (MB)	Belge başına RAM sınırı (MB)
+	Installed RAM: {ram} MB; this limit: {percent}%	Kurulu RAM: {ram} MB; bu sınır: {percent}%
+	Limits each open document's pixels plus History. Oldest undo states are discarded when the limit is exceeded.	Her açık belgenin piksellerini ve Geçmişini sınırlar. Sınır aşılınca en eski geri alma durumları atılır.
+	Applies immediately when saved. Memory is not reserved in advance.	Kaydedilince hemen uygulanır. Bellek önceden ayrılmaz.
+	With GPU Memory set to Automatic, this also limits the GPU layer budget. That budget is capped at one quarter of installed RAM and, when known, three eighths of the graphics card's memory, with a 512 MB minimum. Raising this limit beyond those caps does not increase the GPU budget.	GPU Belleği Otomatikken GPU katman bütçesini de sınırlar. Tavan, RAM’in dörtte biri ve biliniyorsa kart belleğinin sekizde üçü, en az 512 MB. Sınırı yükseltmek GPU bütçesini artırmaz.
+	Use	Kullan
+	In Front	Önde
+	Behind	Arkada
+
+# DDS Options (#1327)
+	DDS Options	DDS Seçenekleri
+	Generate Mipmaps	Mipmap oluştur
+
+# Graphics Adapter preference (#1885)
+	GPU adapter	GPU bağdaştırıcısı

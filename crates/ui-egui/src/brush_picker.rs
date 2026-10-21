@@ -166,7 +166,7 @@ pub fn apply(app: &mut PhotocraftApp, ctx: &egui::Context, picks: Vec<Pick>) {
                 crate::brush_preset_dialog::open(app, None);
             }
             Pick::Import => {
-                let _ = app.open_dialog_file();
+                let _ = crate::preset_files_ui::import_brushes(app);
             }
         }
     }

@@ -82,6 +82,27 @@ fn rotate_arbitrary_other_modes() {
 }
 
 #[test]
+fn rotate_arbitrary_keeps_the_background_opaque_with_a_translucent_background_colour() {
+    let mut s = session(40, 20, 8, "rgb");
+    s.execute("tools.setColors", json!({"background": "#00ff0080"})).unwrap();
+    s.execute("image.rotation.arbitrary", json!({"angle": 30})).unwrap();
+    let corner = doc(&s).layers[0].surface().unwrap().rgba(0, 0);
+    assert_eq!(corner, [0.0, 1.0, 0.0, 1.0], "the uncovered corner is opaque background colour");
+}
+
+#[test]
+fn rotate_arbitrary_keeps_the_full_precision_angle() {
+    // Rounded to f32 this angle crosses a whole pixel: 1003 px instead of 1002, so a rotated crop
+    // that sized its canvas with `rotated_size` at f64 would land 1 px off.
+    let angle = 0.114_706_514_493_370_71;
+    let mut s = Session::new();
+    s.execute("file.new", json!({"width": 1000, "height": 1000})).unwrap();
+    let r = s.execute("image.rotation.arbitrary", json!({"angle": angle})).unwrap();
+    assert_eq!(rotated_size(Size::new(1000, 1000), angle), Size::new(1002, 1002));
+    assert_eq!((r["width"].as_u64(), r["height"].as_u64()), (Some(1002), Some(1002)));
+}
+
+#[test]
 fn rotate_arbitrary_rotates_grouped_locked_children_and_preserves_lock() {
     let mut s = Session::new();
     s.execute("file.new", json!({"width": 16, "height": 16, "background": "white"})).unwrap();
@@ -351,6 +372,20 @@ fn duotone_inks_and_display() {
     assert!(doc(&s).duotone.is_none());
     assert_eq!(doc(&s).mode, ColorMode::Grayscale);
     assert!(!session(4, 4, 8, "rgb").is_enabled("image.mode.duotone"));
+}
+
+#[test]
+fn duotone_curve_points_must_be_finite() {
+    let mut s = session(4, 4, 8, "gray");
+    // 1e39 overflows f32 to inf, which the .pcraft writer refuses to save.
+    for curve in [json!([[0, 0], [100, 1e39]]), json!([[0, 0], [1e39, 50]]), json!([[-1e39, 0], [100, 100]])] {
+        let r = s.execute("image.mode.duotone", json!({"type": "monotone", "inks": [{"curve": curve}]}));
+        assert!(r.is_err(), "{curve} accepted");
+        assert_eq!(doc(&s).mode, ColorMode::Grayscale);
+    }
+    s.execute("image.mode.duotone", json!({"type": "monotone", "inks": [{"curve": [[0, 0], [50, 70], [100, 100]]}]})).unwrap();
+    assert_eq!(doc(&s).mode, ColorMode::Duotone);
+    photocraft_format::save_to_bytes(doc(&s), &Default::default()).unwrap();
 }
 
 #[test]

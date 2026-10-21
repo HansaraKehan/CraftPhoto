@@ -384,7 +384,8 @@ fn graph(ui: &mut egui::Ui, d: &mut CameraRawDialog, view: &mut CameraRawScopeSt
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, ui.is_enabled(), tl!("Tone Histogram")));
     ui.painter().rect_filled(rect, t.radius_sm, t.histogram_background());
     let plot = rect.shrink(4.0);
-    crate::rgb_histogram::paint(ui.painter(), plot, d.histogram(), &t);
+    // Camera Raw's scale: the typical columns set it and a shadow or highlight spike runs off the top.
+    crate::rgb_histogram::paint_with(ui.painter(), plot, d.histogram(), &t, crate::rgb_histogram::Spikes::Clip);
     let corner = 18.0;
     if let Some(sample) = d.hover_sample(false) {
         crate::rgb_histogram::paint_sample(ui.painter(), plot, sample.rgb, &t);

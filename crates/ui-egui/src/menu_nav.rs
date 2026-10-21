@@ -50,13 +50,17 @@ pub struct Row {
     pub command: Option<String>,
     /// Where it was drawn (scrolled out of view when outside its level's `views` rect).
     pub rect: Rect,
+    /// The letter that runs it from the keyboard ([`crate::menu_keys`]), upper case.
+    pub mnemonic: Option<char>,
 }
 
 /// Keyboard / highlight state of the open menu.
 #[derive(Clone, Debug, Default)]
 pub struct Nav {
     /// The open top-level menu (index into the menu bar).
-    top: Option<usize>,
+    pub(crate) top: Option<usize>,
+    /// Underline the rows' mnemonics this frame ([`crate::menu_keys`]).
+    pub underline: bool,
     /// Popup ids of the top-level menus, from the last frame.
     tops: Vec<Id>,
     /// The level the arrow keys move in (0 = the top-level menu).
@@ -146,7 +150,15 @@ impl Nav {
     /// Draw a row of `level` with `add`, highlighted like a hovered row when the keyboard (or the
     /// pointer) is on it, and register it for the keys. `add` returns the row's response. A row
     /// without a `command` opens a submenu.
-    pub fn row<R>(&mut self, ui: &mut Ui, level: usize, enabled: bool, command: Option<&str>, add: impl FnOnce(&mut Ui, &mut Nav) -> (egui::Response, R)) -> R {
+    pub fn row<R>(
+        &mut self,
+        ui: &mut Ui,
+        level: usize,
+        enabled: bool,
+        command: Option<&str>,
+        mnemonic: Option<char>,
+        add: impl FnOnce(&mut Ui, &mut Nav) -> (egui::Response, R),
+    ) -> R {
         let i = self.rows.get(level).map_or(usize::MAX, Vec::len);
         // While a submenu is kept open for the pointer heading to it, its row stays lit and the
         // rows crossed on the way don't light up.
@@ -166,7 +178,7 @@ impl Nav {
             self.aim(level, i, root, open, &r);
         }
         if let Some(rows) = self.rows.get_mut(level) {
-            rows.push(Row { widget: r.id, enabled, command: command.map(str::to_string), rect: r.rect });
+            rows.push(Row { widget: r.id, enabled, command: command.map(str::to_string), rect: r.rect, mnemonic });
             if let Some(index) = held {
                 self.set_hi(level, Some(index));
             } else {
@@ -278,6 +290,24 @@ impl Nav {
     }
 
     /// Open the highlighted submenu of `level` and move the keyboard into it.
+    /// Light the first enabled row of `level` once it has been drawn (a menu opened from the
+    /// keyboard, as on Windows).
+    pub(crate) fn highlight_first(&mut self, level: usize) {
+        self.first_at = Some(level);
+    }
+
+    /// The enabled row of the level the arrows are in whose mnemonic is `c`.
+    pub(crate) fn row_with_mnemonic(&self, c: char) -> Option<Row> {
+        let level = self.level.min(self.rows.len().saturating_sub(1));
+        self.rows.get(level)?.iter().find(|r| r.enabled && r.mnemonic == Some(c)).cloned()
+    }
+
+    /// Open the submenu of row `widget` of the level the arrows are in.
+    pub(crate) fn open_sub_row(&mut self, ctx: &egui::Context, widget: Id) {
+        let level = self.level.min(self.rows.len().saturating_sub(1));
+        self.open_sub(ctx, level, widget);
+    }
+
     fn open_sub(&mut self, ctx: &egui::Context, level: usize, widget: Id) {
         let Some(&root) = self.roots.get(level) else { return };
         let sub = SubMenu::id_from_widget_id(widget);
@@ -306,7 +336,10 @@ impl Nav {
         let Some(top) = self.top.filter(|_| !tops.is_empty()) else { return };
         let level = self.level.min(self.rows.len().saturating_sub(1));
         self.level = level;
-        let press = |k: Key| ctx.input_mut(|i| i.consume_key(Modifiers::NONE, k));
+        // A text field in the menu (Help › Search) keeps the keys that edit it: ← / → move its
+        // cursor and Space types a space.
+        let typing = ctx.text_edit_focused();
+        let press = |k: Key| !(typing && matches!(k, Key::ArrowLeft | Key::ArrowRight | Key::Space)) && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, k));
         let current = self.highlighted(level).and_then(|i| self.rows.get(level)?.get(i)).cloned();
         let switch = |by: usize| {
             let n = tops.len();

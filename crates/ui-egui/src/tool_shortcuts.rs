@@ -94,3 +94,17 @@ mod tests {
         assert_eq!(h.state().ui.status, "q");
     }
 }
+
+#[cfg(test)]
+mod engine_table_tests {
+    use super::*;
+
+    /// The engine knows the tools as data (headless shortcut sets); it must match the toolbar.
+    #[test]
+    fn the_engines_tool_table_matches_the_tools() {
+        let ours: Vec<(String, &str, Option<String>)> = Tool::ALL.into_iter().map(|t| (id(t), t.label(), default(t))).collect();
+        let engine: Vec<(String, &str, Option<String>)> =
+            photocraft_engine::shell_commands::TOOLS.iter().map(|(i, n, k)| (i.to_string(), *n, k.map(str::to_string))).collect();
+        assert_eq!(ours, engine, "update photocraft_engine::shell_commands::TOOLS");
+    }
+}

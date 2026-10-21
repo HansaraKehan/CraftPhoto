@@ -645,7 +645,7 @@ pub fn swapped(r: [f64; 4]) -> [f64; 4] {
 /// no ratio is set; "original" becomes the document's size turned on its side.
 pub fn swapped_ratio(key: &str, doc_w: f64, doc_h: f64) -> Option<String> {
     let (w, h) = crate::chrome_ui::crop_ratio(key, doc_w, doc_h).filter(|(w, h)| w.is_finite() && h.is_finite() && *w > 0.0 && *h > 0.0)?;
-    Some(format!("{}:{}", crate::widgets::fmt_num(h), crate::widgets::fmt_num(w)))
+    Some(format!("{}:{}", crate::crop_size::fmt_ratio(h), crate::crop_size::fmt_ratio(w)))
 }
 
 /// X: swaps the pending frame between portrait and landscape about its centre, keeping its angle,
@@ -881,8 +881,9 @@ pub fn cursor(app: &PhotocraftApp, p: [f64; 2]) -> Option<CursorIcon> {
         None => hit_turned(app.ui.crop_rect?, deg, p, tolerance(app)),
     };
     Some(match h {
-        // The arrow as the handle faces on screen: the frame's turn plus the view's.
-        Hit::Handle(hx, hy) => resize_icon(hx, hy, deg + f64::from(crate::crop_mode::view_rotation(app))),
+        // The arrow as the handle faces on screen: the frame's turn plus the view's, mirrored when
+        // the view is flipped.
+        Hit::Handle(hx, hy) => resize_icon(hx, hy, deg + f64::from(crate::crop_mode::view_rotation(app)), app.ui.view.flip_horizontal),
         // Inside the untouched default frame a drag draws a new one (`pointer`), so nothing moves (#4461).
         Hit::Inside if app.crop.default_frame => CursorIcon::Crosshair,
         Hit::Inside => CursorIcon::Move,
@@ -947,9 +948,12 @@ pub fn draw_turn_cursor(ctx: &egui::Context, p: egui::Pos2, toward: egui::Vec2) 
 }
 
 /// The resize arrow for handle (`hx`, `hy`) of a frame turned `deg` degrees: the handle's outward
-/// direction, turned with the frame, to the nearest of the four arrows.
-fn resize_icon(hx: i8, hy: i8, deg: f64) -> CursorIcon {
+/// direction, turned with the frame and mirrored by a flipped view (`flip`), to the nearest of the
+/// four arrows.
+fn resize_icon(hx: i8, hy: i8, deg: f64, flip: bool) -> CursorIcon {
     let d = turn([f64::from(hx), f64::from(hy)], [0.0, 0.0], deg);
+    // View › Flip Horizontal mirrors the screen after the turn.
+    let d = if flip { [-d[0], d[1]] } else { d };
     let a = d[1].atan2(d[0]).rem_euclid(std::f64::consts::PI);
     match ((a / std::f64::consts::FRAC_PI_4).round() as i64).rem_euclid(4) {
         0 => CursorIcon::ResizeHorizontal,
@@ -1203,10 +1207,10 @@ mod tests {
         let b = turned_bounds(r, 90.0);
         assert!((b[0] - 50.0).abs() < 1e-9 && (b[3] - 80.0).abs() < 1e-9, "{b:?}");
         // Handle arrows turn with the frame.
-        assert_eq!(resize_icon(1, 0, 0.0), CursorIcon::ResizeHorizontal);
-        assert_eq!(resize_icon(1, 0, 90.0), CursorIcon::ResizeVertical);
-        assert_eq!(resize_icon(1, 0, 45.0), CursorIcon::ResizeNwSe);
-        assert_eq!(resize_icon(-1, -1, 90.0), CursorIcon::ResizeNeSw);
+        assert_eq!(resize_icon(1, 0, 0.0, false), CursorIcon::ResizeHorizontal);
+        assert_eq!(resize_icon(1, 0, 90.0, false), CursorIcon::ResizeVertical);
+        assert_eq!(resize_icon(1, 0, 45.0, false), CursorIcon::ResizeNwSe);
+        assert_eq!(resize_icon(-1, -1, 90.0, false), CursorIcon::ResizeNeSw);
         assert_eq!(normalized_angle(540.0), 180.0);
         assert_eq!(normalized_angle(-190.0), 170.0);
         assert_eq!(normalized_angle(f64::NAN), 0.0);
@@ -1269,6 +1273,29 @@ mod tests {
             assert!(red.is_some(), "{depth:?}: no red at the centre");
             app.run("edit.undo", json!({})).unwrap();
             assert_eq!(app.session.active().unwrap().doc.size, Size::new(200, 100), "{depth:?}");
+        }
+    }
+
+    /// Fill › Content-Aware Fill (#3823): ↵ on an extending frame fills the added canvas from the
+    /// image instead of the background colour; Background (Default) keeps the colour.
+    #[test]
+    fn commit_passes_the_fill_choice() {
+        for content_aware in [false, true] {
+            let mut app = app(SampleType::U16);
+            app.run("tools.setColors", json!({"foreground": "#808080", "background": "#000000"})).unwrap();
+            app.run("edit.fill", json!({"contents": "foreground"})).unwrap();
+            app.ui.tool_options.crop_content_aware = content_aware;
+            app.ui.crop_rect = Some([-10.0, -10.0, 210.0, 110.0]);
+            app.crop.default_frame = false;
+            crate::canvas::commit_crop(&mut app);
+            let st = app.session.active().unwrap();
+            assert_eq!((st.doc.size.width, st.doc.size.height), (220, 120));
+            let corner = st.doc.layers[0].surface().unwrap().rgba(0, 0);
+            if content_aware {
+                assert!((corner[0] - 0.5).abs() < 0.05, "filled from the grey image: {corner:?}");
+            } else {
+                assert!(corner[0] < 0.05, "the background colour: {corner:?}");
+            }
         }
     }
 
@@ -1698,6 +1725,22 @@ mod tests {
     }
 
     #[test]
+    fn enter_during_a_drag_ends_the_drag() {
+        // ↵ while the frame is still being dragged commits it; the release after must not bring
+        // back a frame in the old document's coordinates as a pending crop.
+        let mut app = app(SampleType::U8);
+        app.ui.crop_rect = Some([20.0, 20.0, 120.0, 70.0]);
+        tool_event(&mut app, ToolEvent::Down { x: 50.0, y: 40.0, pressure: 1.0 }, NONE);
+        tool_event(&mut app, ToolEvent::Move { x: 60.0, y: 40.0, pressure: 1.0 }, NONE);
+        crate::canvas::commit_crop(&mut app);
+        tool_event(&mut app, ToolEvent::Up { x: 60.0, y: 40.0 }, NONE);
+        ensure_frame(&mut app);
+        assert_eq!(app.session.active().unwrap().doc.size, Size::new(100, 50));
+        assert_eq!(app.ui.crop_rect, Some([0.0, 0.0, 100.0, 50.0]));
+        assert!(!pending(&app));
+    }
+
+    #[test]
     fn degenerate_and_bad_input_never_panics() {
         let mut app = app(SampleType::U8);
         for r in [[0.0; 4], [5.0, 5.0, 5.0, 5.0], [10.0, 10.0, 0.0, 0.0], [f64::NAN, 0.0, 10.0, 10.0], [f64::INFINITY, 0.0, f64::MAX, 1e300]] {
@@ -1786,6 +1829,12 @@ mod tests {
         assert_eq!(cursor(&app, [60.0, 60.0]), Some(CursorIcon::ResizeVertical));
         assert_eq!(cursor(&app, [60.0, 40.0]), Some(CursorIcon::Move));
         assert_eq!(cursor(&app, [150.0, 40.0]), Some(CursorIcon::None), "outside: the drawn turn cursor");
+        // View › Flip Horizontal shows the top-left corner at the top right: its arrow mirrors too.
+        app.ui.view.flip_horizontal = true;
+        assert_eq!(cursor(&app, [20.0, 20.0]), Some(CursorIcon::ResizeNeSw), "flipped view");
+        assert_eq!(cursor(&app, [100.0, 20.0]), Some(CursorIcon::ResizeNwSe), "flipped view");
+        assert_eq!(cursor(&app, [60.0, 60.0]), Some(CursorIcon::ResizeVertical), "flipped view");
+        app.ui.view.flip_horizontal = false;
         app.ui.tool = Tool::Brush;
         assert_eq!(cursor(&app, [60.0, 40.0]), None);
     }
@@ -1916,6 +1965,7 @@ mod tests {
         app.ui.tool_options.crop_ratio = String::new();
         assert!(swap_orientation(&mut app));
         assert_eq!(app.ui.tool_options.crop_ratio, "", "no ratio stays none");
+        assert_eq!(swapped_ratio("1.414:1", 1.0, 1.0).as_deref(), Some("1:1.414"), "decimals survive the swap (#6487)");
         assert_eq!(swapped_ratio("0:5", 1.0, 1.0), None);
         assert_eq!(swapped_ratio("nonsense", 1.0, 1.0), None);
         // No frame, or another tool: X is Switch Foreground and Background Colors.

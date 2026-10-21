@@ -187,6 +187,17 @@ fn detect_magic_hdr() {
     assert_eq!(detect(b"#?RGBE\n"), Some(Format::Hdr));
 }
 #[test]
+fn detect_magic_cineon() {
+    let mut b = vec![0u8; 208];
+    b[0..4].copy_from_slice(&[0x80, 0x2A, 0x5F, 0xD7]);
+    assert_eq!(detect(&b), Some(Format::Cineon));
+    assert_eq!(from_extension("scan.CIN"), Some(Format::Cineon));
+    assert!(caps(Format::Cineon).read && !caps(Format::Cineon).write, "Cineon is read-only");
+    assert!(ASYMMETRIC_EXCEPTIONS.iter().any(|(f, _)| *f == Format::Cineon));
+    // A bare magic is an error, never a panic.
+    assert!(decode_as(Format::Cineon, &b).is_err());
+}
+#[test]
 fn detect_magic_avif() {
     assert_eq!(detect(b"\0\0\0\x1cftypavif\0\0\0\0avifmif1miaf"), Some(Format::Avif));
     assert_eq!(detect(b"\0\0\0\x1cftypavis\0\0\0\0avismsf1miaf"), Some(Format::Avif));

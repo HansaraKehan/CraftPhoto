@@ -1,5 +1,6 @@
 //! Formats delegated to the `image` crate (pure-Rust features only):
-//! GIF, BMP, TGA, ICO, QOI, Radiance HDR, and AVIF encode (feature `avif`).
+//! GIF, BMP, TGA, ICO, QOI, Radiance HDR, and AVIF encode (feature `avif`). Targa is written by
+//! [`super::tga`] and only read here.
 
 use std::io::Cursor;
 
@@ -163,6 +164,10 @@ pub(crate) fn encode(f: Format, src: &Image, plan: Plan, opts: &EncodeOptions) -
         return Err(CodecError::encode(f, format!("dimensions exceed {mw}x{mh}")));
     }
     let img = src.converted(plan.layout, plan.sample);
+    // Targa is written by our encoder: the image crate's RLE packets cross scanlines (#6382).
+    if f == Format::Tga {
+        return super::tga::encode(&img);
+    }
     let dynimg = to_dynamic(&img)?;
     let mut cursor = Cursor::new(Vec::new());
     match f {

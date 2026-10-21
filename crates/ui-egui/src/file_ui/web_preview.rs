@@ -60,8 +60,8 @@ pub fn prepare_table(app: &PhotocraftApp, f: &mut Map<String, Value>) -> Result<
         let (doc, _, _) = web_cmds::web_document(&st.doc, &proxy, &settings).map_err(|e| e.to_string())?;
         f.insert("__paletteApproximate".into(), json!(scale < 1.0));
         let buf = photocraft_compose::flatten(&doc);
-        let mut optimized =
-            web_cmds::optimize(&buf.px, doc.size.width as usize, doc.bounds(), &settings, None, None, doc.resolution_dpi, false).map_err(|e| e.to_string())?;
+        let mut optimized = web_cmds::optimize(&buf.px, doc.size.width as usize, doc.bounds(), &settings, None, None, None, doc.resolution_dpi, false)
+            .map_err(|e| e.to_string())?;
         // Tiny transparent features may disappear in the proxy; keep room for their index.
         if settings.transparency {
             optimized.color_table.truncate(255);
@@ -137,7 +137,7 @@ pub fn optimized(ui: &mut egui::Ui, key: egui::Id, signature: &str, p: &Value, p
     } else {
         let settings = WebSettings::from_params(&base, "preview").map_err(|e| e.to_string())?;
         let encoded = Arc::new(
-            web_cmds::optimize(px, w as usize, photocraft_geom::Rect::new(0, 0, w as i32, h as i32), &settings, None, None, 72.0, true)
+            web_cmds::optimize(px, w as usize, photocraft_geom::Rect::new(0, 0, w as i32, h as i32), &settings, None, None, None, 72.0, true)
                 .map_err(|e| e.to_string())?,
         );
         ui.data_mut(|d| d.insert_temp(key, (signature, encoded.clone())));

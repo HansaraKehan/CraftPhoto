@@ -105,7 +105,7 @@ fn indexed_bmp_opens_with_its_color_table() {
 #[test]
 fn indexed_png_opens_with_its_color_table() {
     let pal = [[10, 20, 30], [200, 100, 50], [7, 8, 9], [0, 255, 0]];
-    let png = photocraft_codecs::encode_png_indexed(2, 2, &[1, 0, 2, 1], &pal, Some(2), None).unwrap();
+    let png = photocraft_codecs::encode_png_indexed(2, 2, &[1, 0, 2, 1], &pal, Some(2), None, None).unwrap();
     let doc = import("indexed.png", &png).unwrap().document;
     assert_eq!(doc.mode, ColorMode::Indexed);
     assert_eq!(doc.depth, SampleType::U8);
@@ -116,6 +116,60 @@ fn indexed_png_opens_with_its_color_table() {
     let px = s.rgba(0, 0);
     assert!((px[0] - 200.0 / 255.0).abs() < 1e-6 && (px[3] - 1.0).abs() < 1e-6);
     assert_eq!(s.rgba(0, 1)[3], 0.0, "the tRNS entry is transparent");
+}
+
+/// A 2 × 2 GIF89a of palette indices `idx` over `pal` (padded to 4 entries), with `transparent`
+/// set through a Graphic Control Extension. Its LZW stream clears before every pixel, so every
+/// code stays 3 bits: the simplest valid stream any decoder reads.
+fn indexed_gif(pal: &[[u8; 3]; 4], idx: [u8; 4], transparent: Option<u8>) -> Vec<u8> {
+    let mut b = b"GIF89a".to_vec();
+    b.extend([2, 0, 2, 0, 0x81, 0, 0]); // 2 × 2, global table of 4
+    pal.iter().for_each(|c| b.extend(c));
+    if let Some(t) = transparent {
+        b.extend([0x21, 0xF9, 4, 0x01, 0, 0, t, 0]);
+    }
+    b.extend([0x2C, 0, 0, 0, 0, 2, 0, 2, 0, 0]);
+    let (clear, end) = (4u32, 5u32);
+    let codes: Vec<u32> = idx.iter().flat_map(|&i| [clear, u32::from(i)]).chain([end]).collect();
+    let (mut bits, mut n, mut data) = (0u32, 0u32, Vec::new());
+    for c in codes {
+        bits |= c << n;
+        n += 3;
+        while n >= 8 {
+            data.push((bits & 0xFF) as u8);
+            bits >>= 8;
+            n -= 8;
+        }
+    }
+    if n > 0 {
+        data.push(bits as u8);
+    }
+    b.push(2); // LZW minimum code size
+    b.push(data.len() as u8);
+    b.extend(&data);
+    b.extend([0, 0x3B]);
+    b
+}
+
+/// An indexed GIF opens in Indexed Color mode with its colour table and transparent entry, as a
+/// palette PNG does (#7886); it used to open as RGB.
+#[test]
+fn indexed_gif_opens_with_its_color_table() {
+    let pal = [[10, 20, 30], [200, 100, 50], [7, 8, 9], [0, 255, 0]];
+    let doc = import("indexed.gif", &indexed_gif(&pal, [1, 0, 2, 1], Some(2))).unwrap().document;
+    assert_eq!(doc.mode, ColorMode::Indexed);
+    assert_eq!(doc.depth, SampleType::U8);
+    let table = doc.color_table.as_ref().unwrap();
+    assert_eq!(table.colors, pal, "every entry, used or not");
+    assert_eq!(table.transparent, Some(2));
+    let s = doc.layers[0].surface().unwrap();
+    let px = s.rgba(0, 0);
+    assert!((px[0] - 200.0 / 255.0).abs() < 1e-6 && (px[3] - 1.0).abs() < 1e-6, "{px:?}");
+    assert_eq!(s.rgba(0, 1)[3], 0.0, "the transparent entry is transparent");
+    // Without a transparent entry, the table alone.
+    let doc = import("opaque.gif", &indexed_gif(&pal, [3, 3, 0, 1], None)).unwrap().document;
+    assert_eq!(doc.mode, ColorMode::Indexed);
+    assert_eq!(doc.color_table.as_ref().unwrap().transparent, None);
 }
 
 /// FITS header cards travel as the document's text metadata, so an astro frame keeps its
@@ -396,8 +450,8 @@ fn transparent_flat_images_open_as_layer_0() {
         ("ga.png", enc(ChannelLayout::GrayA, CS::U8, Format::Png), true),
         ("a.tif", enc(ChannelLayout::Rgba, CS::U8, Format::Tiff), true),
         ("ga.tif", enc(ChannelLayout::GrayA, CS::U16, Format::Tiff), true),
-        ("pal.png", photocraft_codecs::encode_png_indexed(w, h, &[0, 1].repeat(n / 2), &[[255, 0, 0], [0, 0, 255]], Some(0), None).unwrap(), true),
-        ("pal_opaque.png", photocraft_codecs::encode_png_indexed(w, h, &[0, 1].repeat(n / 2), &[[255, 0, 0], [0, 0, 255]], None, None).unwrap(), false),
+        ("pal.png", photocraft_codecs::encode_png_indexed(w, h, &[0, 1].repeat(n / 2), &[[255, 0, 0], [0, 0, 255]], Some(0), None, None).unwrap(), true),
+        ("pal_opaque.png", photocraft_codecs::encode_png_indexed(w, h, &[0, 1].repeat(n / 2), &[[255, 0, 0], [0, 0, 255]], None, None, None).unwrap(), false),
         ("rgb.png", enc(ChannelLayout::Rgb, CS::U8, Format::Png), false),
         ("g.png", enc(ChannelLayout::Gray, CS::U16, Format::Png), false),
         ("rgb.tif", enc(ChannelLayout::Rgb, CS::U8, Format::Tiff), false),
@@ -610,6 +664,73 @@ fn linear_gray_export_preserves_alpha_and_embeddable_profiles() {
     }
 }
 
+/// WebP can embed RGB profiles, but expanding gray to RGB drops a gray profile. Its untagged
+/// RGB samples must use the sRGB transfer function, not the source gray encoding.
+#[test]
+fn linear_gray_webp_exports_use_display_encoding() {
+    use photocraft_codecs::{ChannelLayout, EncodeOptions};
+    for depth in [SampleType::U8, SampleType::U16, SampleType::F32] {
+        for alpha in [1.0, 0.5] {
+            let mut d = columns(ColorMode::Grayscale, depth, &[&[0.25, alpha], &[0.5, alpha]]);
+            d.icc_profile = Some(photocraft_cms::builtin::linear_gray().to_bytes());
+            let stored = column_pixels(&d, 2);
+            for lossless in [true, false] {
+                let opts = ExportOptions { encode: EncodeOptions { webp_lossless: lossless, webp_quality: 100, ..Default::default() }, ..Default::default() };
+                let r = export(&d, "webp", &opts).unwrap();
+                let img = photocraft_codecs::decode(&r.bytes).unwrap();
+                let what = format!("{depth:?}, alpha {alpha}, lossless {lossless}");
+                assert_eq!(img.layout(), if alpha == 1.0 { ChannelLayout::Rgb } else { ChannelLayout::Rgba }, "{what}");
+                assert_eq!(img.icc, None, "{what}: a gray ICC cannot describe RGB samples");
+                let values = img.to_normalized();
+                let stride = img.layout().channels();
+                let tolerance = if lossless { 1.5 / 255.0 } else { 3.0 / 255.0 };
+                for (i, src) in stored.iter().enumerate() {
+                    let offset = (8 * img.width() as usize + 16 * i + 8) * stride;
+                    let expected = photocraft_color::convert::linear_to_srgb(src[0]);
+                    for &value in &values[offset..offset + 3] {
+                        assert!((value - expected).abs() <= tolerance, "{what}, pixel {i}: got {value}, expected {expected}");
+                    }
+                    if img.layout().has_alpha() {
+                        assert!((values[offset + 3] - src[1]).abs() <= 1.0 / 255.0, "{what}: alpha changed");
+                    }
+                }
+                assert!(r.warnings.iter().any(|w| w.contains("converted to sGray")), "{what}: {:?}", r.warnings);
+            }
+        }
+    }
+}
+
+#[test]
+fn default_gray_webp_exports_keep_samples() {
+    for depth in [SampleType::U8, SampleType::U16, SampleType::F32] {
+        for icc in [None, Some(photocraft_cms::Builtin::SGray.profile().to_bytes())] {
+            let mut d = columns(ColorMode::Grayscale, depth, &[&[0.25, 0.5], &[0.5, 1.0]]);
+            d.icc_profile = icc;
+            let stored = column_pixels(&d, 2);
+            let r = export(&d, "webp", &ExportOptions::default()).unwrap();
+            let img = photocraft_codecs::decode(&r.bytes).unwrap();
+            assert_eq!(img.icc, None, "{depth:?}: a gray ICC cannot describe RGB samples");
+            let back = import("gray.webp", &r.bytes).unwrap().document;
+            let want: Vec<Vec<f32>> = stored.iter().map(|p| vec![p[0], p[0], p[0], p[1]]).collect();
+            assert_colors(&column_pixels(&back, 2), &want, 1.0 / 255.0, &format!("{depth:?}: sGray samples"));
+            assert!(!r.warnings.iter().any(|w| w.contains("converted to sGray")), "{depth:?}: {:?}", r.warnings);
+        }
+    }
+}
+
+#[test]
+fn rgb_webp_exports_keep_embeddable_profiles() {
+    for depth in [SampleType::U8, SampleType::U16, SampleType::F32] {
+        let mut d = columns(ColorMode::Rgb, depth, &[&[0.25, 0.5, 0.75, 0.5]]);
+        d.icc_profile = Some(photocraft_cms::Builtin::LinearSrgb.profile().to_bytes());
+        let r = export(&d, "webp", &ExportOptions::default()).unwrap();
+        let back = import("rgb.webp", &r.bytes).unwrap().document;
+        assert_eq!(back.icc_profile, d.icc_profile, "{depth:?}: WebP keeps RGB ICC");
+        assert_colors(&column_pixels(&back, 1), &column_pixels(&d, 1), 1.0 / 255.0, &format!("{depth:?}: RGB samples"));
+        assert!(!r.warnings.iter().any(|w| w.contains("converted to sRGB")), "{depth:?}: {:?}", r.warnings);
+    }
+}
+
 /// #518: a JPEG cut off inside its image data opens with a warning, never silently.
 #[test]
 fn truncated_jpeg_imports_with_a_warning() {
@@ -621,6 +742,37 @@ fn truncated_jpeg_imports_with_a_warning() {
         assert_eq!(r.document.size, photocraft_geom::Size::new(32, 16));
         assert!(r.warnings.first().is_some_and(|w| w.starts_with("JPEG data ends early")), "{mode:?}: {:?}", r.warnings);
     }
+}
+
+/// Guides stored by Photoshop in a JPEG's APP13 resources (resource 1032) open as document guides.
+#[test]
+fn jpeg_photoshop_guides_open_as_document_guides() {
+    let full = export(&smooth(ColorMode::Rgb), "jpg", &ExportOptions::default()).unwrap().bytes;
+    assert!(import("x.jpg", &full).unwrap().document.guides.vertical.is_empty());
+    // Version, grid 576 x 576, two guides in 1/32 px: vertical at 10, horizontal at 5.
+    let mut guides = Vec::new();
+    for v in [1u32, 576, 576, 2] {
+        guides.extend_from_slice(&v.to_be_bytes());
+    }
+    guides.extend_from_slice(&(10i32 * 32).to_be_bytes());
+    guides.push(0);
+    guides.extend_from_slice(&(5i32 * 32).to_be_bytes());
+    guides.push(1);
+    let mut res = b"8BIM".to_vec();
+    res.extend_from_slice(&1032u16.to_be_bytes());
+    res.extend_from_slice(&[0, 0]);
+    res.extend_from_slice(&(guides.len() as u32).to_be_bytes());
+    res.extend_from_slice(&guides);
+    let mut seg = b"Photoshop 3.0\0".to_vec();
+    seg.extend_from_slice(&res);
+    let mut jpeg = full[..2].to_vec();
+    jpeg.extend_from_slice(&[0xFF, 0xED]);
+    jpeg.extend_from_slice(&((seg.len() + 2) as u16).to_be_bytes());
+    jpeg.extend_from_slice(&seg);
+    jpeg.extend_from_slice(&full[2..]);
+    let g = import("x.jpg", &jpeg).unwrap().document.guides;
+    assert_eq!(g.vertical, vec![10.0]);
+    assert_eq!(g.horizontal, vec![5.0]);
 }
 
 /// A GIF of `frames` identical 1x1 black frames.
@@ -983,13 +1135,31 @@ fn tga_default_bits_follow_the_alpha_channels() {
 }
 
 #[test]
+fn a_lab_document_is_written_as_a_lab_tiff_and_opens_as_lab() {
+    // #4936: TIFF stores CIE L*a*b* (CIELab): a Lab document with one layer keeps its pixels.
+    for depth in [SampleType::U8, SampleType::U16] {
+        let d = single(ColorMode::Lab, depth, false);
+        let r = export(&d, "tif", &ExportOptions::default()).unwrap();
+        assert!(r.warnings.iter().all(|w| !w.contains("sRGB") && !w.contains("flattened")), "{depth:?}: {:?}", r.warnings);
+        let back = import("x.tif", &r.bytes).unwrap().document;
+        assert_eq!((back.mode, back.depth), (ColorMode::Lab, depth));
+        pixels_eq(&d, &back, if depth == SampleType::U8 { 0.0 } else { 1.5 / 65535.0 });
+    }
+    // Other formats still go through sRGB.
+    let r = export(&single(ColorMode::Lab, SampleType::U8, false), "png", &ExportOptions::default()).unwrap();
+    assert!(r.warnings.iter().any(|w| w.contains("sRGB")), "{:?}", r.warnings);
+}
+
+#[test]
 fn a_lab_document_with_one_layer_is_not_reported_as_flattened() {
-    // Lab always goes through the sRGB composite, but a lone layer loses nothing to it.
+    // A lone layer loses nothing: TIFF keeps it as Lab, the others go through the sRGB composite.
     let d = single(ColorMode::Lab, SampleType::U8, false);
     for ext in ["tif", "png", "jpg"] {
         let r = export(&d, ext, &ExportOptions::default()).unwrap();
         assert!(r.warnings.iter().all(|w| !w.contains("flattened")), "{ext}: {:?}", r.warnings);
-        assert!(r.warnings.iter().any(|w| w.contains("Lab composite written as sRGB")), "{ext}: {:?}", r.warnings);
+        if ext != "tif" {
+            assert!(r.warnings.iter().any(|w| w.contains("Lab composite written as sRGB")), "{ext}: {:?}", r.warnings);
+        }
     }
     // Two layers are flattened, and say so.
     let mut two = single(ColorMode::Lab, SampleType::U8, false);
@@ -997,4 +1167,23 @@ fn a_lab_document_with_one_layer_is_not_reported_as_flattened() {
     two.layers.push(raster("Top", fmt, two.bounds(), 5, true));
     let r = export(&two, "tif", &ExportOptions::default()).unwrap();
     assert!(r.warnings.iter().any(|w| w.contains("2 layer(s) flattened")), "{:?}", r.warnings);
+}
+
+#[test]
+fn a_stereo_png_keeps_its_stereo_mark_on_save() {
+    use photocraft_codecs::{ChannelLayout, EncodeOptions, Format, Image, PngStereo, SampleType as CS};
+    let img = Image::from_raw(4, 2, ChannelLayout::Rgb, CS::U8, vec![40u8; 24]).unwrap();
+    for view in [PngStereo::Horizontal, PngStereo::Vertical] {
+        let bytes = photocraft_codecs::encode(&img, Format::Png, &EncodeOptions { png_stereo: Some(view), ..Default::default() }).unwrap();
+        let doc = import("stereo.png", &bytes).unwrap().document;
+        assert_eq!(doc.file_encoding.png_stereo, Some(view.mode()));
+        // What File > Save does: reuse the settings the file was opened with (#6063).
+        let mut opts = ExportOptions::default();
+        apply_file_encoding(&doc, &mut opts.encode);
+        let r = export(&doc, "png", &opts).unwrap();
+        assert_eq!(photocraft_codecs::png_stereo(&r.bytes), Some(view), "{view:?}");
+    }
+    // An ordinary PNG gains no mark.
+    let plain = export(&single(ColorMode::Rgb, SampleType::U8, false), "png", &ExportOptions::default()).unwrap();
+    assert_eq!(photocraft_codecs::png_stereo(&plain.bytes), None);
 }

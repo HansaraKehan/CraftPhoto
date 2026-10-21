@@ -25,10 +25,8 @@ type P = (f64, f64);
 pub fn trace_mask(values: &[f32], rect: Rect, outside: f32, tolerance: f64) -> Path {
     let loops = contours(values, rect, outside);
     let mut subpaths = Vec::new();
+    // `contours` only returns loops of three or more points.
     for (i, lp) in loops.iter().enumerate() {
-        if lp.len() < 3 {
-            continue;
-        }
         // Fit to half the tolerance: the worst point may deviate by the full amount only rarely.
         let mut s = fit_closed(lp, (tolerance * 0.5).max(0.05), 1.5);
         s.op = if i == 0 { PathOp::Combine } else { PathOp::Exclude };

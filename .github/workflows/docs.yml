@@ -27,6 +27,7 @@ concurrency:
 
 jobs:
   build:
+    timeout-minutes: 15
     name: mdBook build
     runs-on: ubuntu-latest
     steps:

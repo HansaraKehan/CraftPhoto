@@ -17,7 +17,7 @@ id = "TOOL-213-2"
 target = "Mixer Brush tool on the toolbar"
 status = "done"
 issue = 213
-note = "Tool::MixerBrush in the Brush (B) flyout; Wet/Load/Mix/Flow/Sample All Layers options, command/control dispatch and selection-clipping tests"
+note = "Tool::MixerBrush in the Brush (B) flyout; Wet/Load/Mix/Flow/Sample All Layers options, the Current Brush Load swatch with Load Brush and Clean Brush (brush.mixer.load, brush.mixer.clean) and the automatic Load and Clean toggles; command/control dispatch and selection-clipping tests"
 
 [[item]]
 id = "TOOL-213-3"
@@ -78,16 +78,16 @@ note = "brush_resize.rs (#297, #370): Alt+right-drag, or Control+Option-drag on 
 [[item]]
 id = "TOOL-213-11"
 target = "Editable pressure curve, global and per control"
-status = "partial"
+status = "done"
 issue = 213
-note = "Global: Preferences › Tools › Pressure Curve (prefs tools.pressureCurve; monotone cubic, engine prefs::PressureCurve; applied to every pen sample in ui-egui stylus.rs before any brush; editor pressure_curve_ui.rs with Linear/Soft/Hard presets). Missing: per-control curves (each brush dynamic's own response to pressure, tilt, rotation)"
+note = "Global: Preferences › Tools › Pressure Curve (prefs tools.pressureCurve; applied to every pen sample in ui-egui stylus.rs before any brush; editor pressure_curve_ui.rs with Linear/Soft/Hard presets). Per control: every brush Dynamic has its own curve (paint ResponseCurve, the same monotone cubic; Dynamic.curve, set by tools.setBrush, e.g. shapeDynamics.size.curve) applied to its Fade/Pressure/Tilt/Wheel/Rotation input in dynamics.rs dynamic_value; Brush Settings shows it behind each Control row's curve button (#3294)"
 
 [[item]]
 id = "TOOL-213-12"
 target = "Import an image file as a brush tip"
-status = "missing"
+status = "done"
 issue = 213
-note = "Only brush.defineFromSelection and brush.presets.importAbr"
+note = "brush.presets.importImage (path or data); Brushes panel and preset picker Import Brushes… take .abr or an image (#3279)"
 
 [[item]]
 id = "TOOL-213-13"
@@ -176,9 +176,9 @@ note = "Ratio dropdown and fields, Straighten (TOOL-214-21); W x H x Resolution 
 [[item]]
 id = "TOOL-214-10"
 target = "Pen: Alt breaks a handle, Shift 45 deg, Ctrl direct-selects, Backspace, close-drag handle"
-status = "partial"
+status = "done"
 issue = 214
-note = "Ctrl/Cmd = Direct Selection and Alt = Convert Point on existing paths (direct_select.rs, #790); Backspace/Delete retracts the last point while drawing (#1466); Alt during a drag breaks the handle pair, Alt-drag turns the last anchor's outgoing handle alone, and dragging on the first anchor closes with that anchor's handles (vector_ui.rs, #3306); no Shift 45 deg"
+note = "Ctrl/Cmd = Direct Selection and Alt = Convert Point on existing paths (direct_select.rs, #790); Backspace/Delete retracts the last point while drawing (#1466); Alt during a drag breaks the handle pair, Alt-drag turns the last anchor's outgoing handle alone, and dragging on the first anchor closes with that anchor's handles (vector_ui.rs, #3306); Shift-click puts the next anchor on the nearest 45 deg ray from the previous one and Shift-drag turns the handles to 45 deg steps, live (vector_ui.rs pen_shift_click_puts_the_next_anchor_on_a_45_degree_ray, pen_shift_drag_turns_handles_to_45_degrees_live, #3751)"
 
 [[item]]
 id = "TOOL-214-11"
@@ -192,7 +192,7 @@ id = "TOOL-214-12"
 target = "Shapes: on-canvas corner radius handles, shape feather, selection to shape with tolerance"
 status = "partial"
 issue = 214
-note = "select.convertToShape with tolerance (vector_cmds.rs:1256); radius as a field only"
+note = "On-canvas corner radius widgets on every selected live rectangle with Path Selection, the Rectangle tool and Move + Show Transform Controls: drag rounds every corner of every selected rectangle alike, Alt that corner on each, corner radius cursor and R: readout, one history step (corner_radius.rs, 2026-10-13); select.convertToShape with tolerance (vector_cmds.rs:1256). Missing: shape feather"
 
 [[item]]
 id = "TOOL-214-13"
@@ -298,6 +298,13 @@ target = "Remove tool: paint over an object (or circle it) and it is filled from
 status = "partial"
 issue = 213
 note = "paint.remove (retouch_cmds/remove.rs, background job) + Tool::Remove in the J flyout; loops close over what they enclose; fill by non-local patch completion with texture features, onion-peel start, best-patch copy and gradient-domain seam hiding (algo/nonlocal.rs, Newson et al. IPOL 2017); sparse holes in tiles (algo/remove.rs). remove_quality on 20 holes in public-domain photos: the fill keeps 0.89 of the texture it replaces (0.54 with Content-Aware Fill's completion), edge gradient 1.03 of the original's; remove_bench 24 MP: 100 px ring 120 ms, 1000 px ring 2.5 s, 3000 px line 1.7 s. Options bar: Sample All Layers, Create a new layer (the fill on a new layer above, `newLayer`), Remove after each stroke off (strokes collect as a tint and ↩ applies them as one `strokes` job, Esc drops them). Missing: generative AI mode, live preview of the result"
+
+[[item]]
+id = "TOOL-2259-1"
+target = "Arrow-key nudges of one thing (layers, the selection outline, the Free Transform box) that follow each other are one History state, with a preference to turn it off"
+status = "done"
+issue = 2259
+note = "nudge_bundle.rs: a run shares one `coalesce` key while each nudge comes within Tools > Nudge Bundle Pause (1 s) and nothing else touched the document (an edit, Undo/Redo, a layer selection, a save end it); move_mods.rs runs layer.translate and select.transformSelection through it, transform_tool.rs folds box nudges into one session step. Tools > Bundle Arrow-Key Nudges off gives every press its own state. Selected pixels float until dropped, which is one state already; ⌥-nudges (a copy each) never join a run"
 
 [[item]]
 id = "TOOL-1045-1"

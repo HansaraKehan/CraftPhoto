@@ -19,6 +19,7 @@ pub mod exif_color;
 mod fidelity;
 mod format;
 mod image;
+mod lab;
 mod options;
 pub mod orientation;
 pub mod resolution;
@@ -27,7 +28,7 @@ pub mod web;
 
 pub use crate::codecs::exr_cryptomatte::{cryptomatte_id, cryptomatte_key, cryptomatte_preview_color};
 pub use crate::codecs::gif_frames::{AnimationFrame, MAX_GIF_FRAMES};
-pub use crate::codecs::png::{PngPalette, encode_indexed as encode_png_indexed, palette as png_palette};
+pub use crate::codecs::png::{PngPalette, encode_indexed as encode_png_indexed, palette as png_palette, stereo as png_stereo};
 pub use crate::codecs::tiff::{PhotoshopTags as TiffPhotoshopTags, photoshop_tags as tiff_photoshop_tags, writes_little_endian as tiff_writes_little_endian};
 pub use crate::codecs::tiff_ifd::{TiffInfo, TiffPage, TiffPageKind};
 pub use crate::error::CodecError;
@@ -37,7 +38,9 @@ pub use crate::format::{ASYMMETRIC_EXCEPTIONS, Format, FormatCaps, caps, detect,
 pub use crate::image::{
     ChannelLayout, CryptomatteBuffer, CryptomatteLayer, DecodeWarning, DeepChannel, DeepImage, ExrChannelInfo, ExrPartInfo, Image, Metadata, SampleType,
 };
-pub use crate::options::{DecodeOptions, DpxBits, EncodeOptions, ExrCompression, Limits, PngCompression, TiffCompression};
+pub use crate::options::{
+    DdsCompression, DdsOptions, DecodeOptions, DpxBits, EncodeOptions, ExrCompression, Limits, PngCompression, PngStereo, TiffCompression,
+};
 pub use crate::orientation::{exif_orientation, upright_exif, upright_xmp};
 pub use crate::resolution::{exif_resolution, export_exif, export_xmp, photoshop_resolution, xmp_resolution};
 pub use crate::source_settings::{WebpEncoding, jpeg_quality, webp_encoding};
@@ -79,6 +82,7 @@ pub fn decode_as_with(format: Format, bytes: &[u8], opts: &DecodeOptions) -> Res
         Format::Dds => dds::decode(bytes, l),
         Format::Fits => fits::decode(bytes, l),
         Format::Dpx => dpx::decode(bytes, l),
+        Format::Cineon => dpx::decode_cineon(bytes, l),
         Format::OpenExr => exr::decode(bytes, l),
         Format::Heif => heif::decode(bytes, l, opts.keep_orientation),
         Format::Gif | Format::Bmp | Format::Tga | Format::Ico | Format::Qoi | Format::Hdr | Format::Avif => via_image::decode(format, bytes, l),
@@ -97,6 +101,7 @@ pub fn decode_as_with(format: Format, bytes: &[u8], opts: &DecodeOptions) -> Res
         Format::Tiff => tiff::orientation(bytes, None),
         Format::Heif => 1,
         Format::Dpx => dpx::orientation(bytes),
+        Format::Cineon => dpx::cineon_orientation(bytes),
         _ => img.meta.exif.as_deref().map_or(1, exif_orientation),
     };
     finish_decode(img, o, opts)
@@ -121,6 +126,12 @@ pub fn probe_size(bytes: &[u8]) -> Result<(u32, u32), CodecError> {
     };
     let o = exif.as_deref().map_or(1, exif_orientation);
     Ok(if (5..=8).contains(&o) { (h, w) } else { (w, h) })
+}
+
+/// The colour table of a GIF's first frame (its Local Color Table, else the Global one) and the
+/// entry its Graphic Control Extension makes transparent, read without decoding pixels.
+pub fn gif_palette(bytes: &[u8]) -> Option<(Vec<[u8; 3]>, Option<u8>)> {
+    crate::codecs::gif_palette::palette(bytes)
 }
 
 /// Returns the embedded colour table for an indexed BMP, if it has one.
@@ -249,9 +260,10 @@ pub fn encode(image: &Image, format: Format, opts: &EncodeOptions) -> Result<Vec
         Format::Pnm => pnm::encode(image, plan, opts),
         Format::Pcx => Err(CodecError::unsupported(format, "PCX is import-only; save as PNG instead")),
         Format::Xpm => Err(CodecError::unsupported(format, "XPM is import-only; save as PNG instead")),
-        Format::Dds => Err(CodecError::unsupported(format, "DDS is import-only; save as PNG instead")),
+        Format::Dds => dds::encode(image, plan, opts),
         Format::Fits => fits::encode(image, plan, opts),
         Format::Dpx => dpx::encode(image, plan, opts),
+        Format::Cineon => Err(CodecError::unsupported(format, "Cineon is import-only; save as DPX, TIFF or EXR instead")),
         Format::OpenExr => exr::encode(image, plan, opts),
         Format::Heif => Err(CodecError::unsupported(format, "encoding is not available in this build")),
         Format::Gif | Format::Bmp | Format::Tga | Format::Ico | Format::Qoi | Format::Hdr | Format::Avif => via_image::encode(format, image, plan, opts),

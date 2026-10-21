@@ -21,7 +21,8 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
 
 /// Files known to be invalid upstream, with the reason. They are reported but
 /// do not fail the test.
-const KNOWN_BAD: &[(&str, &str)] = &[("group-divider-blend-mode.psd", "psd-tools fixture stripped to 1906 bytes: merged image data missing")];
+const KNOWN_BAD: &[(&str, &str)] =
+    &[("group-divider-blend-mode.psd", "malformed merged image data; strict parsing rejects it, but the importer recovers its group (#6152)")];
 
 #[test]
 fn corpus_parse_and_byte_stable() {

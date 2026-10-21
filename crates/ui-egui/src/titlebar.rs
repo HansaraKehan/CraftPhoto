@@ -538,6 +538,23 @@ mod tests {
     use egui::{Event, Pos2, RawInput, ViewportId};
     use photocraft_engine::Session;
 
+    /// #5826: the drag overlay under a dialog doesn't depend on the custom title bar. On macOS
+    /// (OS traffic lights over the app's own title strip) a dialog left the window undraggable.
+    #[test]
+    fn a_dialog_keeps_the_title_strip_draggable_with_either_title_bar() {
+        for custom in [false, true] {
+            let mut app = PhotocraftApp::new(Session::new(), crate::Services::default());
+            app.custom_titlebar = custom;
+            app.run("file.new", serde_json::json!({"width": 8, "height": 8})).unwrap();
+            assert!(!app.titlebar_modal_drag(true), "no dialog, no overlay");
+            crate::filter_dialog::open(&mut app, "filter.blur.gaussianBlur").unwrap();
+            assert!(app.titlebar_modal_drag(true), "custom title bar: {custom}");
+            assert!(!app.titlebar_modal_drag(false), "chrome hidden (full screen): no title strip");
+            app.ui.panels.menu_bar = false;
+            assert!(!app.titlebar_modal_drag(true), "no menu bar, no title strip");
+        }
+    }
+
     /// A headless window `width` pt wide showing the title bar and the resize zones.
     struct Win {
         ctx: egui::Context,

@@ -43,10 +43,12 @@ pub const DEFAULT_TOLERANCE: f64 = 0.01;
 /// folded with the subpath operations; open subpaths are closed implicitly.
 pub fn fill_rasterizer(path: &Path, tol: f64) -> Rasterizer {
     let mut r = Rasterizer::new(path.inverted);
+    // One point budget for the whole path, then one edge sort for all components.
+    let polys: Vec<Vec<(f64, f64)>> = flatten_path(path, tol).into_iter().map(|l| l.pts).collect();
     for c in path.components() {
-        let polys: Vec<Vec<(f64, f64)>> = path.subpaths[c.clone()].iter().map(|s| flatten_subpath(s, tol).pts).collect();
-        r.add_component(&polys, path.effective_op(c.start), path.fill_rule);
+        r.push_component(polys.get(c.clone()).unwrap_or_default(), path.effective_op(c.start), path.fill_rule);
     }
+    r.sort_edges();
     r
 }
 
@@ -105,26 +107,26 @@ impl CompiledVectorMask {
 
     /// Effective mask values over `rect`, with invocation-local rasterization state.
     pub fn render(&self, rect: Rect) -> Vec<f32> {
-        let mut v = match &self.geometry {
-            MaskGeometry::Constant(value) => vec![*value; rect.width() as usize * rect.height() as usize],
-            MaskGeometry::Path(rasterizer) => rasterizer.render(rect),
-        };
-        self.apply_density(&mut v);
-        v
+        self.render_with(rect, Rasterizer::render)
     }
 
     /// Effective mask values without entering a thread pool. Use this while
     /// initializing a shared result that other Rayon workers may wait for.
     pub fn render_sequential(&self, rect: Rect) -> Vec<f32> {
+        self.render_with(rect, |rasterizer, rect| {
+            let mut v = vec![0.0; rect.width() as usize * rect.height() as usize];
+            if !v.is_empty() {
+                rasterizer.render_into(rect, &mut v);
+            }
+            v
+        })
+    }
+
+    /// Mask values over `rect`, with a path's coverage from `coverage`.
+    fn render_with(&self, rect: Rect, coverage: impl FnOnce(&Rasterizer, Rect) -> Vec<f32>) -> Vec<f32> {
         let mut v = match &self.geometry {
             MaskGeometry::Constant(value) => vec![*value; rect.width() as usize * rect.height() as usize],
-            MaskGeometry::Path(rasterizer) => {
-                let mut v = vec![0.0; rect.width() as usize * rect.height() as usize];
-                if !v.is_empty() {
-                    rasterizer.render_into(rect, &mut v);
-                }
-                v
-            }
+            MaskGeometry::Path(rasterizer) => coverage(rasterizer, rect),
         };
         self.apply_density(&mut v);
         v

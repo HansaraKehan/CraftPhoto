@@ -530,7 +530,11 @@ pub(crate) fn encode(src: &Image, plan: Plan, opts: &EncodeOptions) -> Result<Ve
             for p in 0..nc {
                 for y in 0..hu {
                     for x in 0..wu {
-                        out.extend_from_slice(&d[idx(p, y, x)].to_be_bytes());
+                        // 0..1 as documented: a value above 2 would make readers (ours too)
+                        // take the data as ADU and scale it by 65535. NaN is written as 0.
+                        let v = d[idx(p, y, x)];
+                        let v = if v.is_nan() { 0.0 } else { v.clamp(0.0, 1.0) };
+                        out.extend_from_slice(&v.to_be_bytes());
                     }
                 }
             }
@@ -630,6 +634,17 @@ mod tests {
         }
         let img = decode(&b, &Limits::default()).unwrap();
         assert_eq!(img.to_f32_samples().unwrap(), vec![1.0, 0.0]);
+    }
+
+    #[test]
+    fn hdr_float_saves_clamped_and_reopens_as_saved() {
+        // One value above 2 used to make the reader scale everything by 65535 (all black).
+        let img = Image::from_f32(2, 1, ChannelLayout::Gray, &[0.5, 3.0]).unwrap();
+        let opts = EncodeOptions::default();
+        let bytes = encode(&img, crate::fidelity::plan(&img, F, &opts), &opts).unwrap();
+        let back = decode(&bytes, &Limits::default()).unwrap().to_f32_samples().unwrap();
+        assert!((back[0] - 0.5).abs() < 1e-6, "{back:?}");
+        assert!((back[1] - 1.0).abs() < 1e-6, "{back:?}");
     }
 
     #[test]

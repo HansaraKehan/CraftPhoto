@@ -402,10 +402,18 @@ pub(crate) fn seam_blend(warped: &[Surface], canvas: Rect, order: &[usize], seam
                 .collect()
         })
         .collect();
-    // Shift ROIs to canvas-relative coordinates for the blend.
-    let local: Vec<RoiImage> = rois.iter().map(|r| RoiImage { x0: r.x0 - canvas.x0, y0: r.y0 - canvas.y0, ..r.clone() }).collect();
+    // Shift ROIs to canvas-relative coordinates for the blend, and back after: a shifted copy
+    // would hold every source's pixels twice (#7758).
+    for r in &mut rois {
+        r.x0 -= canvas.x0;
+        r.y0 -= canvas.y0;
+    }
     let levels = if seamless { panorama::blend_levels(cw, chh).min(7) } else { 1 };
-    let (blend, cov) = panorama::multiband(cw, chh, &local, &weights, levels);
+    let (blend, cov) = panorama::multiband(cw, chh, &rois, &weights, levels);
+    for r in &mut rois {
+        r.x0 += canvas.x0;
+        r.y0 += canvas.y0;
+    }
     let cc = fmt.mode.color_channels();
     let nch = fmt.channels();
     let mut composite = Surface::new(fmt);
@@ -859,6 +867,7 @@ fn crop_and_straighten(s: &mut Session, _p: &Value) -> Result<Value> {
         let mut nd = Document::new(format!("{} copy {}", doc.name, k + 1), Size::new(pw, ph), doc.mode, doc.depth);
         nd.icc_profile = doc.icc_profile.clone();
         nd.resolution_dpi = doc.resolution_dpi;
+        nd.duotone = doc.duotone.clone();
         let mut bg = Layer::new("Background", LayerContent::Raster(px));
         bg.locks.transparency = true;
         bg.locks.position = true;
@@ -871,8 +880,13 @@ fn crop_and_straighten(s: &mut Session, _p: &Value) -> Result<Value> {
 
 // ---------- specs ----------
 
-fn has_doc(s: &Session) -> std::result::Result<(), String> {
-    s.active().map(|_| ()).ok_or_else(|| "no document open".into())
+/// Photoshop greys Crop and Straighten Photos out for Indexed Color documents.
+fn not_indexed(s: &Session) -> std::result::Result<(), String> {
+    let st = s.active().ok_or("no document open")?;
+    if st.doc.mode == ColorMode::Indexed {
+        return Err("not available for Indexed Color documents".into());
+    }
+    Ok(())
 }
 
 fn always(_: &Session) -> std::result::Result<(), String> {
@@ -907,7 +921,7 @@ pub fn specs() -> Vec<CommandSpec> {
             menu: &["File", "Automate"],
             shortcut: None,
             params: "{} → one new document per photo found on the scan",
-            enabled: has_doc,
+            enabled: not_indexed,
             run: crop_and_straighten,
             journal: true,
         },
@@ -1104,6 +1118,54 @@ mod tests {
 
     fn photocraft_algo_srgb(v: f32) -> f32 {
         if v <= 0.003_130_8 { v * 12.92 } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 }
+    }
+
+    /// A light scan with one dark tilted print on it.
+    fn scan_with_one_photo() -> Document {
+        let (w, h) = (300usize, 220usize);
+        let mut px = vec![[0.98f32, 0.98, 0.98, 1.0]; w * h];
+        let (s, co) = 5.0f64.to_radians().sin_cos();
+        for y in 0..h {
+            for x in 0..w {
+                let (dx, dy) = (x as f64 + 0.5 - 150.0, y as f64 + 0.5 - 110.0);
+                let (u, v) = (co * dx + s * dy, -s * dx + co * dy);
+                if u.abs() < 80.0 && v.abs() < 55.0 {
+                    px[y * w + x] = [0.2 + (u / 160.0) as f32 * 0.3, 0.25, 0.3, 1.0];
+                }
+            }
+        }
+        doc_from("scan", &px, w, h, SampleType::U8)
+    }
+
+    #[test]
+    fn crop_and_straighten_keeps_duotone_inks() {
+        let mut s = Session::new();
+        s.add_document(scan_with_one_photo(), None);
+        s.execute("image.mode.grayscale", json!({})).unwrap();
+        s.execute(
+            "image.mode.duotone",
+            json!({"type": "duotone", "inks": [{"name": "Black", "color": [0, 0, 0]}, {"name": "Orange", "color": [255, 128, 0]}]}),
+        )
+        .unwrap();
+        let src = s.documents()[0].doc.duotone.clone();
+        assert!(src.is_some());
+        let r = s.execute("file.automate.cropAndStraightenPhotos", json!({})).unwrap();
+        assert_eq!(r["photos"].as_array().unwrap().len(), 1, "{r}");
+        let d = &s.documents()[1].doc;
+        assert_eq!(d.mode, ColorMode::Duotone);
+        assert_eq!(d.duotone, src);
+    }
+
+    #[test]
+    fn crop_and_straighten_disabled_for_indexed() {
+        // Photoshop greys the command out for Indexed Color documents.
+        let mut s = Session::new();
+        s.add_document(scan_with_one_photo(), None);
+        s.execute("image.mode.indexedColor", json!({})).unwrap();
+        assert_eq!(s.documents()[0].doc.mode, ColorMode::Indexed);
+        assert!(!s.is_enabled("file.automate.cropAndStraightenPhotos"));
+        assert!(s.execute("file.automate.cropAndStraightenPhotos", json!({})).is_err());
+        assert_eq!(s.documents().len(), 1);
     }
 
     #[test]

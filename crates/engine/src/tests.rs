@@ -703,6 +703,38 @@ fn fill_layer_pixel_rewrites_refresh_the_effect_maps() {
 }
 
 #[test]
+fn growing_the_canvas_re_renders_a_cached_fill_layer() {
+    // A PSD fill layer keeps its stored pixels as a fill cache covering only the old canvas.
+    // Canvas Size, an extending Crop and Reveal All must re-render the fill over the new area,
+    // as Photoshop does, instead of leaving the added bands transparent (#7362).
+    let grow: [(&str, Value); 2] = [
+        ("image.canvasSize", json!({"width": 100, "anchor": "left"})),
+        ("image.crop", json!({"x": 0, "y": 0, "width": 100, "height": 48, "deleteCroppedPixels": false})),
+    ];
+    for (cmd, params) in grow {
+        let mut s = Session::new();
+        s.execute("file.new", json!({"width": 64, "height": 48, "background": "transparent"})).unwrap();
+        s.execute("layer.newFillLayer.solidColor", json!({"color": "#ff0000"})).unwrap();
+        s.edit("cache", |doc, active| {
+            let fmt = doc.pixel_format();
+            let l = doc.layer_mut(active.unwrap()).unwrap();
+            let photocraft_doc::LayerContent::Fill(f) = &l.content else { return Err(EngineError::Other("not a fill layer".into())) };
+            let fill = f.clone();
+            let mut surface = photocraft_raster::Surface::new(fmt);
+            surface.fill_rect(photocraft_geom::Rect::new(0, 0, 64, 48), &[1.0, 0.0, 0.0, 1.0]);
+            l.fill_cache = Some(photocraft_doc::FillCache { fill, surface });
+            Ok(())
+        })
+        .unwrap();
+        s.execute(cmd, params).unwrap();
+        let d = &s.active().unwrap().doc;
+        assert_eq!(d.size.width, 100, "{cmd} grows the canvas");
+        let px = photocraft_compose::render(d, d.bounds()).get(90, 20);
+        assert!(px[3] > 0.99 && px[0] > 0.99 && px[1] < 0.01, "{cmd}: the fill covers the added area, got {px:?}");
+    }
+}
+
+#[test]
 fn group_effect_maps_follow_child_visibility_and_opacity() {
     // A styled group's maps come from its children's composite: hiding a child or changing its
     // opacity must refresh the group's shadow. Warm render vs. purged render must agree.
@@ -1153,6 +1185,47 @@ fn coalesced_edits_share_one_history_step() {
     let st = s.active().unwrap();
     let l = st.doc.layer(st.active_layer.unwrap()).unwrap().opacity;
     assert!((l - 1.0).abs() < 1e-6, "{l}");
+}
+
+/// #2259: the commands behind the arrow-key nudges take the `coalesce` key, so a run of them is
+/// one step an agent can drive too, and one Undo takes the whole run back.
+#[test]
+fn translate_and_transform_selection_coalesce_into_one_step() {
+    let mut s = Session::new();
+    s.execute("file.new", json!({"width": 60, "height": 60})).unwrap();
+    s.execute("layer.new.layer", json!({})).unwrap();
+    s.execute("select.rect", json!({"x": 10, "y": 10, "width": 10, "height": 10})).unwrap();
+    s.execute("edit.fill", json!({"color": "#ff0000"})).unwrap();
+    let steps = |s: &Session| s.active().unwrap().history.past_len();
+    let left = |s: &Session| {
+        let st = s.active().unwrap();
+        st.doc.layer(st.active_layer.unwrap()).unwrap().surface().unwrap().content_bounds().x0
+    };
+    let sel = |s: &Session| s.active().unwrap().doc.selection.as_ref().unwrap().content_bounds().x0;
+
+    let base = steps(&s);
+    for _ in 0..5 {
+        s.execute("layer.translate", json!({"dx": 1, "dy": 0, "coalesce": "nudge:1"})).unwrap();
+    }
+    assert_eq!((steps(&s), left(&s)), (base + 1, 15), "five nudges, one step");
+    s.execute("layer.translate", json!({"dx": 1, "dy": 0, "coalesce": "nudge:2"})).unwrap();
+    s.execute("layer.translate", json!({"dx": 1, "dy": 0})).unwrap();
+    s.execute("layer.translate", json!({"dx": 1, "dy": 0, "coalesce": "nudge:2"})).unwrap();
+    assert_eq!(steps(&s), base + 4, "another key, an uncoalesced move and a repeated key each start a step");
+    for _ in 0..3 {
+        assert!(s.undo());
+    }
+    assert_eq!(left(&s), 15);
+    assert!(s.undo());
+    assert_eq!(left(&s), 10, "Undo takes the run of five back at once");
+
+    let base = steps(&s);
+    for _ in 0..4 {
+        s.execute("select.transformSelection", json!({"dx": 1, "dy": 0, "coalesce": "nudge:3"})).unwrap();
+    }
+    assert_eq!((steps(&s), sel(&s)), (base + 1, 14));
+    assert!(s.undo());
+    assert_eq!(sel(&s), 10);
 }
 
 #[test]

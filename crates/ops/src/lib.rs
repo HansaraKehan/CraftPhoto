@@ -209,14 +209,55 @@ impl History {
         self.undo.iter().chain(self.redo.iter()).fold(own, |n, s| n.saturating_add(tile_bytes(&s.doc, &mut seen)))
     }
 
+    /// Bytes of the tiles only `extra` documents hold (History panel snapshots, #4530): not
+    /// `current`'s and not any state's. 0 without `extra`, without walking the states.
+    pub fn extra_bytes(&self, current: &Document, extra: &[&Document]) -> usize {
+        if extra.is_empty() {
+            return 0;
+        }
+        let mut seen = HashSet::new();
+        tile_bytes(current, &mut seen);
+        for s in self.undo.iter().chain(self.redo.iter()) {
+            tile_bytes(&s.doc, &mut seen);
+        }
+        extra.iter().fold(0, |n, d| n.saturating_add(tile_bytes(d, &mut seen)))
+    }
+
+    /// [`History::unique_bytes`] less the tiles `keep` documents also hold: what clearing the
+    /// history frees while they stay (Edit › Purge › Histories keeps the snapshots).
+    pub fn unique_bytes_besides(&self, current: &Document, keep: &[&Document]) -> usize {
+        let mut seen = HashSet::new();
+        tile_bytes(current, &mut seen);
+        for d in keep {
+            tile_bytes(d, &mut seen);
+        }
+        self.undo.iter().chain(self.redo.iter()).fold(0, |n, s| n.saturating_add(tile_bytes(&s.doc, &mut seen)))
+    }
+
     /// Keep pixel memory within [`History::max_bytes`]: the current document's tiles plus the
     /// tiles only history holds (newest states first). The oldest undo states that don't fit are
     /// dropped; the most recent one is always kept so the last step can be undone. Returns how
     /// many states were dropped.
     pub fn trim(&mut self, current: &Document) -> usize {
+        self.trim_with(current, &[])
+    }
+
+    /// [`History::trim`] counting the tiles only `pinned` documents hold (History panel
+    /// snapshots, which outlive the states) against the budget too, so they can't take memory
+    /// beyond it unseen (#4530). The most recent state is still always kept.
+    pub fn trim_with(&mut self, current: &Document, pinned: &[&Document]) -> usize {
         if self.max_bytes == 0 || self.undo.len() <= 1 {
             return 0;
         }
+        // An upper bound of what only `pinned` holds (some of it may be in states too): if the
+        // states fit beside it, they fit.
+        let pinned_bytes = if pinned.is_empty() {
+            0
+        } else {
+            let mut seen = HashSet::new();
+            tile_bytes(current, &mut seen);
+            pinned.iter().fold(0usize, |n, d| n.saturating_add(tile_bytes(d, &mut seen)))
+        };
         let tiles = self.tiles.get_or_insert_with(|| {
             let mut tiles = tiles::Tiles::default();
             for state in self.undo.iter().chain(&self.redo) {
@@ -224,11 +265,14 @@ impl History {
             }
             tiles
         });
-        if tiles.fits(current, self.max_bytes) {
+        if tiles.fits(current, self.max_bytes.saturating_sub(pinned_bytes)) {
             return 0;
         }
         let mut seen = HashSet::new();
         let mut total = tile_bytes(current, &mut seen);
+        for d in pinned {
+            total = total.saturating_add(tile_bytes(d, &mut seen));
+        }
         for s in self.redo.iter().rev() {
             total = total.saturating_add(tile_bytes(&s.doc, &mut seen));
         }
@@ -248,7 +292,7 @@ impl History {
     }
 }
 
-/// Bytes of the pixel tiles of `doc` (layers, masks, alpha channels, selection) not already in `seen`.
+/// Bytes of the pixel tiles of `doc` (layers, masks, fill caches, smart filter masks, alpha channels, selection) not already in `seen`.
 fn tile_bytes(doc: &Document, seen: &mut HashSet<usize>) -> usize {
     let mut n = 0usize;
     tiles::surfaces(doc, |surface| {
@@ -392,6 +436,42 @@ mod tests {
         assert!(h.undo(cur.clone()).is_some());
     }
 
+    /// Snapshot-only tiles count against the budget (#4530); tiles a snapshot shares with the
+    /// document or a state count once, and a purge frees only what no snapshot keeps.
+    #[test]
+    fn snapshot_tiles_count_against_the_budget() {
+        let mut h = History::new(50);
+        let mut cur = Arc::new(base());
+        let tile = 256 * 256 * 4;
+        let paint = |d: &mut Document, v: f32| {
+            let id = d.layers[0].id;
+            d.layer_mut(id).unwrap().surface_mut().unwrap().write_pixel(1, 1, &[v, 0.0, 0.0, 1.0]);
+        };
+        // A snapshot holding a tile nothing else does, then one sharing the first state's tile.
+        let mut own = (*cur).clone();
+        paint(&mut own, 0.9);
+        edit(&mut h, &mut cur, "paint 0", |d| paint(d, 0.1));
+        let shared = h.state(0).unwrap();
+        for i in 1..6 {
+            edit(&mut h, &mut cur, &format!("paint {i}"), |d| paint(d, i as f32 / 8.0));
+        }
+        let snaps = [&own, &*shared];
+        assert_eq!(h.extra_bytes(&cur, &snaps), tile, "the shared tile is history's");
+        assert_eq!(h.extra_bytes(&cur, &[]), 0);
+        assert_eq!(h.unique_bytes(&cur), 6 * tile);
+        assert_eq!(h.unique_bytes_besides(&cur, &snaps), 5 * tile, "clearing keeps the shared tile");
+        // Both snapshot tiles stay whatever is trimmed (the shared one too), so beside the
+        // current tile they leave room for two history tiles; without them, four would fit.
+        h.max_bytes = 5 * tile;
+        assert_eq!(h.trim_with(&cur, &snaps), 4);
+        assert_eq!(h.past_len(), 2);
+        assert_eq!(h.pixel_bytes(&cur) + h.extra_bytes(&cur, &snaps), 5 * tile);
+        // Still keeps the last step undoable.
+        h.max_bytes = 1;
+        h.trim_with(&cur, &snaps);
+        assert_eq!(h.past_len(), 1);
+    }
+
     #[test]
     fn history_shares_untouched_tiles() {
         let mut h = History::default();
@@ -406,6 +486,42 @@ mod tests {
             d.layer_mut(id).unwrap().surface_mut().unwrap().write_pixel(1, 1, &[0.0, 0.0, 0.0, 1.0]);
         });
         assert_eq!(h.unique_bytes(&cur), 256 * 256 * 4);
+    }
+
+    #[test]
+    fn fill_caches_and_smart_filter_masks_count_toward_history_bytes() {
+        use photocraft_doc::{Affine, Fill, FillCache, LayerContent, LayerMask, PixelFormat, SmartObject, SmartSource, Surface};
+        let mut doc = Document::new("fills", Size::new(64, 64), ColorMode::Rgb, SampleType::U8);
+        let mut fill = Layer::new("Fill", LayerContent::Fill(Fill::Solid(Color::WHITE)));
+        let mut cache = Surface::new(PixelFormat::GRAY8);
+        cache.write_pixel(1, 1, &[1.0]);
+        fill.fill_cache = Some(FillCache { fill: Fill::Solid(Color::WHITE), surface: cache });
+        doc.insert_above(None, fill);
+        let mut smart_obj = SmartObject::new(SmartSource::Linked { path: "a.png".into() }, Affine::IDENTITY, None);
+        let mut mask = LayerMask::reveal_all();
+        mask.surface.write_pixel(1, 1, &[0.5]);
+        smart_obj.filter_mask = Some(mask);
+        doc.insert_above(None, Layer::new("Smart", LayerContent::Smart(smart_obj)));
+        let tile = 256 * 256;
+        let mut cur = Arc::new(doc);
+        let mut h = History { max_bytes: usize::MAX, ..History::default() };
+        assert_eq!(h.pixel_bytes(&cur), 2 * tile, "fill cache and smart filter mask are counted");
+        edit(&mut h, &mut cur, "Rename", |doc| doc.name = "renamed".into());
+        assert_eq!(h.pixel_bytes(&cur), 2 * tile, "shared tiles count once");
+        edit(&mut h, &mut cur, "Fill cache", |doc| {
+            let id = doc.layers[0].id;
+            if let Some(cache) = doc.layer_mut(id).and_then(|l| l.fill_cache.as_mut()) {
+                cache.surface.write_pixel(1, 1, &[0.0]);
+            }
+        });
+        assert_eq!(h.pixel_bytes(&cur), 3 * tile, "the copied fill cache tile is history-only");
+        assert_eq!(h.unique_bytes(&cur), tile);
+        h.trim(&cur);
+        assert_counter(&h, &cur);
+        h.max_bytes = 2 * tile;
+        assert_eq!(h.trim(&cur), 1, "the copied fill cache tile pushes history over budget");
+        assert_eq!(h.pixel_bytes(&cur), 3 * tile, "the most recent undo state is always kept");
+        assert_counter(&h, &cur);
     }
 
     #[test]

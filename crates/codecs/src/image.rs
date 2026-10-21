@@ -21,19 +21,31 @@ pub enum ChannelLayout {
     /// Ink amounts, `0 = no ink`, `max = full ink` (not Adobe-inverted).
     Cmyk,
     CmykA,
+    /// CIE L*a*b* (D50), as PhotoCraft's Lab documents hold it: L* 0..100 as 0..1, a* and b*
+    /// −128..127 as `(v + 128) / 255` (Photoshop's unsigned encoding).
+    Lab,
+    LabA,
 }
 
 impl ChannelLayout {
-    pub const ALL: [ChannelLayout; 6] =
-        [ChannelLayout::Gray, ChannelLayout::GrayA, ChannelLayout::Rgb, ChannelLayout::Rgba, ChannelLayout::Cmyk, ChannelLayout::CmykA];
+    pub const ALL: [ChannelLayout; 8] = [
+        ChannelLayout::Gray,
+        ChannelLayout::GrayA,
+        ChannelLayout::Rgb,
+        ChannelLayout::Rgba,
+        ChannelLayout::Cmyk,
+        ChannelLayout::CmykA,
+        ChannelLayout::Lab,
+        ChannelLayout::LabA,
+    ];
 
     /// Total number of channels including alpha.
     pub const fn channels(self) -> usize {
         match self {
             ChannelLayout::Gray => 1,
             ChannelLayout::GrayA => 2,
-            ChannelLayout::Rgb => 3,
-            ChannelLayout::Rgba | ChannelLayout::Cmyk => 4,
+            ChannelLayout::Rgb | ChannelLayout::Lab => 3,
+            ChannelLayout::Rgba | ChannelLayout::Cmyk | ChannelLayout::LabA => 4,
             ChannelLayout::CmykA => 5,
         }
     }
@@ -44,7 +56,7 @@ impl ChannelLayout {
     }
 
     pub const fn has_alpha(self) -> bool {
-        matches!(self, ChannelLayout::GrayA | ChannelLayout::Rgba | ChannelLayout::CmykA)
+        matches!(self, ChannelLayout::GrayA | ChannelLayout::Rgba | ChannelLayout::CmykA | ChannelLayout::LabA)
     }
 
     pub const fn is_gray(self) -> bool {
@@ -59,12 +71,17 @@ impl ChannelLayout {
         matches!(self, ChannelLayout::Cmyk | ChannelLayout::CmykA)
     }
 
+    pub const fn is_lab(self) -> bool {
+        matches!(self, ChannelLayout::Lab | ChannelLayout::LabA)
+    }
+
     /// The same colour model with alpha added.
     pub const fn with_alpha(self) -> Self {
         match self {
             ChannelLayout::Gray | ChannelLayout::GrayA => ChannelLayout::GrayA,
             ChannelLayout::Rgb | ChannelLayout::Rgba => ChannelLayout::Rgba,
             ChannelLayout::Cmyk | ChannelLayout::CmykA => ChannelLayout::CmykA,
+            ChannelLayout::Lab | ChannelLayout::LabA => ChannelLayout::LabA,
         }
     }
 
@@ -74,12 +91,13 @@ impl ChannelLayout {
             ChannelLayout::Gray | ChannelLayout::GrayA => ChannelLayout::Gray,
             ChannelLayout::Rgb | ChannelLayout::Rgba => ChannelLayout::Rgb,
             ChannelLayout::Cmyk | ChannelLayout::CmykA => ChannelLayout::Cmyk,
+            ChannelLayout::Lab | ChannelLayout::LabA => ChannelLayout::Lab,
         }
     }
 
     /// `true` if both layouts share a colour model (ignoring alpha).
     pub const fn same_model(self, other: Self) -> bool {
-        (self.is_gray() && other.is_gray()) || (self.is_rgb() && other.is_rgb()) || (self.is_cmyk() && other.is_cmyk())
+        (self.is_gray() && other.is_gray()) || (self.is_rgb() && other.is_rgb()) || (self.is_cmyk() && other.is_cmyk()) || (self.is_lab() && other.is_lab())
     }
 }
 
@@ -303,18 +321,73 @@ pub struct ExrPartInfo {
 
 impl ExrPartInfo {
     /// How much this part looks like a colour image the plain [`Image`] decode can show:
-    /// 4 RGBA, 3 RGB, 2 YA, 1 any-single-channel, 0 anything else (e.g. `Z` beside `A`).
+    /// 4 RGBA, 3 RGB, 2 YA, 1 Y or any-single-channel, 0 anything else (e.g. `Z` beside `A`).
+    /// The colour and alpha channels must share a complete layer prefix. The highest-ranked
+    /// group wins; equal groups prefer unprefixed channels, then the first prefix alphabetically.
     /// The auto-pick takes the highest rank; ties go to the earlier part.
     pub fn color_rank(&self) -> u8 {
-        let has = |n: &str| self.channels.iter().any(|c| base_channel_name(&c.name) == n);
-        if has("R") && has("G") && has("B") {
-            return if has("A") { 4 } else { 3 };
-        }
-        if has("Y") {
-            return if has("A") { 2 } else { 1 };
-        }
-        u8::from(self.channels.len() == 1)
+        exr_color_channels(self.channels.iter().map(|c| c.name.as_str())).map_or(0, |(layout, _)| layout.channels() as u8)
     }
+}
+
+/// One selection policy for header ranking/probing and flat decoding: never synthesize
+/// RGB(A) or YA from separate layers. OpenEXR layers use the full prefix before the last
+/// dot, including nested layers; a leading or trailing dot alone does not name a layer.
+pub(crate) fn exr_color_channels<'a>(names: impl IntoIterator<Item = &'a str>) -> Option<(ChannelLayout, Vec<usize>)> {
+    #[derive(Default)]
+    struct Group {
+        r: Option<usize>,
+        g: Option<usize>,
+        b: Option<usize>,
+        a: Option<usize>,
+        y: Option<usize>,
+    }
+
+    // Sorted prefixes make rank ties deterministic independently of channel order, with
+    // the empty (unprefixed) group first. Unsupported channels cannot complete a group.
+    let mut groups = std::collections::BTreeMap::<&str, Group>::new();
+    let mut count = 0usize;
+    for (index, name) in names.into_iter().enumerate() {
+        count = count.saturating_add(1);
+        let (prefix, base) = name.rsplit_once('.').filter(|(prefix, base)| !prefix.is_empty() && !base.is_empty()).unwrap_or(("", name));
+        if !matches!(base, "R" | "G" | "B" | "A" | "Y") {
+            continue;
+        }
+        let group = groups.entry(prefix).or_default();
+        let component = match base {
+            "R" => &mut group.r,
+            "G" => &mut group.g,
+            "B" => &mut group.b,
+            "A" => &mut group.a,
+            "Y" => &mut group.y,
+            _ => continue,
+        };
+        component.get_or_insert(index);
+    }
+
+    let mut best = None;
+    let mut best_rank = 0;
+    for group in groups.values() {
+        let candidate = if let (Some(r), Some(g), Some(b)) = (group.r, group.g, group.b) {
+            match group.a {
+                Some(a) => (ChannelLayout::Rgba, vec![r, g, b, a]),
+                None => (ChannelLayout::Rgb, vec![r, g, b]),
+            }
+        } else if let Some(y) = group.y {
+            match group.a {
+                Some(a) => (ChannelLayout::GrayA, vec![y, a]),
+                None => (ChannelLayout::Gray, vec![y]),
+            }
+        } else {
+            continue;
+        };
+        let rank = candidate.0.channels();
+        if rank > best_rank {
+            best = Some(candidate);
+            best_rank = rank;
+        }
+    }
+    best.or_else(|| (count == 1).then(|| (ChannelLayout::Gray, vec![0])))
 }
 
 /// Strip an optional `layer.` prefix from a channel name (`diffuse.R` → `R`).
@@ -723,6 +796,7 @@ pub(crate) fn convert_layout(src: &[f32], from: ChannelLayout, to: ChannelLayout
                 ChannelLayout::Gray | ChannelLayout::GrayA => [color[0]; 3],
                 ChannelLayout::Rgb | ChannelLayout::Rgba => [color[0], color[1], color[2]],
                 ChannelLayout::Cmyk | ChannelLayout::CmykA => cmyk_to_rgb(color[0], color[1], color[2], color[3]),
+                ChannelLayout::Lab | ChannelLayout::LabA => crate::lab::lab_to_srgb([color[0], color[1], color[2]]),
             };
             match to {
                 ChannelLayout::Gray | ChannelLayout::GrayA => {
@@ -730,6 +804,7 @@ pub(crate) fn convert_layout(src: &[f32], from: ChannelLayout, to: ChannelLayout
                 }
                 ChannelLayout::Rgb | ChannelLayout::Rgba => out.extend_from_slice(&rgb),
                 ChannelLayout::Cmyk | ChannelLayout::CmykA => out.extend_from_slice(&rgb_to_cmyk(rgb[0], rgb[1], rgb[2])),
+                ChannelLayout::Lab | ChannelLayout::LabA => out.extend_from_slice(&crate::lab::srgb_to_lab(rgb)),
             }
         }
         if to.has_alpha() {

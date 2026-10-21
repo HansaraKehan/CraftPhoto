@@ -1,4 +1,4 @@
-// Photocraft GPU compositor kernels.
+// PhotoCraft GPU compositor kernels.
 //
 // Every pass renders one chunk of the canvas into a straight-alpha RGBA32F accumulator, reading
 // its inputs with `textureLoad` at the same pixel. Effect-map kernels (`fs_m*`) render
@@ -31,6 +31,13 @@ struct Op {
     map_origin: vec2<i32>,
     map_size: vec2<i32>,
     p4: vec4<f32>,
+    // fs_layerbatch's third extra layer and the rest of its second (see `batch_layer`); zero
+    // elsewhere. With them the record fills its 256-byte stride.
+    q0: vec4<f32>,
+    q1: vec4<f32>,
+    q2: vec4<f32>,
+    q3: vec4<f32>,
+    q4: vec4<f32>,
 };
 
 const F_MASK: u32 = 1u;          // layer has an enabled mask
@@ -53,6 +60,7 @@ const F_QUANT: u32 = 32768u;    // lerp: A rounded to p0.x steps (adjustment res
 const F_ADD_DIFF: u32 = 16384u;  // lerp: A + (B - C) premultiplied (clips on pass-through groups)
 const F_BLEND_IF: u32 = 524288u; // lerp: B back towards A by the Blend If ranges in p0..p3
 const F_TEXT_GAMMA: u32 = 8192u; // blend / atop / fx merge: type layer, mix coverage at gamma p4.w
+const F_LAYER_SHAPE: u32 = 1048576u; // fx merge: B is the shape; layer = its colour at fill p0.x inside it × its alpha
 
 @group(0) @binding(0) var<uniform> chunk: Chunk;
 @group(0) @binding(1) var<uniform> op: Op;
@@ -312,6 +320,9 @@ fn fill_is_special(mode: i32) -> bool {
 // colour (Hard Mix: (cb - f(1 - cs)) / (1 - f)) at `opacity`, Fill staying coverage over
 // transparency. Lab documents mix Normal in CIELAB; type layers mix in the text gamma space.
 fn composite_fill(mode: i32, b: vec4<f32>, s: vec4<f32>, opacity: f32, fill: f32, gamma_on: bool) -> vec4<f32> {
+    // The same code as fs_layerbatch_normal, so a layer gives the same bits whichever pass
+    // draws it (a render resumed from the prefix cache splits runs differently).
+    if (mode == M_NORMAL && !gamma_on && (op.flags & F_LAB) == 0u) { return composite_normal_fill(b, s, opacity, fill); }
     let f = clamp(fill, 0.0, 1.0);
     let special = f < 1.0 && fill_is_special(mode);
     let ab = b.a;
@@ -338,6 +349,21 @@ fn composite_fill(mode: i32, b: vec4<f32>, s: vec4<f32>, opacity: f32, fill: f32
     if (!gamma_on) { return vec4(wb * b.rgb + wbs * bl + ws * s.rgb, ao); }
     let g = op.p4.w;
     return vec4(text_dec(wb * text_enc(b.rgb, g) + wbs * text_enc(bl, g) + ws * text_enc(s.rgb, g), g), ao);
+}
+
+// composite_fill for Normal outside Lab documents and without text gamma: Fill is plain coverage
+// and the blend is the source. Kept apart so fs_layerbatch_normal doesn't carry every other
+// mode's code, which costs registers and so pixels in flight.
+fn composite_normal_fill(b: vec4<f32>, s: vec4<f32>, opacity: f32, fill: f32) -> vec4<f32> {
+    let ab = b.a;
+    let over = s.a * opacity * clamp(fill, 0.0, 1.0);
+    if (over <= 0.0) { return b; }
+    let ao = ab + (1.0 - ab) * over;
+    if (ao <= 0.0) { return vec4(0.0); }
+    let wb = ab * (1.0 - over) / ao;
+    let wbs = ab * over / ao;
+    let ws = (1.0 - ab) * over / ao;
+    return vec4(wb * b.rgb + wbs * s.rgb + ws * s.rgb, ao);
 }
 
 // photocraft_color::convert::{srgb_to_lab, lab_to_srgb} (D50, Bradford to sRGB).
@@ -473,6 +499,17 @@ fn posterize(v: f32, n: f32) -> f32 {
     return floor(bin * 255.0 / (n - 1.0)) / 255.0;
 }
 
+// compose::adjust::posterize_in at 16 bits: bins of the 16-bit sample, landing on 8-bit levels
+// through a 16-bit step. Every product and sum here is a whole number below 2^24, exact in f32;
+// 16-bit layers reach the GPU as half floats, though, so a sample within their precision of a
+// bin's edge can land in the neighbouring bin (the CPU, which exports, is exact).
+fn posterize16(v: f32, n: f32) -> f32 {
+    let x = floor(clamp(v, 0.0, 1.0) * 32768.0 + 0.5);
+    let bin = min(floor(x * n / 32768.0), n - 1.0);
+    let step = floor(bin * 32768.0 / (n - 1.0));
+    return floor((step * 255.0 + 16384.0) / 32768.0) / 255.0;
+}
+
 // Document pixel being adjusted (for ordered dither).
 var<private> adj_px: vec2<i32>;
 
@@ -580,49 +617,37 @@ fn tone_channel(row: i32, v: f32, identity: f32) -> f32 {
     return lut(row, v);
 }
 
-// Modern Brightness curve: line of slope 1.375^(b/50) rolled off to (1,1) by a v^P white anchor.
-// Mirrors compose::adjust::modern_brightness.
-fn mbright(v: f32, b: f32) -> f32 {
-    if (b == 0.0) { return v; }
-    let s = pow(1.375, b / 50.0);
-    var p: f32;
-    if (b >= 0.0) { p = max(4.5 - 0.013 * b, 2.0); } else { p = 5.0 - 0.072 * b; }
-    let vv = clamp(v, 0.0, 1.0);
-    return clamp(s * vv + (1.0 - s) * pow(vv, p), 0.0, 1.0);
-}
-
-// Modern Contrast curve: symmetric cubic-Hermite S pivoting at 0.5.
-// Mirrors compose::adjust::modern_contrast.
-fn mcontrast(v: f32, ct: f32) -> f32 {
-    if (ct == 0.0) { return v; }
-    let k = ct / 128.0;
-    let e = 1.0 - k; let m = 1.0 + k;
-    let vv = clamp(v, 0.0, 1.0);
-    var t: f32;
-    if (vv <= 0.5) { t = vv / 0.5; } else { t = (1.0 - vv) / 0.5; }
-    let h = e * 0.5 * (t * t * t - 2.0 * t * t + t) + (-2.0 * t * t * t + 3.0 * t * t) * 0.5 + m * 0.5 * (t * t * t - t * t);
-    if (vv <= 0.5) { return h; }
-    return 1.0 - h;
-}
-
 fn adjust(c: vec3<f32>) -> vec3<f32> {
+    let hdr = (op.flags & F_HDR) != 0u;
     let p0 = op.p0;
     let p1 = op.p1;
     let p2 = op.p2;
     let p3 = op.p3;
     switch op.kind {
         case 1: { return 1.0 - c; }                                            // Invert
-        case 2: {                                                              // Threshold (p0.x = 8-bit level)
-            return vec3(select(0.0, 1.0, round_half_up(gray(c) * 255.0) >= p0.x));
+        case 2: {                                                              // Threshold (compose::adjust::threshold_white)
+            // p0.x = 8-bit level; p0.y = 1: 8-bit levels, 2: 16-bit samples against p0.z, 0: float.
+            // Sums of 30 R + 59 G + 11 B over whole samples are exact in f32.
+            var white = lum(c) * 255.0 >= p0.x;
+            if p0.y > 0.5 {
+                let q = select(32768.0, 255.0, p0.y < 1.5);
+                let v = floor(clamp(c, vec3(0.0), vec3(1.0)) * q + 0.5);
+                let s = 30.0 * v.r + 59.0 * v.g + 11.0 * v.b;
+                white = select(s >= 100.0 * p0.z, s > 100.0 * p0.x - 50.0, p0.y < 1.5);
+            }
+            return vec3(select(0.0, 1.0, white));
         }
-        case 3: { return vec3(posterize(c.r, p0.x), posterize(c.g, p0.x), posterize(c.b, p0.x)); }
-        case 4: { return clamp((c + p0.x - p0.z) * p0.y + p0.z + p0.w, vec3(0.0), vec3(1.0)); }   // B/C legacy: brightness before (p0.x) or after (p0.w) contrast around compose::adjust::LEGACY_PIVOT (p0.z)
-        case 5: {                                                              // B/C modern
-            let b = p0.x; let ct = p0.y;
-            return vec3(mcontrast(mbright(c.r, b), ct), mcontrast(mbright(c.g, b), ct), mcontrast(mbright(c.b, b), ct));
+        case 3: {                                                              // Posterize (p0.x levels; p0.y = 1: 16-bit)
+            if p0.y > 0.5 { return vec3(posterize16(c.r, p0.x), posterize16(c.g, p0.x), posterize16(c.b, p0.x)); }
+            return vec3(posterize(c.r, p0.x), posterize(c.g, p0.x), posterize(c.b, p0.x));
+        }
+        case 4: {                                                              // B/C legacy: brightness before (p0.x) or after (p0.w) contrast around the pivot (p0.z); 32-bit unclipped
+            let v = (c + p0.x - p0.z) * p0.y + p0.z + p0.w;
+            if (hdr) { return v; }
+            return clamp(v, vec3(0.0), vec3(1.0));
         }
         case 6: { return vec3(exposure(c.r, p0), exposure(c.g, p0), exposure(c.b, p0)); }  // Exposure
-        case 7: { return vec3(tone_channel(0, c.r, p0.x), tone_channel(1, c.g, p0.y), tone_channel(2, c.b, p0.z)); } // Levels / Curves
+        case 7: { return vec3(tone_channel(0, c.r, p0.x), tone_channel(1, c.g, p0.y), tone_channel(2, c.b, p0.z)); } // Levels / Curves / modern Brightness/Contrast (compose::adjust::modern_lut)
         case 17: { return vec3(levels_float(0, levels_float(1, c.r)), levels_float(0, levels_float(2, c.g)), levels_float(0, levels_float(3, c.b))); }
         case 8: {                                                              // Hue/Saturation
             let hsl = rgb_to_hsl(c);
@@ -678,13 +703,17 @@ fn adjust(c: vec3<f32>) -> vec3<f32> {
             l = clamp(l, vec3(0.0), vec3(p0.w));
             return vec3(t_encode(l.r, p0.z), t_encode(l.g, p0.z), t_encode(l.b, p0.z));
         }
-        case 10: {                                                             // Channel mixer
-            let r = clamp(dot(p0.xyz, c) + p0.w, 0.0, 1.0);
+        case 10: {                                                             // Channel mixer (32-bit unclipped)
+            let lo = select(0.0, -F32_MAX, hdr);
+            let hi = select(1.0, F32_MAX, hdr);
+            let r = clamp(dot(p0.xyz, c) + p0.w, lo, hi);
             if (p3.x > 0.5) { return vec3(r); }
-            return vec3(r, clamp(dot(p1.xyz, c) + p1.w, 0.0, 1.0), clamp(dot(p2.xyz, c) + p2.w, 0.0, 1.0));
+            return vec3(r, clamp(dot(p1.xyz, c) + p1.w, lo, hi), clamp(dot(p2.xyz, c) + p2.w, lo, hi));
         }
         case 11: {                                                             // Photo filter
             // compose::adjust::photo_filter_matrix (rows p0..p2) in linear light, then SetLum.
+            // 32-bit samples are linear already and stay unclipped.
+            if (hdr) { return vec3(dot(p0.xyz, c), dot(p1.xyz, c), dot(p2.xyz, c)); }
             let g = p3.y;
             let lin = vec3(t_decode(c.r, g), t_decode(c.g, g), t_decode(c.b, g));
             var f = vec3(t_encode(dot(p0.xyz, lin), g), t_encode(dot(p1.xyz, lin), g), t_encode(dot(p2.xyz, lin), g));
@@ -703,6 +732,7 @@ fn adjust(c: vec3<f32>) -> vec3<f32> {
             if (c.b <= c.r && c.b <= c.g) { secondary = 1; } else if (c.r <= c.g) { secondary = 3; }
             let g = clamp(mn + (mid - mn) * w[secondary] / 100.0 + (mx - mid) * w[primary] / 100.0, 0.0, 1.0);
             if (p1.z > 0.5) {
+                if (hdr) { return set_lum(p2.rgb, g, F32_MAX); }                // 32-bit: nothing clips at 1
                 return clamp(set_lum(p2.rgb, g, 1.0), vec3(0.0), vec3(1.0));   // Color blend of the tint
             }
             return vec3(g);
@@ -808,18 +838,94 @@ fn fs_mask(in: VOut) -> @location(0) vec4<f32> {
     return c;
 }
 
-// blend_into(backdrop = A, src = B, mode, opacity), including Dissolve.
-@fragment
-fn fs_blend(in: VOut) -> @location(0) vec4<f32> {
-    let p = local(in.pos);
-    let b = textureLoad(tex_a, p, 0);
-    var s = textureLoad(tex_b, p, 0);
+// blend_into(backdrop = b, src = s, mode, opacity) at chunk pixel p, including Dissolve.
+fn blend_px(p: vec2<i32>, b: vec4<f32>, src: vec4<f32>) -> vec4<f32> {
+    var s = src;
     if (s.a <= 0.0) { return b; }
     if (op.mode == M_DISSOLVE) {
         s.a = select(0.0, 1.0, dissolve_noise(doc_px(p)) < s.a * op.opacity * op.fill);
         return composite(M_NORMAL, b, s, 1.0);
     }
     return composite_fill(op.mode, b, s, op.opacity, op.fill, (op.flags & F_TEXT_GAMMA) != 0u);
+}
+
+// blend_into(backdrop = A, src = B, mode, opacity), including Dissolve.
+@fragment
+fn fs_blend(in: VOut) -> @location(0) vec4<f32> {
+    let p = local(in.pos);
+    return blend_px(p, textureLoad(tex_a, p, 0), textureLoad(tex_b, p, 0));
+}
+
+// fs_content then fs_blend in one pass: the layer's own pixels (times its mask) blended straight
+// onto A, without writing them to a chunk texture and reading them back.
+@fragment
+fn fs_layerblend(in: VOut) -> @location(0) vec4<f32> {
+    let p = local(in.pos);
+    let d = doc_px(p);
+    var s = layer_texel(d);
+    s.a = s.a * mask_value(d);
+    return blend_px(p, textureLoad(tex_a, p, 0), s);
+}
+
+// The pixel at document pixel d of an extra layer of fs_layerbatch: an unmasked plain layer whose
+// pixels are in texture `t` (0: tex_b, 1: tex_c, 2: map_tex). Three vec4 of the record describe
+// it: geo = (texture origin x, y, size w, h), color = its colour outside the texture,
+// prm = (opacity, fill, mode, 1 when it has a texture), all whole numbers stored as floats.
+fn batch_texel(t: i32, d: vec2<i32>, geo: vec4<f32>, color: vec4<f32>, prm: vec4<f32>) -> vec4<f32> {
+    let q = d - vec2<i32>(geo.xy);
+    if (prm.w > 0.5 && inside(q, vec2<i32>(geo.zw))) {
+        if (t == 0) {
+            return textureLoad(tex_b, q, 0);
+        } else if (t == 1) {
+            return textureLoad(tex_c, q, 0);
+        }
+        return textureLoad(map_tex, q, 0);
+    }
+    return color;
+}
+
+// One extra layer of fs_layerbatch (see batch_texel) blended onto b at document pixel d.
+fn batch_layer(t: i32, d: vec2<i32>, b: vec4<f32>, geo: vec4<f32>, color: vec4<f32>, prm: vec4<f32>) -> vec4<f32> {
+    let s = batch_texel(t, d, geo, color, prm);
+    if (s.a <= 0.0) { return b; }
+    return composite_fill(i32(prm.z), b, s, prm.x, prm.y, false);
+}
+
+// batch_layer of a Normal layer outside Lab documents.
+fn batch_layer_normal(t: i32, d: vec2<i32>, b: vec4<f32>, geo: vec4<f32>, color: vec4<f32>, prm: vec4<f32>) -> vec4<f32> {
+    let s = batch_texel(t, d, geo, color, prm);
+    if (s.a <= 0.0) { return b; }
+    return composite_normal_fill(b, s, prm.x, prm.y);
+}
+
+// fs_layerblend of this pass's layer, then `op.kind` (at most 3) more plain layers: consecutive
+// LayerBlend passes the executor draws as one, reading and writing the chunk once for all of them.
+@fragment
+fn fs_layerbatch(in: VOut) -> @location(0) vec4<f32> {
+    let p = local(in.pos);
+    let d = doc_px(p);
+    var s = layer_texel(d);
+    s.a = s.a * mask_value(d);
+    var b = blend_px(p, textureLoad(tex_a, p, 0), s);
+    if (op.kind >= 1) { b = batch_layer(0, d, b, op.p0, op.p1, op.p2); }
+    if (op.kind >= 2) { b = batch_layer(1, d, b, op.p3, op.q0, op.q1); }
+    if (op.kind >= 3) { b = batch_layer(2, d, b, op.q2, op.q3, op.q4); }
+    return b;
+}
+
+// fs_layerbatch for a run of Normal layers without text gamma, outside Lab documents.
+@fragment
+fn fs_layerbatch_normal(in: VOut) -> @location(0) vec4<f32> {
+    let p = local(in.pos);
+    let d = doc_px(p);
+    var s = layer_texel(d);
+    s.a = s.a * mask_value(d);
+    var b = textureLoad(tex_a, p, 0);
+    if (s.a > 0.0) { b = composite_normal_fill(b, s, op.opacity, op.fill); }
+    if (op.kind >= 1) { b = batch_layer_normal(0, d, b, op.p0, op.p1, op.p2); }
+    if (op.kind >= 2) { b = batch_layer_normal(1, d, b, op.p3, op.q0, op.q1); }
+    if (op.kind >= 3) { b = batch_layer_normal(2, d, b, op.q2, op.q3, op.q4); }
+    return b;
 }
 
 // composite_atop(base = A, src = B): blend as if the base were opaque, keep its alpha.
@@ -1164,8 +1270,12 @@ fn mix_premul(a: vec4<f32>, b: vec4<f32>, k: f32) -> vec4<f32> {
 fn fs_fxmerge(in: VOut) -> @location(0) vec4<f32> {
     let p = local(in.pos);
     var w = textureLoad(tex_a, p, 0);
-    let l = textureLoad(tex_b, p, 0);
+    var l = textureLoad(tex_b, p, 0);
     let c = textureLoad(tex_c, p, 0);
+    if ((op.flags & F_LAYER_SHAPE) != 0u) {
+        // fs_fxinit INIT_INSIDE then INIT_ALPHA, on the shape in B.
+        l = vec4(l.rgb, select(0.0, op.p0.x, l.a > INSIDE_EPS) * min(l.a, 1.0));
+    }
     if (l.a > 0.0 && (op.flags & F_NO_LAYER) == 0u) { w = composite_g(op.mode, w, l, 1.0, (op.flags & F_TEXT_GAMMA) != 0u); }
     let atop = (op.flags & F_ATOP) != 0u;
     var before = c;

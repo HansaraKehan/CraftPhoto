@@ -208,6 +208,23 @@ fn apply_cmd(s: &mut Session, p: &Value) -> Result<Value> {
     apply(s, id, "Apply Layer Comp")
 }
 
+/// How an action records Apply Layer Comp: by the comp's name, as Photoshop does. Comp ids are
+/// local to a document, so a recorded id would apply whichever comp of another document has it
+/// (#7181); by name the step finds that document's comp of the name, or stops with an error.
+/// The comp is the one just applied, so `{}` and `null` (the last applied) record its name too.
+pub(crate) fn recorded_apply(s: &Session, mut p: Value) -> Value {
+    let Some(d) = s.active() else { return p };
+    let Some(comp) = d.doc.last_applied_comp.and_then(|id| d.doc.comp(id)) else { return p };
+    // `null` params run as `{}` (the last applied comp), so they are recorded by name too.
+    if p.is_null() {
+        p = json!({});
+    }
+    if let Value::Object(m) = &mut p {
+        m.insert("comp".into(), json!(comp.name));
+    }
+    p
+}
+
 fn step(s: &mut Session, delta: i64) -> Result<Value> {
     let d = s.active().ok_or(EngineError::NoDocument)?;
     let n = d.doc.layer_comps.len() as i64;

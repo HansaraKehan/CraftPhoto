@@ -17,6 +17,8 @@ pub enum Badge {
     Add,
     Subtract,
     Intersect,
+    /// Four arrows: a press drags the point under the pointer (the Curvature Pen over an anchor).
+    Move,
 }
 
 impl Badge {
@@ -105,6 +107,12 @@ pub fn badge(app: &PhotocraftApp, tool: Tool, m: egui::Modifiers) -> Option<Badg
     if let Some(t) = crate::anchor_tools::effective(tool, m) {
         return (!m.command).then_some(if t == Tool::AddAnchorPoint { Badge::Add } else { Badge::Subtract });
     }
+    // The Curvature Pen over a point: + on the active path's segments (a click adds an anchor
+    // there), four arrows on an anchor (a press drags it).
+    if let Some(p) = app.hover_doc.filter(|_| tool == Tool::CurvaturePen) {
+        return crate::direct_select::curvature_hover(app, p, m)
+            .map(|h| if matches!(h, photocraft_vector::edit::Hit::Segment(..)) { Badge::Add } else { Badge::Move });
+    }
     // The Pen over the active path with Auto Add/Delete on: what a click would do (#4144).
     if let Some(p) = app.hover_doc.filter(|_| tool == Tool::Pen) {
         return crate::anchor_tools::pen_auto(app, tool, m, p).map(|(t, ..)| if t == Tool::AddAnchorPoint { Badge::Add } else { Badge::Subtract });
@@ -129,6 +137,17 @@ pub fn badge_glyph(b: Badge, c: Pos2, h: f32) -> Vec<[Pos2; 2]> {
     match b {
         Badge::Add => vec![[c - vec2(h, 0.0), c + vec2(h, 0.0)], [c - vec2(0.0, h), c + vec2(0.0, h)]],
         Badge::Subtract => vec![[c - vec2(h, 0.0), c + vec2(h, 0.0)]],
+        Badge::Move => {
+            let a = h * 0.45;
+            let mut v = vec![[c - vec2(h, 0.0), c + vec2(h, 0.0)], [c - vec2(0.0, h), c + vec2(0.0, h)]];
+            for d in [vec2(1.0, 0.0), vec2(-1.0, 0.0), vec2(0.0, 1.0), vec2(0.0, -1.0)] {
+                let tip = c + d * h;
+                let side = vec2(-d.y, d.x) * a;
+                v.push([tip, tip - d * a + side]);
+                v.push([tip, tip - d * a - side]);
+            }
+            v
+        }
         Badge::Intersect => {
             let d = h * 0.8;
             vec![[c + vec2(-d, -d), c + vec2(d, d)], [c + vec2(-d, d), c + vec2(d, -d)]]

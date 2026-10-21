@@ -40,17 +40,21 @@ pub mod blocks;
 pub mod camera_raw_xmp;
 mod channel_map;
 pub mod comps_map;
+pub mod doc_path;
 pub mod effects_map;
 pub mod exr_parts;
 mod flat;
 mod gradient_bake;
+pub mod guides_map;
 pub use gradient_bake::{Method as GradientMethod, bake as bake_gradient};
 mod kra;
 pub mod linked;
 mod multichannel_map;
 mod ora;
+mod palette_map;
 pub use ora::losses as ora_losses;
 pub mod pattern_map;
+pub mod pdf;
 mod pdn;
 pub mod pixels;
 mod psd_export;
@@ -65,9 +69,9 @@ pub mod text_styles_map;
 pub mod tiff_layers;
 pub mod vector_map;
 
-pub use photocraft_codecs::DpxBits;
 use photocraft_codecs::{CodecError, EncodeOptions};
-use photocraft_doc::Document;
+pub use photocraft_codecs::{DdsCompression, DdsOptions, DpxBits};
+use photocraft_doc::{Adjustment, Document, Layer, LayerContent};
 use photocraft_psd::{PsdError, PsdFile};
 
 pub use adjust_map::ADJUSTMENT_KEYS;
@@ -138,6 +142,34 @@ pub(crate) fn unequal_resolution_warning(x: f64, y: f64) -> Option<String> {
         .then(|| format!("the vertical resolution ({y:.2} ppi) differs from the horizontal ({x:.2} ppi); the document keeps {x:.2} ppi for both"))
 }
 
+/// Warnings about a loaded document's layers that render without their stored effect, for
+/// sources that carry no import warnings of their own (a crafted `.pcraft`): a Color Lookup
+/// whose table can't be applied silently renders as the identity instead (#1763).
+pub fn open_warnings(doc: &Document) -> Vec<String> {
+    let mut out = Vec::new();
+    // Iterative, so no document's nesting can make this recurse.
+    let mut stack: Vec<&Layer> = doc.layers.iter().rev().collect();
+    while let Some(l) = stack.pop() {
+        if let LayerContent::Adjustment(Adjustment::ColorLookup { name: _, size, lut, .. }) = &l.content {
+            match lut.as_deref().zip(photocraft_doc::adjust::lut3d_len(*size)) {
+                Some((table, len)) if table.len() >= len => {}
+                Some((table, len)) => out.push(format!(
+                    "layer \"{}\": its Color Lookup table has {} values, but a {size}³ lookup needs {len}; the layer renders without the lookup",
+                    l.name,
+                    table.len()
+                )),
+                None => {
+                    out.push(format!("layer \"{}\": its Color Lookup has no usable table for a {size}³ lookup; the layer renders without the lookup", l.name))
+                }
+            }
+        }
+        if let Some(children) = l.children() {
+            stack.extend(children.iter().rev());
+        }
+    }
+    out
+}
+
 /// Result of [`export`].
 #[derive(Debug, Clone)]
 pub struct ExportResult {
@@ -186,6 +218,9 @@ pub struct ExportOptions {
     /// File Compatibility (see [`PsdExportOptions::maximize_compatibility`]). On by default, as
     /// Photoshop's Always.
     pub psd_maximize_compatibility: bool,
+    /// The path of the document's own file, which linked smart objects that PSD/PSB and layered
+    /// TIFF embed are resolved against ([`doc_path::resolve`]).
+    pub document_path: Option<std::path::PathBuf>,
 }
 
 impl Default for ExportOptions {
@@ -198,6 +233,7 @@ impl Default for ExportOptions {
             tga_bits: None,
             image_previews: true,
             psd_maximize_compatibility: true,
+            document_path: None,
         }
     }
 }
@@ -270,16 +306,22 @@ pub fn import_with_svg_group_depth_and_interrupt(
 fn import_stages(name: &str, bytes: &[u8], ctl: &photocraft_raster::Interrupt, max_group_depth: usize) -> Result<ImportResult, IoError> {
     // A declared native extension must reach its loader so malformed bundles retain format errors.
     if has_extension(name, photocraft_format::EXTENSION) || photocraft_format::is_pcraft(bytes) {
-        return Ok(ImportResult { document: photocraft_format::load_from_bytes(bytes)?, warnings: Vec::new(), source_read_only: false, preview_only: false });
+        let document = photocraft_format::load_from_bytes(bytes)?;
+        return Ok(ImportResult { warnings: open_warnings(&document), document, source_read_only: false, preview_only: false });
     }
     if is_psd(bytes) {
-        let file = PsdFile::from_bytes(bytes)?;
+        // A merged image the import reads is decoded with the parse: a ZIP one is inflated once.
+        let (file, merged) = PsdFile::from_bytes_and_merged_recovering(
+            bytes,
+            |f| psd_import::check_group_depth(f).is_ok() && psd_import::merged_needed(f),
+            psd_import::can_recover_layers,
+        )?;
         // Nesting past the document model's cap could never be saved; reject the file with the
         // actionable limit.
         psd_import::check_group_depth(&file)?;
         ctl.check().map_err(|_| IoError::Cancelled)?;
         ctl.progress(0.05);
-        let (mut document, warnings) = psd_import::psd_to_document_with(&file, ctl).ok_or(IoError::Cancelled)?;
+        let (mut document, warnings) = psd_import::psd_to_document_decoded(&file, ctl, merged).ok_or(IoError::Cancelled)?;
         document.name = name.to_string();
         text_import::prepare(&mut document);
         return Ok(ImportResult { document, warnings, source_read_only: false, preview_only: false });
@@ -390,6 +432,9 @@ fn export_stages(doc: &Document, name_or_ext: &str, opts: &ExportOptions, ctl: &
     if ext == "ora" {
         return ora::export(doc);
     }
+    if ext == "pdf" {
+        return pdf::export(doc);
+    }
     if ext == photocraft_format::EXTENSION {
         let doc = named_for_file(doc, name_or_ext);
         let thumbnail = Some(photocraft_compose::thumbnail(doc.as_ref(), 256));
@@ -402,7 +447,12 @@ fn export_stages(doc: &Document, name_or_ext: &str, opts: &ExportOptions, ctl: &
         return Ok(ExportResult { bytes: photocraft_format::save_to_bytes(doc.as_ref(), &previews)?, warnings: Vec::new() });
     }
     if ext == "psd" || ext == "psb" {
-        let o = PsdExportOptions { force_psb: opts.force_psb || ext == "psb", maximize_compatibility: opts.psd_maximize_compatibility, ..Default::default() };
+        let o = PsdExportOptions {
+            force_psb: opts.force_psb || ext == "psb",
+            maximize_compatibility: opts.psd_maximize_compatibility,
+            document_path: opts.document_path.clone(),
+            ..Default::default()
+        };
         let (mut file, mut warnings) = with_span(ctl, 0.0, PSD_MODEL_DONE, |ctl| psd_export::document_to_psd_interruptible(doc, &o, ctl));
         // A cancelled conversion stops early with an incomplete model: never write it.
         ctl.check().map_err(|_| IoError::Cancelled)?;

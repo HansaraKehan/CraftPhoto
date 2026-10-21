@@ -346,6 +346,10 @@
 # Field Blur pins (#3373)
 	No pin selected	Булавка не выбрана
 	Click the image to add a pin; drag a pin to move it, or its ring to change its blur. Delete removes the selected pin.	Щелкните изображение, чтобы добавить булавку; перетащите булавку, чтобы переместить ее, или ее кольцо, чтобы изменить размытие. Delete удаляет выбранную булавку.
+	Drag the handles on the outline to resize and turn it, the square to round its corners, and the dots inside to set where the blur starts.	Перетаскивайте маркеры на контуре, чтобы изменить размер и повернуть его, квадрат — чтобы скруглить углы, а точки внутри — чтобы задать, где начинается размытие.
+	Drag the pin to move the band, or its ring to change its blur. Drag the solid lines to widen the sharp band, the dashed lines to set the transition, and the dots to turn it.	Перетащите булавку, чтобы сдвинуть полосу, или ее кольцо, чтобы изменить размытие. Сплошные линии расширяют резкую полосу, пунктирные задают переход, а точки поворачивают ее.
+	Drag the handles on the outline to resize and turn it; the ring sets the blur angle.	Перетаскивайте маркеры на контуре, чтобы изменить размер и повернуть его; кольцо задает угол размытия.
+	Blur Angle	Угол размытия
 	Iris Blur…	Диафрагменное размытие…
 	Tilt-Shift…	Наклон-сдвиг…
 	Path Blur…	Размытие по контуру…
@@ -909,9 +913,7 @@
 	Newspaper	Газетная бумага
 	Working Spaces	Рабочие пространства
 	Color Management Policies	Правила управления цветом
-	Convert document's colors to the working space	Преобразовать цвета документа в рабочее пространство
 	Assign working space	Назначить рабочее пространство
-	Use the embedded profile (instead of the working space)	Использовать встроенный профиль (вместо рабочего пространства)
 	Leave as is (don't color manage)	Оставить как есть (без управления цветом)
 	Discard the embedded profile (don't color manage)	Не использовать встроенный профиль (без управления цветом)
 	Embed Color Profile	Встроить цветовой профиль
@@ -1021,6 +1023,11 @@
 	Mix	Смешивание
 	Auto Clean Brush	Автоочистка кисти
 	Wet	Влага
+	Current Brush Load	Текущая загрузка кисти
+	Load Brush	Загрузить кисть
+	Clean Brush	Очистить кисть
+	Load the brush after each stroke	Загружать кисть после каждого штриха
+	Clean the brush after each stroke	Очищать кисть после каждого штриха
 	Rate	Скорость
 	Airbrush: keeps depositing paint while the pointer rests.	Аэрограф: продолжает наносить краску, пока курсор неподвижен.
 	Pulled String Mode	Режим натянутой нити
@@ -1038,6 +1045,8 @@
 	Rename Brush…	Переименовать кисть…
 	Delete Brush	Удалить кисть
 	Import Brushes…	Импортировать кисти…
+	Import Brushes… (.abr or image)	Импортировать кисти… (.abr или изображение)
+	Import Brush from Image…	Импортировать кисть из изображения…
 	Gradient Preset Options	Параметры наборов градиентов
 	Import .GRD	Импортировать .GRD
 	Choose a gradient file (.grd).	Выберите файл градиентов (.grd).
@@ -1696,6 +1705,7 @@
 	These settings aren't available in PhotoCraft yet.	Эти параметры пока недоступны в PhotoCraft.
 	Shortcut removed.	Комбинация клавиш удалена.
 	All shortcuts reset to PhotoCraft defaults.	Все комбинации клавиш сброшены к стандартным PhotoCraft.
+	Add Shortcut	Добавить комбинацию
 	Delete Shortcut	Удалить комбинацию
 	Press keys…	Нажмите клавиши…
 	shortcut	комбинация
@@ -2304,6 +2314,8 @@
 	Camera Raw Defaults	Значения Camera Raw по умолчанию
 	Canvas border	Рамка холста
 	Show canvas dots	Показывать точки холста
+	Clip thumbnails to layer bounds	Обрезать миниатюры по границам слоя
+	Clip Thumbnails to Layer Bounds	Обрезать миниатюры по границам слоя
 	Canvas color	Цвет холста
 	Canvas custom color	Свой цвет холста
 	Classic	Классическая
@@ -2476,7 +2488,6 @@
 	Cancelled opening {name}	Открытие {name} отменено
 	The document “{name}” does not have an embedded {mode} profile.	В документе «{name}» нет встроенного профиля {mode}.
 	The document “{name}” has an embedded color profile that does not match the current {mode} working space.	Встроенный цветовой профиль документа «{name}» не совпадает с текущим рабочим пространством {mode}.
-	Embedded: {embedded}	Встроенный: {embedded}
 	Working: {working}	Рабочее пространство: {working}
 	Developing {name}	Обработка {name}
 	Cancelled {label}	{label}: отменено
@@ -2706,7 +2717,6 @@ cameraRaw	Roughness	Неровность
 	Redrawing	Перерисовка
 	This redraw took {seconds} s on the CPU.	Эта перерисовка на CPU заняла {seconds} с.
 	Edits that change the whole document, such as a layer's blend mode, opacity or visibility, redraw all of it.	Правки, затрагивающие весь документ, например режим наложения, непрозрачность или видимость слоя, перерисовывают его целиком.
-	Its layers don't fit the GPU memory budget. Raising Memory usage in Preferences › Performance raises the budget, up to a quarter of this computer's memory.	Слои не помещаются в бюджет памяти GPU. Увеличение параметра «Память» в разделе Настройки › Производительность повышает бюджет, но не больше четверти памяти этого компьютера.
 	The GPU compositor wasn't used: {reason}	Компоновщик GPU не использовался: {reason}
 fontWeight	Thin	Тонкий
 fontWeight	ExtraLight	Сверхтонкий
@@ -2772,6 +2782,8 @@ fontWeight	Italic	Курсив
 	Color Picker (Layer Style Color)	Палитра цветов (цвет стиля слоя)
 	Auto Hide Notifications	Автоскрытие уведомлений
 	Notification Duration (seconds)	Длительность уведомления (секунды)
+	Bundle Arrow-Key Nudges	Объединять сдвиги стрелками
+	Nudge Bundle Pause (ms)	Пауза объединения сдвигов (мс)
 	Appearance Mode	Режим оформления
 	Dark Theme	Тёмная тема
 	Light Theme	Светлая тема
@@ -2968,7 +2980,26 @@ cameraData	Lens	Объектив
 	Rasterize Layer Style	Растрировать стиль слоя
 	Search settings…	Поиск настроек…
 	No matching settings	Нет подходящих настроек
+# Edit › Content-Aware Fill workspace
+	Sampling Brush Tool	Кисть области выборки
+	Sampling Area Overlay	Наложение области выборки
+	Show Sampling Area	Показать область выборки
+	Indicates	Обозначает
+	Sampling Area	Область выборки
+	Excluded Area	Исключённая область
+	Sampling Area Options	Параметры области выборки
+	Rectangular	Прямоугольная
+	Fill Settings	Параметры заливки
+	Rotation Adaptation	Адаптация поворота
+	Very High	Очень высокая
+	Full	Полная
+	Mirror	Отражение
+	Output Settings	Параметры вывода
+	Output To	Вывод в
+	Duplicate Layer	Дубликат слоя
+	Contract	Сжать
 	Loading fonts…	Загрузка шрифтов…
+	Response curve	Кривая отклика
 	Tool	Инструмент
 	Simulate Pressure	Имитировать нажим
 	Stroke Path…	Обвести контур…
@@ -3055,6 +3086,7 @@ curves	Smooth	Сгладить
 	Remove after each stroke	Удалять после каждого штриха
 	Apply the removal ({key})	Применить удаление ({key})
 	Strokes to remove: {n} (Enter applies, Esc cancels)	Штрихов к удалению: {n} (Enter применяет, Esc отменяет)
+	Show home recent files	Показывать недавние файлы на домашнем экране
 	Clear Brush Controls	Очистить параметры кисти
 	Reset All Locked Settings	Сбросить все заблокированные параметры
 	Copy Texture to Other Tools	Скопировать текстуру в другие инструменты
@@ -3081,6 +3113,10 @@ curves	Smooth	Сгладить
 	Action playback stopped	Воспроизведение операции остановлено
 	Step {step} is waiting for its dialog	Шаг {step} ожидает своего диалога
 @plural	{n} action|{n} actions	{n} операция|{n} операции|{n} операций
+	Background (Default)	Фон (по умолчанию)
+	Content-Aware Fill	Заливка с учётом содержимого
+# Batch / Image Processor
+	Include All Subfolders	Включить все вложенные папки
 	Auto Add/Delete	Автодобавление/удаление
 
 # Native Windows printing qualification
@@ -3110,3 +3146,88 @@ curves	Smooth	Сгладить
 	Gray Value (Median)	Уровень серого (медиана)
 	Integrated Density	Интегральная плотность
 	Length	Длина
+# Embedded Profile Mismatch: profile names beside the choices, Remember this choice
+	Use the embedded profile ({profile})	Использовать встроенный профиль ({profile})
+	Convert to the working space ({profile})	Преобразовать в рабочее пространство ({profile})
+	Remember this choice for future images	Запомнить этот выбор для следующих изображений
+	Turn the prompt back on with Ask On Mismatch in Edit › Color Settings.	Снова включить вопрос можно параметром Ask On Mismatch в Редактирование › Настройки цвета.
+	Button Mode	Режим кнопок
+	Button Mode On	Режим кнопок включён
+
+# Darken / Lighten Interface (⇧⌘F1 / ⇧⌘F2)
+	Darken Interface	Сделать интерфейс темнее
+	Lighten Interface	Сделать интерфейс светлее
+# Bevel & Emboss Technique.
+	Technique	Метод
+	Chisel Hard	Жесткая огранка
+	Chisel Soft	Мягкая огранка
+	Open color-less EXR as ACEScg	Открывать EXR без цветового профиля как ACEScg
+
+# View › Guides › right-click a guide
+	Edit Selected Guides	Изменить выбранные направляющие
+	Clear Selected Guides	Удалить выбранные направляющие
+	Pasting from other apps is unavailable	Вставка из других приложений недоступна
+	PhotoCraft can't reach the system clipboard in this session. On Wayland, a Flatpak sandbox hides the protocol that images from other apps are read through.	В этом сеансе PhotoCraft не может получить доступ к системному буферу обмена. В Wayland песочница Flatpak скрывает протокол, через который читаются изображения из других приложений.
+	To paste from other apps, start PhotoCraft under XWayland: `{command}`	Чтобы вставлять из других приложений, запустите PhotoCraft под XWayland: `{command}`
+	Nothing to paste: PhotoCraft can't read the system clipboard here	Нечего вставить: здесь PhotoCraft не может прочитать системный буфер обмена
+	Delete this set	Удалить этот набор
+	New Set…	Новый набор…
+	PhotoCraft Defaults	Стандартные PhotoCraft
+	Save a list of these shortcuts as a web page	Сохранить список этих комбинаций как веб-страницу
+	Save the changes to this set	Сохранить изменения в этом наборе
+	Save these shortcuts as a .kys file	Сохранить эти комбинации как файл .kys
+	Save these shortcuts as a new set	Сохранить эти комбинации как новый набор
+	Set deleted.	Набор удалён.
+	Set saved.	Набор сохранён.
+	Set:	Набор:
+	Summarize…	Сводка…
+	There are too many sets: delete one first.	Слишком много наборов: сначала удалите один.
+	set name	имя набора
+	{set} (modified)	{set} (изменён)
+	Random	Случайно
+	Show file name in title	Показывать имя файла в заголовке
+	Accept and Go to Conflict	Принять и перейти к конфликту
+	Changes undone.	Изменения отменены.
+	Choose a new shortcut for this command, or leave it without one.	Выберите новую комбинацию для этой команды или оставьте её без комбинации.
+	Put this command's shortcuts back as they were	Вернуть комбинации этой команды
+	Take the shortcut from the other command and select it	Снять комбинацию с другой команды и выбрать её
+	Undo Changes	Отменить изменения
+	{shortcut} is reserved by the system and can't be assigned.	Комбинация {shortcut} зарезервирована системой и не может быть назначена.
+	Low-Latency Drawing (vsync off, applies at next launch)	Рисование с малой задержкой (без вертикальной синхронизации, после перезапуска)
+# Free Transform: a new layer while the box is open (#5859)
+	Free Transform is still being applied; try again when it has finished.	Свободное трансформирование ещё применяется; повторите попытку, когда оно завершится.
+	The transform couldn't be applied.	Не удалось применить трансформирование.
+# Preferences › Performance › GPU Memory; the status bar and slow-redraw notice
+	Its layers need {needed} of GPU memory; the budget leaves them {budget}.	Слоям нужно {needed} памяти GPU; бюджет оставляет им {budget}.
+	Set GPU Memory in Preferences › Performance to what your graphics card can hold, at most 3/8 of its memory. Automatic follows Memory Usage, within a quarter of this computer's memory and 3/8 of the card's, and doesn't count the document against a card whose memory is known. The status bar shows GPU Memory Full while they don't fit.	Задайте «Память GPU» в разделе Настройки › Производительность по объёму, который вмещает ваша видеокарта, не больше 3/8 её памяти. «Автоматически» следует параметру «Память», в пределах четверти памяти этого компьютера и 3/8 памяти видеокарты, и не учитывает документ на видеокарте с известным объёмом памяти. Пока слои не помещаются, в строке состояния показано «Память GPU заполнена».
+	GPU Memory Full	Память GPU заполнена
+	The layers need {needed} of GPU memory and may hold {budget}, so edits that redraw the whole document do it on the CPU. Click to set GPU Memory.	Слоям нужно {needed} памяти GPU, а занимать они могут {budget}, поэтому правки, перерисовывающие весь документ, выполняются на CPU. Нажмите, чтобы задать «Память GPU».
+	GPU memory budget: {budget}	Бюджет памяти GPU: {budget}
+	This document's layers: {needed} of {budget} for layers	Слои этого документа: {needed} из {budget} для слоёв
+	This document's layers need {needed} but may hold {budget}: whole-document redraws use the CPU	Слоям этого документа нужно {needed}, но занимать они могут {budget}: весь документ перерисовывается на CPU
+	GPU Memory (MB, 0 = Automatic)	Память GPU (МБ, 0 = автоматически)
+	Replace	Заменить
+	{name} was changed by another app after it was opened or saved here.	Файл {name} был изменён другим приложением после того, как его открыли или сохранили здесь.
+	Replace it with this document, or cancel and use File › Save As to keep both.	Замените его этим документом или отмените и используйте Файл › Сохранить как, чтобы сохранить оба.
+	Decrease Brush Size	Уменьшить размер кисти
+	Increase Brush Size	Увеличить размер кисти
+	Decrease Brush Hardness	Уменьшить жёсткость кисти
+	Increase Brush Hardness	Увеличить жёсткость кисти
+	Memory Usage	Использование памяти
+	Per-document RAM limit (MB)	Лимит ОЗУ на документ (МБ)
+	Installed RAM: {ram} MB; this limit: {percent}%	Установлено ОЗУ: {ram} МБ; этот лимит: {percent}%
+	Limits each open document's pixels plus History. Oldest undo states are discarded when the limit is exceeded.	Ограничивает пиксели и историю каждого открытого документа. Старые состояния отмены удаляются при превышении лимита.
+	Applies immediately when saved. Memory is not reserved in advance.	Применяется сразу после сохранения. Память заранее не резервируется.
+	With GPU Memory set to Automatic, this also limits the GPU layer budget. That budget is capped at one quarter of installed RAM and, when known, three eighths of the graphics card's memory, with a 512 MB minimum. Raising this limit beyond those caps does not increase the GPU budget.	При GPU-памяти «Авто» это также ограничивает бюджет GPU. Потолок — четверть ОЗУ и, если известно, три восьмых памяти карты, минимум 512 МБ. Больший лимит GPU-бюджет не увеличивает.
+	Command	Command
+	Use	Использовать
+	In Front	Спереди
+	Behind	Сзади
+
+# DDS Options (#1327)
+	DDS Options	Параметры DDS
+	Compression	Сжатие
+	Generate Mipmaps	Создать MIP-карты
+
+# Graphics Adapter preference (#1885)
+	GPU adapter	Адаптер GPU

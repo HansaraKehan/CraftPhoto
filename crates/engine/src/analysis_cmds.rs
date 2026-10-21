@@ -198,7 +198,7 @@ pub(crate) fn compound<R>(s: &mut Session, label: &str, f: impl FnOnce(&mut Sess
             // As in `Session::edit`: undo targets what was selected just before the step (#1356).
             st.history.set_current_layers(prior);
             st.history.record(label, before, st.layer_target());
-            st.history.trim(&st.doc);
+            st.trim_history();
             st.coalesce = None;
             Ok(v)
         }
@@ -722,10 +722,12 @@ fn group_index(d: &Document, p: &Value) -> Option<usize> {
     (i < d.measurement.count_groups.len()).then_some(i)
 }
 
-fn color_of(p: &Value, key: &str) -> Option<Color> {
-    p.get(key)?;
-    let c = crate::commands::color_param(p, key, [1.0, 0.0, 0.0, 1.0]);
-    Some(Color::rgb(c[0], c[1], c[2]))
+fn color_of(cmd: &str, p: &Value, key: &str) -> Result<Option<Color>> {
+    if p.get(key).is_none() {
+        return Ok(None);
+    }
+    let c = crate::commands::color_param(cmd, p, key, [1.0, 0.0, 0.0, 1.0])?;
+    Ok(Some(Color::rgb(c[0], c[1], c[2])))
 }
 
 /// Photoshop's colours for new count groups, in order.
@@ -755,7 +757,12 @@ fn count_add(s: &mut Session, p: &Value) -> Result<Value> {
     if !at[0].is_finite() || !at[1].is_finite() {
         return Err(bad("count.add", "coordinates must be finite"));
     }
-    let gi = p.get("group").and_then(Value::as_u64).map(|v| v as usize);
+    let gi = p.get("group").and_then(Value::as_u64).map(|v| usize::try_from(v).map_err(|_| bad("count.add", "no such group"))).transpose()?;
+    // The first marker creates group zero, but an explicit target must never be redirected.
+    let group_count = doc(s)?.measurement.count_groups.len().max(1);
+    if gi.is_some_and(|i| i >= group_count) {
+        return Err(bad("count.add", "no such group"));
+    }
     let n = s.edit("Count", |d, _| {
         if d.measurement.count_groups.is_empty() {
             let g = new_group(d, None, None);
@@ -840,7 +847,7 @@ fn count_clear(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn count_new_group(s: &mut Session, p: &Value) -> Result<Value> {
     let name = p.get("name").and_then(Value::as_str).map(str::to_string);
-    let color = color_of(p, "color");
+    let color = color_of("count.newGroup", p, "color")?;
     s.edit("New Count Group", |d, _| {
         let g = new_group(d, name, color);
         d.measurement.count_groups.push(g);
@@ -856,7 +863,9 @@ fn count_delete_group(s: &mut Session, p: &Value) -> Result<Value> {
     s.edit("Delete Count Group", |d, _| {
         d.measurement.count_groups.remove(g);
         let n = d.measurement.count_groups.len();
-        d.measurement.active_count_group = d.measurement.active_count_group.min(n.saturating_sub(1));
+        // Removing a group before the active one shifts it down a slot.
+        let a = d.measurement.active_count_group;
+        d.measurement.active_count_group = (if g < a { a - 1 } else { a }).min(n.saturating_sub(1));
         Ok(())
     })?;
     Ok(count_json(doc(s)?.as_ref()))
@@ -887,7 +896,7 @@ fn count_set_group(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(n) = p.get("name").and_then(Value::as_str) {
         grp.name = n.to_string();
     }
-    if let Some(c) = color_of(p, "color") {
+    if let Some(c) = color_of(CMD, p, "color")? {
         grp.color = c;
     }
     if let Some(v) = whole_size(CMD, p, "markerSize", 1, 10)? {
@@ -1121,8 +1130,12 @@ fn place_scale_marker(s: &mut Session, p: &Value) -> Result<Value> {
     };
     // Bottom-left with a margin; the text sits under (or over) the bar.
     let margin = (w.min(h) * 0.03).round().max(2.0);
-    let bar_h = (font_size / 4.0).round().clamp(2.0, h / 4.0);
-    let text_h = if show_text { font_size * 1.25 } else { 0.0 };
+    // `fontSize` is in points; `type.create` renders it at resolution/72 px per point, so lay out
+    // the bar and label in those pixels (at 300 ppi, 12 pt is 50 px) (#5754).
+    let dpi = f64::from(d.resolution_dpi);
+    let font_px = font_size * if dpi.is_finite() && dpi > 0.0 { dpi / 72.0 } else { 1.0 };
+    let bar_h = (font_px / 4.0).round().clamp(2.0, h / 4.0);
+    let text_h = if show_text { font_px * 1.25 } else { 0.0 };
     // Keep the bar on the canvas when the text under it doesn't fit; the label is clipped instead (#932).
     let bar_y = if text_top { h - margin - bar_h } else { h - margin - bar_h - text_h }.max(0.0);
     // Likewise pull a bar nearly as wide as the image in from the right edge (#932).
@@ -1143,7 +1156,7 @@ fn place_scale_marker(s: &mut Session, p: &Value) -> Result<Value> {
         })?;
         let mut text_layer = Value::Null;
         if show_text {
-            let baseline = if text_top { f64::from(bar.y0) - font_size * 0.3 } else { f64::from(bar.y1) + font_size };
+            let baseline = if text_top { f64::from(bar.y0) - font_px * 0.3 } else { f64::from(bar.y1) + font_px };
             let mut tp = json!({"x": bar.x0, "y": baseline, "text": label, "size": font_size, "color": [rgb[0], rgb[1], rgb[2], 1.0], "name": label});
             if let Some(f) = &font {
                 tp["font"] = json!(f);

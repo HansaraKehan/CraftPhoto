@@ -203,6 +203,11 @@ impl B {
         self.fields.push((kind, reach_for(width)));
         In::Field(kind)
     }
+    /// A chiselled bevel's inside and outside fields, always asked for together ([`bevel_fields`]
+    /// computes them as one).
+    fn bevel_fields(&mut self, width: f32) -> [In; 2] {
+        [FieldKind::BevelInside, FieldKind::BevelOutside].map(|k| self.field(k, width))
+    }
     /// `Map::shifted` by whole pixels (`invert`: of `1 - a`); identity shifts of the plain map
     /// are skipped.
     fn shift(&mut self, src: In, dx: f32, dy: f32, outside: f32, invert: bool) -> In {
@@ -374,8 +379,7 @@ pub(crate) fn program_with(e: &Effect, light: &GlobalLight, vector_shape: bool, 
             let mut h = if bv.technique == BevelTechnique::Smooth {
                 b.conv(In::Shape, photocraft_compose::effects::tent_kernel(g.width))
             } else {
-                let din = b.field(FieldKind::BevelInside, size);
-                let dout = b.field(FieldKind::BevelOutside, size);
+                let [din, dout] = b.bevel_fields(size);
                 let soft = g.chisel_soft > 0.0;
                 let h = b.push(stage(Kernel::MBevelH, Some(din), Some(dout), [paint(g.paint), size, f32::from(u8::from(soft)), 0.0], 0));
                 // As `effects::bevel_height`: only emboss styles blur a Chisel Soft ramp.
@@ -542,20 +546,51 @@ fn threaded_inside(kind: FieldKind) -> bool {
 /// fields run on all threads inside `distance_field`, from one window. That is also the window the CPU
 /// compositor computes them from, so a rebuilt field is exactly the one it gives.
 fn field_banded(kind: FieldKind, reach: i32, shape: &[f32], region: Rect, out: Rect, halo: i32) -> Vec<f32> {
-    if threaded_inside(kind) {
-        let win = out.inflate(halo).intersect(&region);
-        if win.is_empty() {
-            return Vec::new();
-        }
-        let f = photocraft_compose::effects::distance_field(kind, crop(shape, region, win), win.width() as usize, win.height() as usize, reach as f32);
-        return if win == out { f } else { crop(&f, win, out) };
-    }
-    let parts = par_map(bands(out, BAND.max(halo)), |band| {
-        let win = band.inflate(halo).intersect(&region);
-        let f = photocraft_compose::effects::distance_field(kind, crop(shape, region, win), win.width() as usize, win.height() as usize, reach as f32);
-        crop(&f, win, band)
+    let [f] = fields_in_windows(threaded_inside(kind), shape, region, out, halo, |s, w, h| {
+        [photocraft_compose::effects::distance_field(kind, s, w, h, reach as f32)]
     });
-    parts.concat()
+    f
+}
+
+/// [`field`] of both bevel fields over the same `out`, `[BevelInside, BevelOutside]`, with the
+/// sharp edges of each window found once (the two kinds have the same radius and threading).
+pub(crate) fn bevel_fields(reach: i32, shape: &[f32], region: Rect, out: Rect) -> [Vec<f32>; 2] {
+    let kind = FieldKind::BevelInside;
+    fields_in_windows(threaded_inside(kind), shape, region, out, field_radius(kind, reach) + 1, |s, w, h| {
+        photocraft_compose::effects::bevel_distance_fields(s, w, h, reach as f32)
+    })
+}
+
+/// The fields `compute` gives for a `w × h` window of the region-sized `shape`, over `out` (inside
+/// `region`), each window grown by `halo`: `out` as one window when `whole` (the field spreads over
+/// threads itself), else bands of it in parallel.
+fn fields_in_windows<const N: usize>(
+    whole: bool,
+    shape: &[f32],
+    region: Rect,
+    out: Rect,
+    halo: i32,
+    compute: impl Fn(Vec<f32>, usize, usize) -> [Vec<f32>; N] + Sync + Send,
+) -> [Vec<f32>; N] {
+    let part = |r: Rect| -> [Vec<f32>; N] {
+        let win = r.inflate(halo).intersect(&region);
+        if win.is_empty() {
+            return std::array::from_fn(|_| Vec::new());
+        }
+        let f = compute(crop(shape, region, win), win.width() as usize, win.height() as usize);
+        if win == r { f } else { f.map(|f| crop(&f, win, r)) }
+    };
+    if whole {
+        return part(out);
+    }
+    let parts = par_map(bands(out, BAND.max(halo)), part);
+    std::array::from_fn(|k| {
+        let mut f = Vec::with_capacity(parts.iter().map(|p| p[k].len()).sum());
+        for p in &parts {
+            f.extend_from_slice(&p[k]);
+        }
+        f
+    })
 }
 
 /// The layer's shape (`compose::layer_shape`) over `r`, in parallel bands.
@@ -579,10 +614,12 @@ pub(crate) fn paste(shape: &mut [f32], region: Rect, r: Rect, v: &[f32]) {
 // ---------------------------------------------------------------------------------------------
 // Shape identity and damage
 
-pub(crate) type Tiles = HashMap<TileCoord, Arc<Tile>>;
+/// A shape source's tiles by address: a [`std::sync::Weak`] reserves the address (so a new tile
+/// can't reuse it and pass for unchanged) without keeping the pixels alive (#4530).
+pub(crate) type Tiles = HashMap<TileCoord, std::sync::Weak<Tile>>;
 
 pub(crate) fn snapshot(s: &Surface) -> Tiles {
-    s.tiles().map(|(c, t)| (*c, t.clone())).collect()
+    s.tiles().map(|(c, t)| (*c, Arc::downgrade(t))).collect()
 }
 
 /// Union of the tiles that differ between `old` and `s`.
@@ -590,7 +627,7 @@ pub(crate) fn damage(old: &Tiles, s: &Surface) -> Rect {
     let mut d = Rect::EMPTY;
     let mut add = |r: Rect| d = if d.is_empty() { r } else { d.union(&r) };
     for (c, t) in s.tiles() {
-        if old.get(c).is_none_or(|o| !Arc::ptr_eq(o, t)) {
+        if old.get(c).is_none_or(|o| !std::ptr::eq(o.as_ptr(), Arc::as_ptr(t))) {
             add(c.rect());
         }
     }
@@ -642,41 +679,46 @@ pub(crate) fn shape_key(layer: &Layer, canvas: Rect) -> u64 {
     h.finish()
 }
 
-/// Deep identity of a group (children, their pixels by tile pointer, settings).
-pub(crate) fn group_key(layer: &Layer, light: &GlobalLight) -> u64 {
-    fn surface_fp(s: &Surface, h: &mut std::collections::hash_map::DefaultHasher) {
+/// Deep identity of a group (children, their pixels by tile pointer, settings). `pin` sees every
+/// tile hashed, so a cache entry can reserve their addresses (see [`Tiles`]).
+pub(crate) fn group_key(layer: &Layer, light: &GlobalLight, pin: &mut dyn FnMut(&Arc<Tile>)) -> u64 {
+    type Pin<'a> = &'a mut dyn FnMut(&Arc<Tile>);
+    fn surface_fp(s: &Surface, h: &mut std::collections::hash_map::DefaultHasher, pin: Pin) {
         format!("{:?}{:?}", s.format(), s.default_pixel()).hash(h);
         for (c, t) in s.tiles() {
+            pin(t);
             (c.tx, c.ty, Arc::as_ptr(t) as usize).hash(h);
         }
     }
-    fn walk(l: &Layer, h: &mut std::collections::hash_map::DefaultHasher) {
+    fn walk(l: &Layer, h: &mut std::collections::hash_map::DefaultHasher, pin: Pin) {
         l.id.0.hash(h);
         (l.visible, l.clipped, l.opacity.to_bits(), l.fill_opacity.to_bits(), format!("{:?}", l.blend)).hash(h);
         match &l.content {
             LayerContent::Group(g) => {
                 for c in &g.children {
-                    walk(c, h);
+                    walk(c, h, pin);
                 }
             }
             LayerContent::Fill(f) => {
                 format!("{f:?}").hash(h);
                 if let Some(c) = &l.fill_cache {
-                    surface_fp(&c.surface, h);
+                    surface_fp(&c.surface, h, pin);
                 }
             }
             LayerContent::Adjustment(a) => format!("{a:?}").hash(h),
             _ => {
                 if let Some(s) = l.surface() {
-                    surface_fp(s, h);
+                    surface_fp(s, h, pin);
                 }
             }
         }
         if let Some(m) = &l.mask {
             (m.enabled, m.density.to_bits(), m.feather.to_bits()).hash(h);
-            surface_fp(&m.surface, h);
+            surface_fp(&m.surface, h, pin);
         }
         format!("{:?}{:?}", l.vector_mask, l.effects).hash(h);
+        l.blend_if.hash(h);
+        l.advanced.hash(h);
         h.write_u8(0xfe);
     }
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -684,14 +726,15 @@ pub(crate) fn group_key(layer: &Layer, light: &GlobalLight) -> u64 {
     match &layer.content {
         LayerContent::Group(g) => {
             for c in &g.children {
-                walk(c, &mut h);
+                walk(c, &mut h, pin);
             }
             if let Some(m) = &layer.mask {
                 (m.enabled, m.density.to_bits(), m.feather.to_bits()).hash(&mut h);
-                surface_fp(&m.surface, &mut h);
+                surface_fp(&m.surface, &mut h, pin);
             }
+            format!("{:?}", layer.vector_mask).hash(&mut h);
         }
-        _ => walk(layer, &mut h),
+        _ => walk(layer, &mut h, pin),
     }
     h.finish()
 }
@@ -714,6 +757,36 @@ mod tests {
         assert_eq!(a.key, b.key);
         s.size += 1.0;
         assert_ne!(a.key, program(&Effect::DropShadow(s), &light, false).key);
+    }
+
+    /// A styled group's effect shape follows its own vector mask and its children's Blend If and
+    /// Advanced Blending, so the cached shape must be rebuilt when any of them changes.
+    #[test]
+    fn group_key_follows_vector_mask_blend_if_and_advanced() {
+        use photocraft_doc::{BlendRange, Knockout, Path, PixelFormat, Subpath, VectorMask};
+        let light = GlobalLight::default();
+        let group = Layer::group("g", vec![Layer::raster("child", PixelFormat::RGBA8)]);
+        let base = group_key(&group, &light, &mut |_| {});
+
+        let mask = |x: f64| VectorMask::new(Path::new(vec![Subpath::polygon(&[(x, 0.0), (x + 10.0, 0.0), (x + 10.0, 10.0)])]));
+        let mut masked = group.clone();
+        masked.vector_mask = Some(mask(0.0));
+        let with_mask = group_key(&masked, &light, &mut |_| {});
+        assert_ne!(base, with_mask, "adding the group's vector mask");
+        masked.vector_mask = Some(mask(5.0));
+        assert_ne!(with_mask, group_key(&masked, &light, &mut |_| {}), "moving the group's vector mask");
+
+        fn child_mut(g: &mut Layer) -> &mut Layer {
+            let LayerContent::Group(gr) = &mut g.content else { unreachable!() };
+            &mut gr.children[0]
+        }
+        let mut blend_if = group.clone();
+        child_mut(&mut blend_if).blend_if.ranges = vec![[BlendRange { black: [128, 128], white: [255, 255] }, BlendRange::FULL]];
+        assert_ne!(base, group_key(&blend_if, &light, &mut |_| {}), "a child's Blend If");
+
+        let mut advanced = group.clone();
+        child_mut(&mut advanced).advanced.knockout = Knockout::Deep;
+        assert_ne!(base, group_key(&advanced, &light, &mut |_| {}), "a child's Advanced Blending");
     }
 
     #[test]
@@ -837,6 +910,40 @@ mod tests {
         assert!(too_small_noticed, "a 2 row halo went unnoticed, so this test guards nothing");
     }
 
+    /// Both bevel fields from one window (sharp edges found once) are bit for bit the fields
+    /// computed one at a time, over the whole region and over a part of it.
+    #[test]
+    fn paired_bevel_fields_equal_the_fields_one_at_a_time() {
+        let region = Rect::new(-20, -10, 300, 290);
+        let (w, h) = (region.width() as usize, region.height() as usize);
+        let mut shape = vec![0.0f32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let (fx, fy) = (x as f32 - 150.0, y as f32 - 140.0);
+                let r = (fx * fx + fy * fy).sqrt() + 8.0 * (fy * 0.07).sin() * (fx * 0.05).cos();
+                shape[y * w + x] = (90.0 - r).clamp(0.0, 1.0) * if (x / 13 + y / 17) % 5 == 0 { 0.6 } else { 1.0 };
+            }
+        }
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        for reach in [3, 9, 40] {
+            for out in [region, Rect::new(40, 30, 170, 120), Rect::new(-20, 200, 300, 290)] {
+                let [inside, outside] = bevel_fields(reach, &shape, region, out);
+                assert_eq!(bits(&inside), bits(&field(FieldKind::BevelInside, reach, &shape, region, out)), "inside, reach {reach}, {out:?}");
+                assert_eq!(bits(&outside), bits(&field(FieldKind::BevelOutside, reach, &shape, region, out)), "outside, reach {reach}, {out:?}");
+                // The banded path (wasm) pairs them per band the same way.
+                let halo = field_radius(FieldKind::BevelInside, reach) + 1;
+                let banded =
+                    fields_in_windows(false, &shape, region, out, halo, |s, w, h| photocraft_compose::effects::bevel_distance_fields(s, w, h, reach as f32));
+                for (k, kind) in [FieldKind::BevelInside, FieldKind::BevelOutside].into_iter().enumerate() {
+                    let [one] = fields_in_windows(false, &shape, region, out, halo, |s, w, h| {
+                        [photocraft_compose::effects::distance_field(kind, s, w, h, reach as f32)]
+                    });
+                    assert_eq!(bits(&banded[k]), bits(&one), "banded {kind:?}, reach {reach}, {out:?}");
+                }
+            }
+        }
+    }
+
     /// #3646: a stroke's outer edge is the fitted 5 × 5 chamfer while it is narrow and the exact
     /// Euclidean transform once it is wide — the chamfer's octagon facets a wide stroke. The GPU
     /// builds it from the field its width picks (`stroke_outside_exact`), while the spread of drop
@@ -873,5 +980,40 @@ mod tests {
         s.spread = 0.5;
         let shadow = program(&Effect::DropShadow(s), &light, false);
         assert!(shadow.fields.iter().any(|(k, _)| *k == FieldKind::StrokeOutside), "the shadow spread keeps the chamfer: {:?}", shadow.fields);
+    }
+
+    /// Cached shapes and group keys reserve tile addresses without keeping pixels (#4530):
+    /// damage still tells a replaced tile from an unchanged one, and a dropped tile's pixels
+    /// are freed although the entry remembers it.
+    #[test]
+    fn shape_tiles_and_group_pins_hold_addresses_not_pixels() {
+        use photocraft_color::{ColorMode, PixelFormat, SampleType};
+        let fmt = PixelFormat::new(ColorMode::Rgb, SampleType::U8, true);
+        let mut s = Surface::new(fmt);
+        // A ramp, so no two tiles share their pixels.
+        for x in 0..600 {
+            let v = x as f32 / 600.0;
+            s.fill_rect(Rect::new(x, 0, x + 1, 300), &[v, 0.2, 0.9, 1.0]);
+        }
+        let first = s.tiles().find(|(c, _)| c.tx == 0 && c.ty == 0).map(|(_, t)| t.clone()).unwrap();
+        assert_eq!(Arc::strong_count(&first), 2);
+        let old = snapshot(&s);
+        assert_eq!(Arc::strong_count(&first), 2, "the snapshot adds no strong reference");
+        assert!(damage(&old, &s).is_empty());
+        s.fill_rect(Rect::new(0, 0, 4, 4), &[0.0, 0.0, 0.0, 1.0]);
+        let origin = s.tiles().map(|(c, _)| *c).find(|c| c.tx == 0 && c.ty == 0).unwrap();
+        assert_eq!(damage(&old, &s), origin.rect(), "only the edited tile");
+        drop(first);
+        assert!(old.values().any(|w| w.strong_count() == 0), "the replaced tile's pixels are freed");
+
+        let child = Layer::new("c", LayerContent::Raster(s));
+        let n = child.surface().map_or(0, |s| s.tile_count());
+        let group = Layer::group("g", vec![child]);
+        let mut pins = Vec::new();
+        let key = group_key(&group, &GlobalLight::default(), &mut |t| pins.push(Arc::downgrade(t)));
+        assert_eq!(key, group_key(&group, &GlobalLight::default(), &mut |_| {}), "pinning doesn't change the key");
+        assert_eq!(pins.len(), n);
+        drop(group);
+        assert!(pins.iter().all(|w| w.strong_count() == 0), "a group's pins keep none of its pixels");
     }
 }

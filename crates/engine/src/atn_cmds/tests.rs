@@ -130,6 +130,39 @@ fn load_maps_events_keeps_flags_and_plays() {
     assert_eq!(s.actions.list[2].set.as_deref(), Some("Other"));
 }
 
+/// Renames that chain ("A" becomes "A 2" while the file's own "A 2" becomes "A 2 2") rewrite
+/// each Play and Conditional target once, to the renamed copy of the action it named.
+#[test]
+fn load_renames_each_play_target_once() {
+    let mut s = Session::new();
+    let mut mine = Action::new("A", vec![]);
+    mine.set = Some("Mine".into());
+    s.actions.list.push(mine);
+    let a = Action::new("A", vec![("actions.conditional".into(), json!({"if": "always", "then": "A", "else": "A 2"}))]);
+    let a2 = Action::new("A 2", vec![("actions.play".into(), json!({"action": "A"}))]);
+    let keys = [("A".to_string(), "F4".to_string())];
+    let (bytes, _) = export("File", &[&a, &a2], &keys, false).unwrap();
+    let r = s.execute("actions.load", json!({"data": b64(&bytes)})).unwrap();
+    assert_eq!(r["actions"], json!(["A 2", "A 2 2"]));
+    let get = |n: &str| s.actions.list.iter().find(|a| a.name == n && a.set.as_deref() == Some("File")).unwrap();
+    assert_eq!(get("A 2 2").steps[0].1["action"], "A 2", "plays the file's A, not its A 2");
+    let cond = &get("A 2").steps[0].1;
+    assert_eq!((&cond["then"], &cond["else"]), (&json!("A 2"), &json!("A 2 2")), "{cond}");
+    assert_eq!(r["functionKeys"], json!([{"action": "A 2", "key": "F4"}]));
+
+    // Adding to a set of the same name leaves the Play steps already in it alone.
+    let mut s = Session::new();
+    for (name, steps) in [("A", vec![]), ("B", vec![("actions.play".to_string(), json!({"action": "A"}))])] {
+        let mut a = Action::new(name, steps);
+        a.set = Some("File".into());
+        s.actions.list.push(a);
+    }
+    let (bytes, _) = export("File", &[&Action::new("A", vec![])], &[], false).unwrap();
+    let r = s.execute("actions.load", json!({"data": b64(&bytes), "replace": false})).unwrap();
+    assert_eq!(r["actions"], json!(["A 2"]));
+    assert_eq!(s.actions.list[1].steps[0].1, json!({"action": "A"}), "B still plays the A it had");
+}
+
 #[test]
 fn save_round_trips_through_photoshop_events() {
     let mut s = Session::new();
@@ -144,7 +177,7 @@ fn save_round_trips_through_photoshop_events() {
     assert_eq!(file.name.to_string_lossy(), "Test Set");
     assert_eq!(file.actions[0].function_key, 3);
     let events: Vec<String> = file.actions[0].items.iter().map(|i| i.event.id()).collect();
-    assert_eq!(events, ["GsnB", "Mk  ", "setd", "slct", "slct", "Stop", "syntheticFill", "Ply ", "Fltn"]);
+    assert_eq!(events, ["GsnB", "Mk  ", "setd", "slct", "slct", "Stop", "syntheticFill", "Ply ", "FltI"]);
     assert!(file.actions[0].items[0].with_dialog);
     assert!(!file.actions[0].items[8].enabled);
     // The kept Photoshop step is written back byte for byte.
@@ -174,6 +207,7 @@ fn every_mapped_command_exports_and_imports_back() {
         ("filter.noise.addNoise", json!({"amount": 12.5, "distribution": "gaussian", "monochromatic": true, "seed": 7})),
         ("filter.noise.median", json!({"radius": 2})),
         ("filter.blur.motionBlur", json!({"angle": 45, "distance": 20})),
+        ("filter.blur.smartBlur", json!({"radius": 2.5, "threshold": 40, "quality": "medium", "mode": "overlayEdge"})),
         ("filter.other.offset", json!({"horizontal": 10, "vertical": -5, "undefinedAreas": "wrap"})),
         ("filter.blur.blur", json!({})),
         (
@@ -186,6 +220,10 @@ fn every_mapped_command_exports_and_imports_back() {
             json!({"colorize": false, "hue": 10, "saturation": -20, "lightness": 0, "reds": {"hue": 5, "saturation": 0, "lightness": 0, "range": [315, 345, 15, 45]}}),
         ),
         ("image.adjustments.brightnessContrast", json!({"brightness": 10, "contrast": -5, "legacy": false})),
+        (
+            "image.adjustments.shadowsHighlights",
+            json!({"shadowAmount": 60, "shadowTone": 40, "shadowRadius": 25, "highlightAmount": 10, "highlightTone": 50, "highlightRadius": 30, "blackClip": 0.02, "whiteClip": 0.05, "midtone": 15, "color": 20}),
+        ),
         ("image.adjustments.threshold", json!({"level": 100})),
         ("image.adjustments.posterize", json!({"levels": 4})),
         ("image.adjustments.invert", json!({})),
@@ -412,7 +450,6 @@ fn every_mapped_command_exports_and_imports_back() {
         "filter.blur.blurMore",
         "filter.blur.boxBlur",
         "filter.blur.radialBlur",
-        "filter.blur.smartBlur",
         "filter.blur.surfaceBlur",
         "filter.noise.despeckle",
         "filter.noise.dustAndScratches",
@@ -429,6 +466,55 @@ fn every_mapped_command_exports_and_imports_back() {
     // (Save is the desktop shell's: recorded by it, replayed by it, written by Batch.)
     for id in EVENTS.iter().flat_map(|e| e.ids.iter()) {
         assert!(crate::commands::find(id).is_some() || crate::actions_cmds::shell_save_command(id), "the .atn table names an unknown command `{id}`");
+    }
+}
+
+/// `paint.bucket` exported to .atn and imported back → its params, or None when it doesn't export.
+fn bucket_round_trip(params: Value) -> Option<Value> {
+    let item = export_item("paint.bucket", &params, "S")?;
+    let e = event_for(&item.event)?;
+    match (e.from)(item.descriptor.as_ref()?) {
+        Mapped::Steps(steps) => steps.first().map(|(id, p)| {
+            assert_eq!(id, "paint.bucket");
+            p.clone()
+        }),
+        _ => None,
+    }
+}
+
+/// A Paint Bucket step with an explicit colour keeps it through .atn (#7199): replayed on a fresh
+/// document, whose foreground is black, it still fills red. A colour .atn can't hold makes the
+/// step not export rather than fill with the foreground.
+#[test]
+fn bucket_keeps_an_explicit_color_through_atn() {
+    let fill = |params: &Value| {
+        let mut s = Session::new();
+        s.execute("file.new", json!({"width": 8, "height": 8, "background": "#ffffff"})).unwrap();
+        s.execute("paint.bucket", params.clone()).unwrap();
+        let d = s.active().unwrap();
+        d.doc.layer(d.active_layer.unwrap()).unwrap().surface().unwrap().pixel(2, 2)
+    };
+    let red = json!({"x": 2, "y": 2, "antiAlias": false, "color": "#ff0000"});
+    let back = bucket_round_trip(red.clone()).unwrap();
+    assert_eq!(back["color"], "#ff0000", "{back}");
+    assert_eq!(fill(&back), fill(&red));
+    assert_eq!(fill(&back), vec![1.0, 0.0, 0.0, 1.0]);
+    // The colour as an array of channels.
+    assert_eq!(bucket_round_trip(json!({"x": 1, "y": 1, "color": [0.0, 0.5, 1.0]})).unwrap()["color"], "#0080ff");
+    // No colour, or one the command can't read: the foreground, as before.
+    for p in [json!({"x": 1, "y": 1}), json!({"x": 1, "y": 1, "color": "red"})] {
+        let back = bucket_round_trip(p.clone()).unwrap();
+        assert!(back.get("color").is_none() && back.get("contents").is_none(), "{p} → {back}");
+    }
+    // A pattern fill ignores the colour, also when named with the older `source`.
+    for key in ["contents", "source"] {
+        let back = bucket_round_trip(json!({"x": 1, "y": 1, key: "pattern", "color": "#ff0000"})).unwrap();
+        assert_eq!(back["contents"], "pattern", "{key}: {back}");
+        assert!(back.get("color").is_none(), "{key}: {back}");
+    }
+    // Translucent or out-of-range colours have no .atn form.
+    for c in [json!("#ff000080"), json!([1.0, 0.0, 0.0, 0.5]), json!([2.0, 0.0, 0.0])] {
+        assert!(bucket_round_trip(json!({"x": 1, "y": 1, "color": c})).is_none(), "{c}");
     }
 }
 
@@ -536,6 +622,33 @@ fn save_writes_the_file_and_the_set_of_the_selected_action() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// #7290: saving over an existing ATN must replace it atomically (a temporary file renamed over
+/// it), never truncate and rewrite it in place, so a write that fails partway (a full disk)
+/// leaves the previously valid file readable. A handle opened on the old file still sees the old
+/// bytes after an atomic replacement; an in-place rewrite changes them under it.
+#[cfg(unix)]
+#[test]
+fn save_over_an_existing_file_never_rewrites_it_in_place() {
+    use std::io::Read;
+    let mut s = Session::new();
+    s.actions.list.push(Action::new("Owned", vec![("select.all".into(), json!({}))]));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Owned.atn");
+    let p = path.to_string_lossy().to_string();
+    s.execute("actions.save", json!({"path": p})).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let mut old = std::fs::File::open(&path).unwrap();
+    s.actions.list.push(Action::new("Second", vec![("select.all".into(), json!({}))]));
+    s.execute("actions.save", json!({"path": p})).unwrap();
+    let mut seen = Vec::new();
+    old.read_to_end(&mut seen).unwrap();
+    assert_eq!(seen, before, "the existing ATN was rewritten in place");
+    let after = atn::parse(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(after.actions.len(), 2);
+    let names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(names, vec![std::ffi::OsString::from("Owned.atn")], "no temporary file is left behind");
+}
+
 #[test]
 fn layer_param_accepts_a_name() {
     let mut s = Session::new();
@@ -573,7 +686,7 @@ fn remaining_events_import_in_their_photoshop_shapes() {
     let moved = desc("null")
         .with("null", target_ref("Lyr "))
         .with("FTcs", enm("QCSt", "Qcsa"))
-        .with("Ofst", D::Descriptor(desc("Ofst").with("Hrzn", px(-57.4)).with("Vrtc", px(12.0))))
+        .with("Ofst", D::Descriptor(desc("Ofst").with("Hrzn", px(-57.0)).with("Vrtc", px(12.0))))
         .with("Intr", enm("Intp", "Bcbc"));
     let scaled = desc("null")
         .with("null", target_ref("Lyr "))
@@ -955,4 +1068,322 @@ fn remove_white_clears_the_targeted_layer_not_the_converted_background() {
     let bottom = st.doc.layers.first().unwrap();
     assert!(!st.doc.is_background(bottom.id), "the Background became a normal layer");
     assert!(bottom.surface().unwrap().sample_channel(2, 2, 1) > 0.99, "and kept its pixels");
+}
+
+/// Measured in Photoshop: `executeAction` fails for the codes `BoxB`, `SrfB`, `Fltn` and
+/// `BlnW` ("the command is not currently available"), while the names `boxblur`,
+/// `surfaceBlur`, `flattenImage`, `blackAndWhite` and the code `FltI` run.
+#[test]
+fn events_photoshop_only_runs_by_name_export_by_name_and_old_codes_still_import() {
+    let bw = json!({"reds": 40, "yellows": 60, "greens": 40, "cyans": 60, "blues": 20, "magentas": 80, "tint": false, "tintColor": "#e4d5b0"});
+    let cases = [
+        ("filter.blur.boxBlur", json!({"radius": 3}), "boxblur", "BoxB"),
+        ("filter.blur.surfaceBlur", json!({"radius": 5, "threshold": 15}), "surfaceBlur", "SrfB"),
+        ("layer.flattenImage", json!({}), "FltI", "Fltn"),
+        ("image.adjustments.blackWhite", bw, "blackAndWhite", "BlnW"),
+    ];
+    for (id, params, written, legacy) in &cases {
+        let exported = export_item(id, params, "S").unwrap_or_else(|| panic!("{id} does not export"));
+        assert_eq!(exported.event.id(), *written, "{id} exports under an id Photoshop runs");
+        assert_eq!(matches!(exported.event, AtnEvent::Name(_)), written.len() != 4, "{id}: a name is written as a name");
+        let d = exported.descriptor.clone();
+        // The written id, the name for Flatten Image, and the old code all import to the command.
+        let name = if *id == "layer.flattenImage" { "flattenImage" } else { written };
+        for event in [*written, name, *legacy] {
+            let e = event_for(&item(event, "", None).event).unwrap_or_else(|| panic!("{event} does not import"));
+            assert!(e.ids.contains(id), "{event} imports as {:?}, not {id}", e.ids);
+            match (e.from)(d.as_ref().unwrap()) {
+                Mapped::Steps(steps) => {
+                    assert_eq!(steps.len(), 1, "{event}: {steps:?}");
+                    assert_eq!(steps[0].0, *id, "{event}");
+                    let mut back = steps[0].1.clone();
+                    normalise(&mut back);
+                    assert_eq!(back, *params, "{event}");
+                }
+                Mapped::Unsupported { .. } => panic!("{event} does not import back"),
+            }
+        }
+    }
+
+    // A whole set of Photoshop-shaped steps (names, FltI) and old PhotoCraft-shaped ones
+    // (legacy codes) loads to the same commands.
+    let blur = |event: &str| item(event, "Box Blur", Some(desc("null").with("Rds ", px(3.0))));
+    let surface = |event: &str| item(event, "Surface Blur", Some(desc("null").with("Rds ", px(5.0)).with("Thsh", long(15.0))));
+    let photoshop = vec![blur("boxblur"), surface("surfaceBlur"), item("FltI", "Flatten Image", None), item("flattenImage", "Flatten Image", None)];
+    let legacy = vec![blur("BoxB"), surface("SrfB"), item("Fltn", "Flatten Image", None)];
+    let data = set_of("S", vec![("Photoshop", photoshop), ("Legacy", legacy)]);
+    let mut s = Session::new();
+    let r = s.execute("actions.load", json!({"data": data})).unwrap();
+    assert_eq!(r["unsupported"], json!([]), "{r}");
+    let ids = |i: usize| s.actions.list[i].steps.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>();
+    assert_eq!(ids(0), ["filter.blur.boxBlur", "filter.blur.surfaceBlur", "layer.flattenImage", "layer.flattenImage"]);
+    assert_eq!(ids(1), ["filter.blur.boxBlur", "filter.blur.surfaceBlur", "layer.flattenImage"]);
+    assert_eq!(s.actions.list[1].steps[1].1, json!({"radius": 5, "threshold": 15}));
+    // Saving them writes the ids Photoshop runs, never the old codes.
+    let saved = s.execute("actions.save", json!({"set": "S"})).unwrap();
+    let file = atn::parse(&photocraft_paint::tile::b64_decode(saved["data"].as_str().unwrap()).unwrap()).unwrap();
+    let events: Vec<String> = file.actions.iter().flat_map(|a| a.items.iter().map(|i| i.event.id())).collect();
+    assert_eq!(events, ["boxblur", "surfaceBlur", "FltI", "FltI", "boxblur", "surfaceBlur", "FltI"]);
+
+    // Unknown ids, near misses and the legacy codes written as names stay Photoshop steps,
+    // never a panic or a wrong command.
+    for event in ["BoxBlur", "boxBlur", "BOXB", "Fltn ", "FLTI", "", "\u{0}\u{0}\u{0}\u{0}", "BlnWx"] {
+        let e = event_for(&item(event, "", None).event);
+        assert!(e.is_none(), "{event:?} maps to {:?}", e.map(|e| e.ids));
+    }
+    // A legacy code with a broken descriptor is unsupported, not a crash.
+    let e = event_for(&item("SrfB", "", None).event).unwrap();
+    assert!(matches!((e.from)(&desc("null").with("Rds ", D::Double(f64::NAN))), Mapped::Unsupported { .. } | Mapped::Steps(_)));
+    // A wrong-typed key is skipped like any other unreadable field: the step keeps the defaults.
+    match (e.from)(&desc("null").with("Rds ", text("x"))) {
+        Mapped::Steps(steps) => assert!(steps.iter().all(|(_, p)| p.get("radius").is_none()), "{steps:?}"),
+        Mapped::Unsupported { .. } => {}
+    }
+}
+
+/// Smart Blur's quality uses Photoshop's `SmBQ` codes (`SBQL`/`SBQM`/`SBQH`): measured in
+/// Photoshop, the old `Hgh `/`Mdm `/`Low ` play back as its fallback quality. Old codes still read.
+#[test]
+fn smart_blur_quality_uses_photoshop_codes() {
+    let smart_blur =
+        |quality: D, mode: &str| desc("null").with("Rds ", D::Double(6.0)).with("Thsh", D::Double(60.0)).with("SmBQ", quality).with("SmBM", enm("SmBM", mode));
+    // Every quality writes Photoshop's code, as a double radius/threshold and both enums,
+    // and reads back as the same step.
+    for (quality, code) in [("low", "SBQL"), ("medium", "SBQM"), ("high", "SBQH")] {
+        let params = json!({"radius": 6, "threshold": 60, "quality": quality, "mode": "edgeOnly"});
+        let a = Action::new("Q", vec![("filter.blur.smartBlur".into(), params.clone())]);
+        let (bytes, skipped) = export("S", &[&a], &[], false).unwrap();
+        assert!(skipped.is_empty());
+        let file = atn::parse(&bytes).unwrap();
+        let it = &file.actions[0].items[0];
+        assert_eq!(it.event.id(), "SmrB");
+        assert_eq!(it.descriptor.as_ref(), Some(&smart_blur(enm("SmBQ", code), "SBME")), "{quality}");
+        let back = import(&bytes).unwrap();
+        assert!(back.unsupported.is_empty(), "{quality}");
+        assert_eq!(back.actions[0].steps, vec![("filter.blur.smartBlur".to_string(), params)]);
+    }
+
+    // Photoshop-shaped steps (each quality and mode, as Photoshop stores them) and the codes
+    // PhotoCraft wrote before this fix read as the right quality.
+    let cases = [
+        ("SBQH", "SBMN", "high", "normal"),
+        ("SBQM", "SBMO", "medium", "overlayEdge"),
+        ("SBQL", "SBME", "low", "edgeOnly"),
+        ("Hgh ", "SBMN", "high", "normal"),
+        ("Mdm ", "SBMN", "medium", "normal"),
+        ("Low ", "SBMN", "low", "normal"),
+    ];
+    let items = cases.iter().map(|(q, m, _, _)| item("SmrB", "Smart Blur", Some(smart_blur(enm("SmBQ", q), m)))).collect();
+    let data = set_of("Blurs", vec![("Smart", items)]);
+    let mut s = Session::new();
+    s.execute("actions.load", json!({"data": data})).unwrap();
+    let steps = &s.actions.list[0].steps;
+    for ((q, _, quality, mode), (id, p)) in cases.iter().zip(steps) {
+        assert_eq!(id, "filter.blur.smartBlur", "{q}");
+        assert_eq!(p, &json!({"radius": 6, "threshold": 60, "quality": quality, "mode": mode}), "{q}");
+    }
+
+    // An unknown code, a quality of the wrong type, NaN and a missing quality never panic: the
+    // unknown ones stay Photoshop steps, kept verbatim.
+    let odd = [
+        smart_blur(enm("SmBQ", "Xxxx"), "SBMN"),
+        smart_blur(D::Integer(2), "SBMN"),
+        smart_blur(enm("SmBQ", "SBQH"), "Xxxx"),
+        desc("null").with("Rds ", D::Double(f64::NAN)).with("SmBQ", enm("SmBQ", "SBQM")),
+        desc("null"),
+    ];
+    let items: Vec<AtnItem> = odd.iter().map(|d| item("SmrB", "Smart Blur", Some(d.clone()))).collect();
+    let imported = import(&photocraft_paint::tile::b64_decode(&set_of("Odd", vec![("Odd", items)])).unwrap()).unwrap();
+    let steps = &imported.actions[0].steps;
+    assert_eq!(steps.len(), odd.len());
+    assert_eq!(steps[0].0, PHOTOSHOP_STEP, "an unknown quality is kept verbatim");
+    assert_eq!(steps[2].0, PHOTOSHOP_STEP, "an unknown mode is kept verbatim");
+    assert_eq!(imported.unsupported.iter().map(|u| u.step).collect::<Vec<_>>(), [0, 2]);
+    // A wrong-type quality is left out (the filter's default applies), as for every enum field.
+    assert_eq!(steps[1], ("filter.blur.smartBlur".to_string(), json!({"radius": 6, "threshold": 60, "mode": "normal"})));
+    // An unknown quality or a non-string one is not exported.
+    for bad in [json!({"quality": "best"}), json!({"quality": 3}), json!({"radius": "x"})] {
+        let a = Action::new("Bad", vec![("filter.blur.smartBlur".into(), bad.clone())]);
+        assert!(export("S", &[&a], &[], false).is_err(), "{bad}");
+    }
+}
+
+/// #5830: Shadows/Highlights (`adaptCorrect`) recorded by Photoshop, with string IDs, plays as
+/// Image › Adjustments › Shadows/Highlights instead of stopping as a step with no equivalent.
+#[test]
+fn photoshop_shadows_highlights_steps_play() {
+    let tones = |amount: f64, width: f64, radius: i32| {
+        D::Descriptor(desc("adaptCorrectTones").with("amount", pct(amount)).with("width", pct(width)).with("radius", D::Integer(radius)))
+    };
+    let d = desc("null")
+        .with("shadowMode", tones(35.0, 50.0, 30))
+        .with("highlightMode", tones(20.0, 40.0, 24))
+        .with("blackClip", D::Double(0.01))
+        .with("whiteClip", D::Double(0.02))
+        .with("center", D::Integer(5))
+        .with("colorCorrection", D::Integer(20));
+    let e = event_for(&item("adaptCorrect", "Sombra/Realce", None).event).expect("adaptCorrect is mapped");
+    let Mapped::Steps(steps) = (e.from)(&d) else { panic!("Shadows/Highlights maps to a step") };
+    assert_eq!(steps.len(), 1);
+    let (id, p) = &steps[0];
+    assert_eq!(id, "image.adjustments.shadowsHighlights");
+    let mut p = p.clone();
+    normalise(&mut p);
+    assert_eq!(
+        p,
+        json!({"shadowAmount": 35, "shadowTone": 50, "shadowRadius": 30, "highlightAmount": 20, "highlightTone": 40, "highlightRadius": 24, "blackClip": 0.01, "whiteClip": 0.02, "midtone": 5, "color": 20})
+    );
+    // The same settings as char IDs read the same; absent keys are left to the defaults.
+    let codes = desc("null")
+        .with("sdwM", D::Descriptor(desc("adaptCorrectTones").with("Amnt", pct(35.0)).with("Wdth", pct(50.0)).with("Rds ", D::Integer(30))))
+        .with("BlcC", D::Double(0.01));
+    let Mapped::Steps(steps) = (e.from)(&codes) else { panic!("char IDs map too") };
+    let mut q = steps[0].1.clone();
+    normalise(&mut q);
+    assert_eq!(q, json!({"shadowAmount": 35, "shadowTone": 50, "shadowRadius": 30, "blackClip": 0.01}));
+    // And it runs on a document.
+    let mut s = Session::new();
+    s.execute("file.new", json!({"width": 16, "height": 16, "background": "#404040"})).unwrap();
+    s.execute(id, p).unwrap();
+}
+
+#[test]
+fn save_while_recording_includes_pending_steps() {
+    let mut s = Session::new();
+    s.execute("file.new", json!({"width": 8, "height": 8})).unwrap();
+    s.execute("actions.record", json!({"name": "Pending"})).unwrap();
+    s.execute("layer.new.layer", json!({"name": "Recorded"})).unwrap();
+
+    // While still recording (without calling actions.stop), save the action.
+    let saved = s.execute("actions.save", json!({"action": "Pending"})).unwrap();
+    assert_eq!(saved["steps"], 1, "pending steps must be flushed and included in save");
+    assert_eq!(saved["skipped"], json!([]));
+
+    // After save, recording continues and additional steps are flushed on stop without duplication.
+    s.execute("layer.new.layer", json!({"name": "Second"})).unwrap();
+    s.execute("actions.stop", json!({})).unwrap();
+
+    let action = s.execute("actions.get", json!({"action": "Pending"})).unwrap();
+    assert_eq!(action["steps"].as_array().unwrap().len(), 2, "both steps must be present without duplication");
+}
+
+/// Photoshop's Close has no document target: a Close of a specific document must not be
+/// exported as a plain Close, which would close the active document on playback.
+#[test]
+fn close_with_document_target_is_not_exported_as_plain_close() {
+    let targeted = Action { name: "Probe".into(), steps: vec![("file.close".into(), json!({"document": 0}))], ..Default::default() };
+    assert!(export("Audit4", &[&targeted], &[], false).is_err());
+    let (_, skipped) = export("Audit4", &[&targeted], &[], true).unwrap();
+    assert_eq!(skipped, vec![Skipped { action: "Probe".into(), step: 0, id: "file.close".into() }]);
+    let plain = Action { name: "Plain".into(), steps: vec![("file.close".into(), json!({}))], ..Default::default() };
+    let (bytes, skipped) = export("Audit4", &[&plain], &[], false).unwrap();
+    assert!(skipped.is_empty());
+    let imported = import(&bytes).unwrap();
+    assert_eq!(imported.actions[0].steps, vec![("file.close".to_string(), json!({}))]);
+}
+
+/// A translation-only Free Transform with a fractional offset must not collapse into an
+/// integer `layer.translate`: the sub-pixel placement and interpolation have to survive.
+#[test]
+fn fractional_translation_only_transform_keeps_offset_and_interpolation() {
+    let params = json!({"dx": 0.5, "dy": 0, "interpolation": "bilinear"});
+    let d = transform_to("edit.transform", &params).unwrap();
+    let file = AtnFile {
+        name: UnicodeString::new_nul("Frac"),
+        expanded: false,
+        actions: vec![AtnAction { name: UnicodeString::new_nul("A"), items: vec![item("transform", "Transform", Some(d))], ..Default::default() }],
+        warnings: vec![],
+    };
+    let imp = import(&atn::write(&file).unwrap()).unwrap();
+    assert!(imp.unsupported.is_empty());
+    let steps = &imp.actions[0].steps;
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0].0, "edit.transform");
+    assert_eq!(steps[0].1.get("dx").and_then(Value::as_f64), Some(0.5));
+    assert_eq!(steps[0].1.get("interpolation"), Some(&json!("bilinear")));
+}
+
+/// Arbitrary canvas rotation must keep its interpolation through a strict export: dropping it
+/// silently replays the rotation with the default bicubic resampling.
+#[test]
+fn arbitrary_rotation_keeps_interpolation_through_atn() {
+    for params in [
+        json!({"angle": 17, "direction": "ccw", "interpolation": "nearest"}),
+        json!({"angle": 17, "direction": "ccw", "interpolation": "bilinear"}),
+        json!({"angle": 17, "direction": "ccw", "interpolation": "bicubic"}),
+        json!({"angle": 17, "direction": "ccw"}),
+    ] {
+        let a = Action { name: "Rot".into(), steps: vec![("image.rotation.arbitrary".into(), params.clone())], ..Default::default() };
+        let (bytes, skipped) = export("Rot", &[&a], &[], false).unwrap();
+        assert!(skipped.is_empty());
+        let imported = import(&bytes).unwrap();
+        assert!(imported.unsupported.is_empty());
+        assert_eq!(imported.actions[0].steps, vec![("image.rotation.arbitrary".to_string(), params)]);
+    }
+}
+
+/// A filter recorded against a layer mask must not export as a plain filter that edits the
+/// layer's pixels on replay: Photoshop's descriptor has no field for PhotoCraft's `target`.
+#[test]
+fn add_noise_with_mask_target_is_not_exported_as_pixel_filter() {
+    let masked = Action {
+        name: "Probe".into(),
+        steps: vec![("filter.noise.addNoise".into(), json!({"amount": 75, "seed": 123, "target": "mask"}))],
+        ..Default::default()
+    };
+    assert!(export("Audit", &[&masked], &[], false).is_err());
+    let (_, skipped) = export("Audit", &[&masked], &[], true).unwrap();
+    assert_eq!(skipped, vec![Skipped { action: "Probe".into(), step: 0, id: "filter.noise.addNoise".into() }]);
+    for params in [json!({"amount": 75, "seed": 123}), json!({"amount": 75, "seed": 123, "target": "pixels"})] {
+        let plain = Action { name: "Plain".into(), steps: vec![("filter.noise.addNoise".into(), params)], ..Default::default() };
+        let (bytes, skipped) = export("Audit", &[&plain], &[], false).unwrap();
+        assert!(skipped.is_empty());
+        let imported = import(&bytes).unwrap();
+        assert_eq!(imported.actions[0].steps, vec![("filter.noise.addNoise".to_string(), json!({"amount": 75, "seed": 123}))]);
+    }
+}
+
+/// A Play Action that starts the called action at a later step must not export as a call of the
+/// whole action: that would replay the steps the recording deliberately skipped.
+#[test]
+fn partial_play_action_is_not_exported_as_whole_action_call() {
+    let partial = Action { name: "Parent".into(), steps: vec![("actions.play".into(), json!({"action": "Child", "from": 1}))], ..Default::default() };
+    assert!(export("Set", &[&partial], &[], false).is_err());
+    let (_, skipped) = export("Set", &[&partial], &[], true).unwrap();
+    assert_eq!(skipped, vec![Skipped { action: "Parent".into(), step: 0, id: "actions.play".into() }]);
+    for params in [json!({"action": "Child"}), json!({"action": "Child", "from": 0})] {
+        let whole = Action { name: "Parent".into(), steps: vec![("actions.play".into(), params)], ..Default::default() };
+        let (bytes, skipped) = export("Set", &[&whole], &[], false).unwrap();
+        assert!(skipped.is_empty());
+        let imported = import(&bytes).unwrap();
+        assert_eq!(imported.actions[0].steps, vec![("actions.play".to_string(), json!({"action": "Child"}))]);
+    }
+}
+
+/// #7646: an action's function key keeps Photoshop's Shift and Command options through
+/// `.atn` load and save, as `Shift+F5`, `Cmd+F5` and `Cmd+Shift+F5` shortcuts.
+#[test]
+fn function_keys_keep_shift_and_command() {
+    let mut file = sample();
+    file.actions[1].function_key = 5;
+    file.actions[1].shift = true;
+    file.actions[1].command = true;
+    file.actions[0].shift = true;
+    let mut s = Session::new();
+    let r = s.execute("actions.load", json!({"data": b64(&atn::write(&file).unwrap())})).unwrap();
+    assert_eq!(r["functionKeys"], json!([{"action": "Soften", "key": "Shift+F3"}, {"action": "Finish", "key": "Cmd+Shift+F5"}]));
+    let shortcuts = &s.prefs().shortcuts;
+    assert_eq!(shortcuts.get("actions.play:Soften").map(String::as_str), Some("Shift+F3"));
+    assert_eq!(shortcuts.get("actions.play:Finish").map(String::as_str), Some("Cmd+Shift+F5"));
+    let r = s.execute("actions.save", json!({"set": "Test Set"})).unwrap();
+    let saved = atn::parse(&photocraft_paint::tile::b64_decode(r["data"].as_str().unwrap()).unwrap()).unwrap();
+    let keys: Vec<_> = saved.actions.iter().map(|a| (a.function_key, a.shift, a.command)).collect();
+    assert_eq!(keys, [(3, true, false), (5, true, true)]);
+
+    assert_eq!(super::parse_function_key("Cmd+F12"), Some((12, false, true)));
+    assert_eq!(super::parse_function_key("Shift+Cmd+F2"), Some((2, true, true)));
+    for bad in ["F16", "F0", "Alt+F2", "Cmd+Cmd+F2", "Shift+", "Cmd+K", ""] {
+        assert_eq!(super::parse_function_key(bad), None, "{bad}");
+    }
+    assert_eq!(super::function_key_name(7, false, false), "F7");
 }

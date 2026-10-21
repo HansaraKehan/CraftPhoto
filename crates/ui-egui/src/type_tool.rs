@@ -54,7 +54,7 @@ fn to_text(aff: &Affine, x: f64, y: f64) -> (f32, f32) {
 
 /// Topmost shown type layer (it and every group around it visible, #4320) whose laid-out text
 /// contains the document point.
-fn hit_layer(app: &mut PhotocraftApp, x: f64, y: f64) -> Option<LayerId> {
+pub(crate) fn hit_layer(app: &mut PhotocraftApp, x: f64, y: f64) -> Option<LayerId> {
     let doc = app.session.active()?.doc.clone();
     let slop = 6.0 / app.point_zoom().max(0.01);
     // A Type Mask session's text is a hidden layer; it is still the text being edited.
@@ -121,6 +121,7 @@ pub fn edit_active(app: &mut PhotocraftApp) -> Result<(), String> {
         ed.caret = n;
     }
     let vertical = app.session.active().and_then(|st| text_layer(&st.doc, id)).is_some_and(|t| t.orientation == photocraft_doc::text::Orientation::Vertical);
+    app.ui.text_edit_return_tool = None;
     app.ui.tool = if vertical { crate::state::Tool::VerticalType } else { crate::state::Tool::Type };
     app.ui.mask_target = false;
     app.ui.vector_mask_target = false;
@@ -132,6 +133,7 @@ pub fn edit_active(app: &mut PhotocraftApp) -> Result<(), String> {
 /// type is there.
 pub fn edit_at(app: &mut PhotocraftApp, x: f64, y: f64) -> bool {
     let Some(id) = hit_layer(app, x, y) else { return false };
+    let previous_tool = app.ui.tool;
     commit(app);
     if app.session.select_layer(id).is_err() {
         return false;
@@ -144,6 +146,9 @@ pub fn edit_at(app: &mut PhotocraftApp, x: f64, y: f64) -> bool {
     app.ui.text_edit =
         Some(TextEdit { layer: id.0, caret: off, anchor: off, session: key, created: false, mask: false, dragging: false, resize: None, preedit: None });
     let vertical = app.session.active().and_then(|st| text_layer(&st.doc, id)).is_some_and(|t| t.orientation == photocraft_doc::text::Orientation::Vertical);
+    if !previous_tool.is_type() {
+        app.ui.text_edit_return_tool = Some(previous_tool);
+    }
     app.ui.tool = if vertical { crate::state::Tool::VerticalType } else { crate::state::Tool::Type };
     app.ui.mask_target = false;
     app.ui.vector_mask_target = false;
@@ -232,6 +237,15 @@ fn resize_box(app: &mut PhotocraftApp, ed: &TextEdit, i: u8, x: f64, y: f64) {
     let _ = app.run("type.edit", json!({"layer": ed.layer, "box": [o.x, o.y, x1 - x0, y1 - y0], "coalesce": ed.session}));
 }
 
+/// True when document point (`x`, `y`) lies inside the paragraph box of type layer `id` (false
+/// for point text).
+fn inside_box(app: &mut PhotocraftApp, id: LayerId, x: f64, y: f64) -> bool {
+    let Some((bx, by, w, h)) = box_shape(app, id) else { return false };
+    let Some((_, aff, _)) = layout(app, id) else { return false };
+    let (tx, ty) = to_text(&aff, x, y);
+    tx >= bx && tx <= bx + w && ty >= by && ty <= by + h
+}
+
 /// Pointer down with the Type tool. Returns true when the press was consumed (no box drag).
 pub fn pointer_down(app: &mut PhotocraftApp, x: f64, y: f64, mods: egui::Modifiers) -> bool {
     if let Some(ed) = app.ui.text_edit.clone() {
@@ -242,7 +256,9 @@ pub fn pointer_down(app: &mut PhotocraftApp, x: f64, y: f64, mods: egui::Modifie
             }
             return true;
         }
-        if hit_layer(app, x, y) == Some(id) {
+        // Photoshop: anywhere inside the paragraph box places the caret, even off the glyphs
+        // (left of a line's start, below the last line); only a click outside it commits.
+        if hit_layer(app, x, y) == Some(id) || inside_box(app, id, x, y) {
             let off = hit_offset(app, id, x, y);
             if let Some(e) = app.ui.text_edit.as_mut() {
                 e.caret = off;
@@ -271,6 +287,7 @@ pub fn pointer_down(app: &mut PhotocraftApp, x: f64, y: f64, mods: egui::Modifie
         let off = hit_offset(app, id, x, y);
         app.ui.text_edit =
             Some(TextEdit { layer: id.0, caret: off, anchor: off, session: key, created: false, mask: false, dragging: true, resize: None, preedit: None });
+        app.ui.text_edit_return_tool = None;
         return true;
     }
     false
@@ -295,6 +312,7 @@ pub fn pointer_up(app: &mut PhotocraftApp, start: [f64; 2], end: [f64; 2]) {
     if let Some(e) = app.ui.text_edit.as_mut() {
         e.dragging = false;
         e.resize = None;
+        app.ui.caret_blink_time = app.last_frame_time;
         return;
     }
     let (w, h) = ((end[0] - start[0]).abs(), (end[1] - start[1]).abs());
@@ -334,7 +352,9 @@ pub fn pointer_up(app: &mut PhotocraftApp, start: [f64; 2], end: [f64; 2]) {
         }
         // Like Photoshop: the placeholder is selected, so typing replaces it.
         let n = text.chars().count();
+        app.ui.caret_blink_time = app.last_frame_time;
         app.ui.text_edit = Some(TextEdit { layer: id, caret: n, anchor: 0, session: key, created: true, mask, dragging: false, resize: None, preedit: None });
+        app.ui.text_edit_return_tool = None;
     }
 }
 
@@ -773,6 +793,7 @@ pub fn handle_keys(app: &mut PhotocraftApp, ctx: &egui::Context) -> bool {
     let id = LayerId(ed.layer);
     let Some(text) = current_text(app, id) else {
         app.ui.text_edit = None;
+        app.ui.text_edit_return_tool = None;
         return false;
     };
     // Undo/redo can shorten the text under us.
@@ -781,7 +802,11 @@ pub fn handle_keys(app: &mut PhotocraftApp, ctx: &egui::Context) -> bool {
         e.caret = e.caret.min(n);
         e.anchor = e.anchor.min(n);
     }
-    ctx.request_repaint_after(std::time::Duration::from_millis(530)); // caret blink
+    let time = ctx.input(|i| i.time);
+    let elapsed = (time - app.ui.caret_blink_time).max(0.0);
+    let period = 0.530;
+    let remaining = period - (elapsed % period);
+    ctx.request_repaint_after(std::time::Duration::from_secs_f64(remaining.clamp(0.010, period)));
     let events = ctx.input(|i| i.events.clone());
     let vertical_flow = is_vertical(app, id);
     let mut handled = vec![false; events.len()];
@@ -934,6 +959,7 @@ pub fn handle_keys(app: &mut PhotocraftApp, ctx: &egui::Context) -> bool {
         }
     }
     if handled.iter().any(|h| *h) {
+        app.ui.caret_blink_time = ctx.input(|i| i.time);
         let mut k = 0;
         ctx.input_mut(|i| {
             i.events.retain(|_| {
@@ -960,6 +986,11 @@ pub fn commit_with(app: &mut PhotocraftApp, mods: egui::Modifiers) {
     }
     crate::type_transform::reset(app);
     let Some(ed) = app.ui.text_edit.take() else { return };
+    if let Some(tool) = app.ui.text_edit_return_tool.take()
+        && app.ui.tool.is_type()
+    {
+        app.ui.tool = tool;
+    }
     let Some(text) = current_text(app, LayerId(ed.layer)) else { return };
     if ed.mask {
         // Type Mask: the text's glyphs become (or combine with) the selection and the working
@@ -987,6 +1018,9 @@ pub fn commit_with(app: &mut PhotocraftApp, mods: egui::Modifiers) {
 /// Selection highlight, caret and text frame over the canvas.
 pub fn draw_overlay(app: &mut PhotocraftApp, painter: &egui::Painter, xf: &ViewXform) {
     let Some(ed) = app.ui.text_edit.clone() else { return };
+    if ed.dragging {
+        app.ui.caret_blink_time = painter.ctx().input(|i| i.time);
+    }
     let id = LayerId(ed.layer);
     let Some((l, aff, text)) = layout(app, id) else { return };
     if ed.mask {
@@ -1014,20 +1048,20 @@ pub fn draw_overlay(app: &mut PhotocraftApp, painter: &egui::Painter, xf: &ViewX
     }
     // Frame: paragraph text shows its box with handles; point text an underline per line.
     let mods = crate::workspace_ui::sticky_mods(app, painter.ctx().input(|i| i.modifiers));
-    if crate::type_transform::draw(app, painter, xf, mods) {
-        return;
-    }
+    let has_transform = crate::type_transform::draw(app, painter, xf, mods);
     let shape = app.session.active().and_then(|s| text_layer(&s.doc, id).map(|t| t.shape.clone()));
     let frame = Stroke::new(1.0, t.accent);
     match shape {
         Some(photocraft_doc::text::TextShape::Box { x, y, width, height }) => {
-            let c = [scr_t(x, y), scr_t(x + width, y), scr_t(x + width, y + height), scr_t(x, y + height)];
-            painter.add(egui::Shape::closed_line(c.to_vec(), frame));
-            let mids = [c[0].lerp(c[1], 0.5), c[1].lerp(c[2], 0.5), c[2].lerp(c[3], 0.5), c[3].lerp(c[0], 0.5)];
-            for p in c.iter().chain(mids.iter()) {
-                let r = egui::Rect::from_center_size(*p, egui::vec2(7.0, 7.0));
-                painter.rect_filled(r, 0.0, Color32::WHITE);
-                painter.rect_stroke(r, 0.0, frame, egui::StrokeKind::Inside);
+            if !has_transform {
+                let c = [scr_t(x, y), scr_t(x + width, y), scr_t(x + width, y + height), scr_t(x, y + height)];
+                painter.add(egui::Shape::closed_line(c.to_vec(), frame));
+                let mids = [c[0].lerp(c[1], 0.5), c[1].lerp(c[2], 0.5), c[2].lerp(c[3], 0.5), c[3].lerp(c[0], 0.5)];
+                for p in c.iter().chain(mids.iter()) {
+                    let r = egui::Rect::from_center_size(*p, egui::vec2(7.0, 7.0));
+                    painter.rect_filled(r, 0.0, Color32::WHITE);
+                    painter.rect_stroke(r, 0.0, frame, egui::StrokeKind::Inside);
+                }
             }
         }
         _ => {
@@ -1070,17 +1104,23 @@ pub fn draw_overlay(app: &mut PhotocraftApp, painter: &egui::Painter, xf: &ViewX
             }
         }
     } else {
-        // Blinking caret (Photoshop's ~0.53 s rhythm), solid while dragging.
+        // Blinking caret (Photoshop's ~0.53 s rhythm), solid while dragging or immediately after interaction.
         let time = painter.ctx().input(|i| i.time);
-        if ed.dragging || (time * 1000.0 / 530.0) as i64 % 2 == 0 {
+        let elapsed = (time - app.ui.caret_blink_time).max(0.0);
+        if ed.dragging || (elapsed * 1000.0 / 530.0) as i64 % 2 == 0 {
             let (x, top, bot) = l.caret(a);
             let (x, top, bot) = if l.lines.is_empty() { (0.0, -(12.0 * l.px_per_pt.max(1.0)), 3.0) } else { (x, top, bot) };
-            let c = if crate::theme::Tokens::get(painter.ctx()).pro { Color32::WHITE } else { Color32::BLACK };
-            painter.line_segment([scr(x, top), scr(x, bot)], Stroke::new(1.5, c));
-            painter.line_segment([scr(x, top), scr(x, bot)], Stroke::new(0.75, Color32::BLACK));
+            for stroke in CARET_STROKES {
+                painter.line_segment([scr(x, top), scr(x, bot)], stroke);
+            }
         }
     }
 }
+
+/// The text caret, drawn in order: a white halo, then a solid black line inside it, so it reads on
+/// any background (#6085). The black line used to be a 0.75 pt hairline inside a white one, which
+/// on a white background left only a faint grey line.
+const CARET_STROKES: [Stroke; 2] = [Stroke { width: 3.0, color: Color32::WHITE }, Stroke { width: 1.0, color: Color32::BLACK }];
 
 /// The Type Mask tools while typing: Quick Mask's colour over the canvas with the glyphs clear,
 /// as Photoshop shows the selection-to-be. The glyphs come from the hidden working layer's pixels.
@@ -1422,7 +1462,10 @@ pub(crate) fn family_picker_in(
     preview: photocraft_engine::prefs::FontPreview,
 ) -> bool {
     let mut changed = false;
+    // A font picked from the open menu (click or Enter): the field keeps the focus afterwards.
+    let mut picked = false;
     let search_id = ui.id().with(("font-search", salt));
+    let focus_id = search_id.with("focus");
     // The list opens on the press, so a press-drag-release picks a font too (#2735).
     let (press, close) = crate::press_menu::PressCombo::before(ui, salt);
     let labels: Option<Arc<HashMap<String, String>>> = ui.ctx().data(|d| d.get_temp(font_labels_id()));
@@ -1438,26 +1481,25 @@ pub(crate) fn family_picker_in(
         .close_behavior(if matches!(close, egui::PopupCloseBehavior::IgnoreClicks) { close } else { egui::PopupCloseBehavior::CloseOnClickOutside });
 
     let response = combo.show_ui(ui, |ui| {
-        let (pass_id, focus_id, height_id) = (search_id.with("pass"), search_id.with("focus"), search_id.with("height"));
-        let pass = ui.ctx().cumulative_pass_nr();
-        let last_pass: Option<u64> = ui.data(|d| d.get_temp(pass_id));
-        // Freshly opened (not drawn last pass): focus the search field whatever the query, and keep
-        // asking until it has focus (the first pass is egui's invisible sizing pass) (#1369).
-        let opened = last_pass.is_none_or(|p| p.saturating_add(1) < pass);
-        let mut focus = opened || ui.data(|d| d.get_temp(focus_id)).unwrap_or(false);
+        let height_id = search_id.with("height");
+        // Each opening focuses the search, including a reopen on the very next pass. Keep
+        // asking through the invisible sizing pass, until the field receives focus.
+        let mut focus = ui.data(|d| d.get_temp(focus_id)).unwrap_or(true);
         let mut q: String = ui.data(|d| d.get_temp(search_id)).unwrap_or_default();
         // Consume these before TextEdit and the canvas can interpret them as caret movement.
         let down = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown));
         let up = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp));
         let enter = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
-        let r = ui.add(egui::TextEdit::singleline(&mut q).hint_text(tl!("Search fonts")).desired_width(200.0));
-        if r.has_focus() {
-            focus = false;
-        } else if focus {
-            r.request_focus();
+        if focus {
+            ui.memory_mut(|m| m.request_focus(search_id.with("input")));
+        }
+        let r = ui.add(egui::TextEdit::singleline(&mut q).id(search_id.with("input")).hint_text(tl!("Search fonts")).desired_width(200.0));
+        if focus {
+            // The opening click can release after several focused frames. Keep the request
+            // pending through that release, which can hand focus back to the combo button.
+            focus = !r.has_focus() || ui.input(|i| i.pointer.primary_down() || i.pointer.primary_released());
         }
         ui.data_mut(|d| {
-            d.insert_temp(pass_id, pass);
             d.insert_temp(focus_id, focus);
             d.insert_temp(search_id, q.clone());
         });
@@ -1479,6 +1521,7 @@ pub(crate) fn family_picker_in(
             }
         }
         let accept = enter && rows.iter().any(|(f, _)| *f == current);
+        picked |= accept;
         if accept {
             ui.data_mut(|d| d.remove::<String>(search_id));
             ui.close();
@@ -1488,7 +1531,11 @@ pub(crate) fn family_picker_in(
 
         let mut hovered: Option<String> = None;
         for (f, label) in rows {
-            let mut button = egui::Button::selectable(f == current, label).truncate();
+            // Highlighted by its fill alone, as Photoshop's font menu is. A selectable button lays
+            // out its frame's stroke only once hovered or selected, so with the theme's stroke the
+            // row under the pointer (and the selected one) grew and pushed the rows below down:
+            // the list jumped as the pointer moved (#7406).
+            let mut button = egui::Button::selectable(f == current, label).truncate().stroke(egui::Stroke::NONE);
             if let Some((size, [_, h])) = preview {
                 button =
                     button.right_text(egui::Atom::custom(ui.id().with(("font-sample", f)), egui::vec2(crate::font_preview::slot_width(ui.ctx(), f, size), h)));
@@ -1510,6 +1557,7 @@ pub(crate) fn family_picker_in(
                 // A served family not fetched yet: start now, before any text needs it.
                 photocraft_text::served::request(f);
                 changed = true;
+                picked = true;
                 ui.data_mut(|d| d.remove::<String>(search_id));
                 hovered = None;
                 ui.close();
@@ -1527,7 +1575,42 @@ pub(crate) fn family_picker_in(
         if accept { None } else { hovered }
     });
     press.after(&response.response);
+    if !egui::ComboBox::is_open(ui.ctx(), response.response.id) {
+        ui.data_mut(|d| d.remove::<bool>(focus_id));
+    }
     let hovered_font = response.inner.unwrap_or_default();
+
+    // As in Photoshop, the field keeps the keyboard focus once a font is picked, and ↑ / ↓ on the
+    // focused, closed field step to the previous / next family, applying each (#7407). The lock
+    // filter keeps egui from using those arrows to move the focus to another widget.
+    let field = response.response.id;
+    if picked {
+        ui.memory_mut(|m| m.request_focus(field));
+    }
+    let open = egui::ComboBox::is_open(ui.ctx(), field);
+    if !open && ui.is_enabled() && ui.memory(|m| m.has_focus(field)) {
+        ui.memory_mut(|m| m.set_focus_lock_filter(field, egui::EventFilter { vertical_arrows: true, ..Default::default() }));
+        let down = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown));
+        let up = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp));
+        if down || up {
+            // The lock filter only holds from the frame after the field got the focus: an arrow
+            // right after a pick was already read by egui as a focus move, applied at the end of
+            // the frame. Cancel it, so the arrow only steps the font.
+            ui.memory_mut(|m| m.move_focus(egui::FocusDirection::None));
+        }
+        // The wheel's step: a negative notch is the next family.
+        let notches = f32::from(u8::from(up)) - f32::from(u8::from(down));
+        let rows = font_menu_rows(families, labels, "");
+        if let Some(i) = rows.iter().position(|(f, _)| *f == current)
+            && let Some(n) = wheel_family_index(i, rows.len(), notches)
+            && let Some((f, _)) = rows.get(n)
+            && **f != *current
+        {
+            current.clone_from(f);
+            photocraft_text::served::request(f);
+            changed = true;
+        }
+    }
 
     // The wheel over the closed button steps through the families, a notch each, like Photoshop's
     // options-bar font menu: no need to open the list (#3350).
@@ -1985,9 +2068,20 @@ fn toggle_cell(ui: &mut egui::Ui, w: f32, on: bool, tip: &str, paint: impl FnOnc
     if on {
         ui.painter().rect_stroke(r, t.radius_sm, Stroke::new(1.0, t.accent_border), egui::StrokeKind::Inside);
     }
-    paint(ui, r, if on { t.text } else { t.text_dim });
+    let enabled = ui.is_enabled();
+    paint(
+        ui,
+        r,
+        if !enabled {
+            t.text_faint
+        } else if on {
+            t.text
+        } else {
+            t.text_dim
+        },
+    );
     let tip = tip.to_string();
-    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, on, &tip));
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, enabled, on, &tip));
     resp.on_hover_text(tl!(&tip)).clicked()
 }
 
@@ -2117,6 +2211,8 @@ fn type_sections(app: &mut PhotocraftApp, ui: &mut egui::Ui, character: bool, pa
     use crate::props_layout::{COL_GAP, LABEL_GAP, LABEL_W, field_width, section};
     use crate::theme::ROW_GAP;
     let Some((c, para)) = styles_at(app) else { return };
+    // Preferences ▸ Units & Rulers ▸ Type, as in the options bar: the model keeps points.
+    let (u, unit) = type_unit(app);
     let t = crate::theme::Tokens::get(ui.ctx());
     // Row helper: `ui.horizontal` with the column gap, then the shared row gap.
     let row = |ui: &mut egui::Ui, add: &mut dyn FnMut(&mut egui::Ui)| {
@@ -2154,13 +2250,13 @@ fn type_sections(app: &mut PhotocraftApp, ui: &mut egui::Ui, character: bool, pa
             let k = shown_scale(app);
             // Hover tips stay English until wired through `tl!` in a multi-locale change
             // (`every_tl_literal_is_translated` requires every complete catalog).
-            if let Some(v) = num_field(ui, "tT", "Font size", c.size_pt * k, 0.1..=1296.0, "pt", w) {
-                app.ui.tool_options.type_size = v;
-                apply(app, ui.ctx(), json!({"size": v, "metricsAsShown": true}));
+            if let Some(v) = num_field(ui, "tT", "Font size", c.size_pt * k * u, 0.1 * u..=1296.0 * u, unit, w) {
+                app.ui.tool_options.type_size = v / u;
+                apply(app, ui.ctx(), json!({"size": v / u, "metricsAsShown": true}));
             }
             let lead = c.leading_pt.unwrap_or(c.size_pt * para.auto_leading.max(0.01)) * k;
-            if let Some(v) = num_field(ui, "A↕", "Leading (set to the font size × auto-leading when Auto)", lead, 0.1..=5000.0, "pt", w) {
-                apply(app, ui.ctx(), json!({"leading": v, "metricsAsShown": true}));
+            if let Some(v) = num_field(ui, "A↕", "Leading (set to the font size × auto-leading when Auto)", lead * u, 0.1 * u..=5000.0 * u, unit, w) {
+                apply(app, ui.ctx(), json!({"leading": v / u, "metricsAsShown": true}));
             }
         });
         row(ui, &mut |ui| {
@@ -2185,8 +2281,8 @@ fn type_sections(app: &mut PhotocraftApp, ui: &mut egui::Ui, character: bool, pa
             }
         });
         row(ui, &mut |ui| {
-            if let Some(v) = num_field(ui, "Aª", "Baseline shift", c.baseline_shift_pt, -1296.0..=1296.0, "pt", w) {
-                apply(app, ui.ctx(), json!({"baselineShift": v}));
+            if let Some(v) = num_field(ui, "Aª", "Baseline shift", c.baseline_shift_pt * u, -1296.0 * u..=1296.0 * u, unit, w) {
+                apply(app, ui.ctx(), json!({"baselineShift": v / u}));
             }
             // Colour: label + a swatch filling the rest of the second column.
             ui.horizontal(|ui| {
@@ -2278,14 +2374,32 @@ fn type_sections(app: &mut PhotocraftApp, ui: &mut egui::Ui, character: bool, pa
             ("justifyAll", tl!("Justify all"), A::JustifyAll),
         ];
         let cw = cell_width(full, items.len());
+        // Justification needs a paragraph box: on point text Photoshop greys the four justify
+        // buttons (#7713).
+        // The panel formats the layer being typed in, else every selected type layer.
+        let point = match formatting_params(app) {
+            Some(p) => p.get("layers").and_then(serde_json::Value::as_array).map_or_else(
+                || p.get("layer").and_then(serde_json::Value::as_u64).into_iter().collect::<Vec<_>>(),
+                |ids| ids.iter().filter_map(serde_json::Value::as_u64).collect(),
+            ),
+            None => Vec::new(),
+        }
+        .into_iter()
+        .any(|layer| box_shape(app, LayerId(layer)).is_none());
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
             for (key, tip, a) in items {
-                let clicked = toggle_cell(ui, cw, para.align == a, tip, |ui, r, col| {
-                    // The glyph keeps its size; the cell grows around it.
-                    let g = egui::Rect::from_center_size(r.center(), egui::vec2(12.0, 10.0));
-                    align_glyph(ui.painter(), g, a, if para.align == a { col } else { t.icon });
-                });
+                let justify = !matches!(a, A::Left | A::Center | A::Right);
+                let clicked = ui
+                    .add_enabled_ui(!(point && justify), |ui| {
+                        toggle_cell(ui, cw, para.align == a, tip, |ui, r, col| {
+                            // The glyph keeps its size; the cell grows around it.
+                            let g = egui::Rect::from_center_size(r.center(), egui::vec2(12.0, 10.0));
+                            let col = if !ui.is_enabled() || para.align == a { col } else { t.icon };
+                            align_glyph(ui.painter(), g, a, col);
+                        })
+                    })
+                    .inner;
                 if clicked {
                     apply(app, ui.ctx(), json!({"align": key}));
                 }
@@ -2293,30 +2407,27 @@ fn type_sections(app: &mut PhotocraftApp, ui: &mut egui::Ui, character: bool, pa
         });
         ui.add_space(ROW_GAP);
         row(ui, &mut |ui| {
-            if let Some(v) = num_field(ui, "→|", "Indent left margin", para.start_indent_pt, -1296.0..=1296.0, "pt", w) {
-                apply(app, ui.ctx(), json!({"startIndent": v}));
+            if let Some(v) = num_field(ui, "→|", "Indent left margin", para.start_indent_pt * u, -1296.0 * u..=1296.0 * u, unit, w) {
+                apply(app, ui.ctx(), json!({"startIndent": v / u}));
             }
-            if let Some(v) = num_field(ui, "|←", "Indent right margin", para.end_indent_pt, -1296.0..=1296.0, "pt", w) {
-                apply(app, ui.ctx(), json!({"endIndent": v}));
-            }
-        });
-        row(ui, &mut |ui| {
-            if let Some(v) = num_field(ui, "¶→", "Indent first line", para.first_line_indent_pt, -1296.0..=1296.0, "pt", w) {
-                apply(app, ui.ctx(), json!({"firstLineIndent": v}));
+            if let Some(v) = num_field(ui, "|←", "Indent right margin", para.end_indent_pt * u, -1296.0 * u..=1296.0 * u, unit, w) {
+                apply(app, ui.ctx(), json!({"endIndent": v / u}));
             }
         });
         row(ui, &mut |ui| {
-            if let Some(v) = num_field(ui, "↑¶", "Add space before paragraph", para.space_before_pt, 0.0..=1296.0, "pt", w) {
-                apply(app, ui.ctx(), json!({"spaceBefore": v}));
-            }
-            if let Some(v) = num_field(ui, "¶↓", "Add space after paragraph", para.space_after_pt, 0.0..=1296.0, "pt", w) {
-                apply(app, ui.ctx(), json!({"spaceAfter": v}));
+            if let Some(v) = num_field(ui, "¶→", "Indent first line", para.first_line_indent_pt * u, -1296.0 * u..=1296.0 * u, unit, w) {
+                apply(app, ui.ctx(), json!({"firstLineIndent": v / u}));
             }
         });
-        let mut hy = para.hyphenate;
-        if crate::widgets::checkbox(ui, &mut hy, "Hyphenate").changed() {
-            apply(app, ui.ctx(), json!({"hyphenate": hy}));
-        }
+        row(ui, &mut |ui| {
+            if let Some(v) = num_field(ui, "↑¶", "Add space before paragraph", para.space_before_pt * u, 0.0 * u..=1296.0 * u, unit, w) {
+                apply(app, ui.ctx(), json!({"spaceBefore": v / u}));
+            }
+            if let Some(v) = num_field(ui, "¶↓", "Add space after paragraph", para.space_after_pt * u, 0.0 * u..=1296.0 * u, unit, w) {
+                apply(app, ui.ctx(), json!({"spaceAfter": v / u}));
+            }
+        });
+        // Hyphenate is stored (⌥⇧⌘H / PSD AutoHyphenate) but layout never breaks words (#6710).
         ui.add_space(ROW_GAP);
     }
 }
@@ -2392,6 +2503,11 @@ fn type_options(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
 pub fn cancel(app: &mut PhotocraftApp) {
     crate::type_transform::reset(app);
     let Some(ed) = app.ui.text_edit.take() else { return };
+    if let Some(tool) = app.ui.text_edit_return_tool.take()
+        && app.ui.tool.is_type()
+    {
+        app.ui.tool = tool;
+    }
     undo_session(app, &ed);
 }
 
@@ -2681,5 +2797,87 @@ mod tests {
         assert_eq!(word_boundary("hello big world", 0, true), 5);
         assert_eq!(word_boundary("hello big world", 7, false), 6);
         assert_eq!(word_boundary("hello big world", 15, false), 10);
+    }
+    #[test]
+    fn arrow_keys_reset_caret_blink_phase() {
+        let mut app = app();
+        pointer_up(&mut app, [10.0, 50.0], [10.0, 50.0]);
+        insert(&mut app, "Hello");
+        app.ui.caret_blink_time = 0.0;
+        let ctx = egui::Context::default();
+
+        let has_caret = |app: &mut PhotocraftApp, ctx: &egui::Context, time: f64| -> bool {
+            let mut out = ctx.run_ui(egui::RawInput { time: Some(time), ..Default::default() }, |ui| {
+                let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 400.0));
+                let painter = ui.ctx().layer_painter(egui::LayerId::background()).with_clip_rect(rect);
+                let xf = ViewXform { rect, zoom: 1.0, center: [100.0, 100.0], flip: false, rotation: 0.0, aspect: 1.0 };
+                draw_overlay(app, &painter, &xf);
+            });
+            out.textures_delta.clear();
+            out.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::LineSegment { stroke, .. } if CARET_STROKES.contains(stroke)))
+        };
+
+        // Before resetting, the caret is in the off phase at t = 10.5 s (10500 / 530 = 19, odd phase)
+        assert!(!has_caret(&mut app, &ctx, 10.5), "caret should be off at t = 10.5 with phase 0.0");
+
+        ctx.begin_pass(egui::RawInput {
+            time: Some(10.5),
+            events: vec![egui::Event::Key { key: egui::Key::ArrowRight, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }],
+            ..Default::default()
+        });
+        handle_keys(&mut app, &ctx);
+        assert_eq!(app.ui.caret_blink_time, 10.5);
+
+        // draw_overlay paints the solid caret in the new phase
+        assert!(has_caret(&mut app, &ctx, 10.5), "caret should be painted right after arrow key");
+    }
+
+    #[test]
+    fn pointer_up_click_resets_caret_blink_phase() {
+        let mut app = app();
+        pointer_up(&mut app, [10.0, 50.0], [10.0, 50.0]);
+        insert(&mut app, "Hello");
+        app.ui.caret_blink_time = 0.0;
+        app.last_frame_time = 12.3;
+        pointer_up(&mut app, [10.0, 50.0], [10.0, 50.0]);
+        assert_eq!(app.ui.caret_blink_time, 12.3);
+    }
+
+    #[test]
+    fn double_click_from_move_tool_restores_move_tool_on_commit_and_cancel() {
+        let (mut app, _) = variants();
+        app.ui.tool = crate::state::Tool::Move;
+        assert!(edit_at(&mut app, ON_TEXT.0, ON_TEXT.1));
+        assert_eq!(app.ui.tool, crate::state::Tool::Type);
+        assert_eq!(app.ui.text_edit_return_tool, Some(crate::state::Tool::Move));
+        commit(&mut app);
+        assert_eq!(app.ui.tool, crate::state::Tool::Move, "commit restores the Move tool");
+        assert_eq!(app.ui.text_edit_return_tool, None);
+
+        // Also test cancel
+        app.ui.tool = crate::state::Tool::Move;
+        assert!(edit_at(&mut app, ON_TEXT.0, ON_TEXT.1));
+        assert_eq!(app.ui.tool, crate::state::Tool::Type);
+        cancel(&mut app);
+        assert_eq!(app.ui.tool, crate::state::Tool::Move, "cancel restores the Move tool");
+        assert_eq!(app.ui.text_edit_return_tool, None);
+
+        // Switching tools mid-edit commits without overriding the newly chosen tool
+        app.ui.tool = crate::state::Tool::Move;
+        assert!(edit_at(&mut app, ON_TEXT.0, ON_TEXT.1));
+        assert_eq!(app.ui.tool, crate::state::Tool::Type);
+        assert_eq!(app.ui.text_edit_return_tool, Some(crate::state::Tool::Move));
+        app.ui.tool = crate::state::Tool::Brush;
+        commit(&mut app);
+        assert_eq!(app.ui.tool, crate::state::Tool::Brush, "switching tools keeps the chosen tool");
+        assert_eq!(app.ui.text_edit_return_tool, None);
+
+        // Layers-thumbnail edit stays on Type tool (matches Photoshop)
+        app.ui.tool = crate::state::Tool::Move;
+        edit_active(&mut app).unwrap();
+        assert_eq!(app.ui.tool, crate::state::Tool::Type);
+        assert_eq!(app.ui.text_edit_return_tool, None);
+        commit(&mut app);
+        assert_eq!(app.ui.tool, crate::state::Tool::Type, "Layers-thumbnail edit stays on Type tool");
     }
 }

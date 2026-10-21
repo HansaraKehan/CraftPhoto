@@ -45,11 +45,17 @@ pub struct Action {
     /// filled by Load Actions (`actions.load`) and written by Save Actions (`actions.save`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub set: Option<String>,
+    /// Button Mode colour. Empty is none; otherwise one of [`BUTTON_COLORS`].
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub color: String,
 }
+
+/// Button Mode colours, in Photoshop's order. Empty is no colour.
+pub const BUTTON_COLORS: [&str; 8] = ["", "red", "orange", "yellow", "green", "blue", "violet", "gray"];
 
 impl Action {
     pub fn new(name: impl Into<String>, steps: Vec<(String, Value)>) -> Self {
-        Self { name: name.into(), steps, disabled: BTreeSet::new(), dialogs: BTreeSet::new(), set: None }
+        Self { name: name.into(), steps, disabled: BTreeSet::new(), dialogs: BTreeSet::new(), set: None, color: String::new() }
     }
 
     /// Apply `f` to every per-step index set (`disabled`, `dialogs`) after steps moved.
@@ -235,7 +241,7 @@ fn get(s: &mut Session, p: &Value) -> Result<Value> {
     let idx = resolve(&s.actions.list, p, "actions.get")?;
     let action = &s.actions.list[idx];
     let steps: Vec<Value> = action.steps.iter().map(|(id, params)| json!([id, params])).collect();
-    Ok(json!({"name": action.name, "steps": steps, "disabled": action.disabled, "dialogs": action.dialogs, "set": action.set}))
+    Ok(json!({"name": action.name, "steps": steps, "disabled": action.disabled, "dialogs": action.dialogs, "set": action.set, "color": action.color}))
 }
 
 fn record(s: &mut Session, p: &Value) -> Result<Value> {
@@ -553,6 +559,25 @@ fn rename(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"action": name, "index": idx}))
 }
 
+fn set_color(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "actions.setColor";
+    not_playing(s, cmd)?;
+    let idx = resolve(&s.actions.list, p, cmd)?;
+    let Some(color) = p.get("color").and_then(Value::as_str) else {
+        return Err(bad(cmd, "needs \"color\""));
+    };
+    if !BUTTON_COLORS.contains(&color) {
+        return Err(bad(cmd, "color must be empty, red, orange, yellow, green, blue, violet, or gray"));
+    }
+    let Some(action) = s.actions.list.get_mut(idx) else {
+        return Err(bad(cmd, "no such action"));
+    };
+    action.color = color.to_string();
+    let name = action.name.clone();
+    s.actions.touch();
+    Ok(json!({"action": name, "color": color}))
+}
+
 pub fn specs() -> Vec<CommandSpec> {
     vec![
         CommandSpec {
@@ -580,7 +605,7 @@ pub fn specs() -> Vec<CommandSpec> {
             label: "Get Action",
             menu: &[],
             shortcut: None,
-            params: r##"{"action":name|index} → {name, steps:[[id, params]…], disabled:[step…], dialogs:[step…], set:name|null} (steps is the shape file.automate.batch and droplets take; disabled lists the 0-based steps playback skips; dialogs the steps whose dialog Photoshop would show; set the action set from Load Actions)"##,
+            params: r##"{"action":name|index} → {name, steps:[[id, params]…], disabled:[step…], dialogs:[step…], set:name|null, color:str} (steps is the shape file.automate.batch and droplets take; disabled lists the 0-based steps playback skips; dialogs the steps whose dialog Photoshop would show; set the action set from Load Actions; color is the Button Mode swatch, or empty)"##,
             enabled: always,
             run: get,
             journal: false,
@@ -643,6 +668,16 @@ pub fn specs() -> Vec<CommandSpec> {
             params: r##"{"action":name|index, "name":str} → {action, index}. The name must not be empty or whitespace-only and must be unique. Nested Play Action steps and the action's function key follow the rename."##,
             enabled: always,
             run: rename,
+            journal: false,
+        },
+        CommandSpec {
+            id: "actions.setColor",
+            label: "Set Action Color",
+            menu: &[],
+            shortcut: None,
+            params: r##"{"action":name|index, "color":""|"red"|"orange"|"yellow"|"green"|"blue"|"violet"|"gray"} → {action, color}. The Button Mode colour. Empty clears it."##,
+            enabled: always,
+            run: set_color,
             journal: false,
         },
     ]
@@ -1410,5 +1445,25 @@ mod tests {
         // The first document is untouched.
         let first = &s.documents()[0].doc;
         assert_eq!((first.size.width, first.size.height), (48, 48), "the recording document keeps its own crop");
+    }
+
+    #[test]
+    fn button_color_is_one_of_the_photoshop_swatches() {
+        let mut s = Session::new();
+        s.execute("actions.record", json!({"name": "Print"})).unwrap();
+        s.execute("actions.stop", json!({})).unwrap();
+        let set = s.execute("actions.setColor", json!({"action": "Print", "color": "blue"})).unwrap();
+        assert_eq!(set["color"], "blue");
+        assert_eq!(s.actions.list[0].color, "blue");
+        assert_eq!(s.execute("actions.get", json!({"action": 0})).unwrap()["color"], "blue");
+        let saved = serde_json::to_string(&s.actions.list).unwrap();
+        assert!(saved.contains("blue"));
+        s.execute("actions.setColor", json!({"action": 0, "color": ""})).unwrap();
+        assert!(s.actions.list[0].color.is_empty());
+        assert!(!serde_json::to_string(&s.actions.list).unwrap().contains("color"), "an empty colour is omitted");
+        for bad in [json!({"action": 0, "color": "pink"}), json!({"action": 0}), json!({"action": 4, "color": "red"}), json!({"color": "red"})] {
+            assert!(s.execute("actions.setColor", bad).is_err());
+        }
+        assert!(s.actions.list[0].color.is_empty(), "rejected colours change nothing");
     }
 }

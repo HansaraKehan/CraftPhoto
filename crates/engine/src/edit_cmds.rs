@@ -35,15 +35,14 @@ pub struct Clip {
 
 /// Photoshop's layer-based copy (CC 2018 on): with no selection, Copy takes the active layer
 /// whole when it is a smart object (#2428), a type or shape layer, or a group (its whole subtree)
-/// (#2670), so Paste recreates it instead of its pixels. Pixel layers still copy their pixels;
-/// several selected layers are [`multi_copy_ids`].
+/// (#2670), so Paste recreates it instead of its pixels. Fill and adjustment layers have no
+/// pixels of their own, so they are taken whole too rather than refused (#2344). Pixel layers
+/// still copy their pixels; several selected layers are [`multi_copy_ids`].
 fn takes_whole(d: &crate::DocState, id: LayerId) -> bool {
     d.doc.selection.is_none()
         && d.selected_layers().len() <= 1
         && crate::layer_copy_cmds::layered(d.doc.mode)
-        && d.doc
-            .layer(id)
-            .is_some_and(|l| matches!(l.content, LayerContent::Smart(_) | LayerContent::Text(_) | LayerContent::Shape(_) | LayerContent::Group(_)))
+        && d.doc.layer(id).is_some_and(|l| !matches!(l.content, LayerContent::Raster(_)))
 }
 
 /// A scratch document in the source's colour, to hold copied layers.
@@ -280,13 +279,18 @@ fn copy(s: &mut Session, merged: bool) -> Result<Value> {
         }
         match (d.doc.layer(id).and_then(Layer::surface).filter(|_| several.is_empty()), &layers) {
             (Some(surf), _) => Clip { layers, ..lift(surf, d.doc.selection.as_ref(), canvas)? },
-            // A group has no pixels of its own: the clipboard pixels are what it shows.
+            // A group or fill layer has no pixels of its own: the clipboard pixels are what it
+            // shows. Adjustment layers show nothing by themselves, so their clip spans the canvas
+            // they apply to: Paste places them as a full-canvas layer, and the UI still mirrors
+            // the clip to the OS clipboard (an empty clip would let a stale OS image replace it).
             (None, Some(copies)) => {
                 let mut shown = (**copies).clone();
                 for l in &mut shown.layers {
                     l.visible = true;
                 }
-                Clip { layers, ..lift(&merged_surface(&shown), None, canvas)? }
+                let clip = lift(&merged_surface(&shown), None, canvas)?;
+                let bounds = if clip.bounds.is_empty() { canvas } else { clip.bounds };
+                Clip { layers, bounds, ..clip }
             }
             (None, None) => return Err(EngineError::Other("the active layer has no pixels".into())),
         }
@@ -390,7 +394,6 @@ fn paste(s: &mut Session, p: &Value, in_place: bool) -> Result<Value> {
     let moved = shifted(&clip.surface, dx, dy);
     let target = PixelFormat::new(fmt.mode, fmt.sample, true);
     let surf = if moved.format() == target { moved } else { moved.convert(target) };
-    let before = d.doc.clone();
     let id = s.edit("Paste", |doc, active| {
         let mut l = Layer::raster(doc.next_layer_name("Layer"), target);
         *crate::pixels_mut(&mut l)? = surf;
@@ -399,8 +402,7 @@ fn paste(s: &mut Session, p: &Value, in_place: bool) -> Result<Value> {
         doc.selection = None;
         Ok(id)
     })?;
-    // Only where the pasted pixels land needs recompositing, not the whole document (#2901).
-    crate::layer_multi_cmds::note_insert(s, &before);
+    // `edit` reports only where the pasted pixels land as damage, not the whole document (#2901).
     Ok(json!({"layer": id.0, "offset": [dx, dy]}))
 }
 
@@ -835,6 +837,44 @@ fn guide_color(p: &Value) -> Result<Option<[u8; 3]>> {
     )
 }
 
+/// Edit Selected Guides (the guide context menu): change one guide's orientation, position and
+/// colour in one history step. A guide that keeps its orientation keeps its index; one that turns
+/// goes to the end of the other list. Without `color` it keeps its own colour, or none.
+fn edit_guide(s: &mut Session, p: &Value) -> Result<Value> {
+    let orientation = |key: &str| match p.get(key).map(|v| v.as_str()) {
+        None => Ok(None),
+        Some(Some("horizontal")) => Ok(Some(false)),
+        Some(Some("vertical")) => Ok(Some(true)),
+        Some(_) => Err(EngineError::Other(format!("`{key}` must be \"horizontal\" or \"vertical\""))),
+    };
+    let from = orientation("orientation")?.unwrap_or(false);
+    let to = orientation("newOrientation")?.unwrap_or(from);
+    let index = p.get("index").and_then(Value::as_u64).ok_or(EngineError::Other("missing `index`".into()))?;
+    let pos = guide_position(s, p, to)?;
+    let color = guide_color(p)?;
+    s.edit("Edit Guide", |doc, _| {
+        let guides = &mut doc.guides;
+        let list = if from { &guides.vertical } else { &guides.horizontal };
+        let i = usize::try_from(index).ok().filter(|i| *i < list.len()).ok_or(EngineError::Other("no such guide".into()))?;
+        let old = list[i];
+        let at = pos.unwrap_or(old);
+        let rgb = color.or_else(|| guides.color(from, old));
+        if from == to {
+            let list = if from { &mut guides.vertical } else { &mut guides.horizontal };
+            list[i] = at;
+        } else {
+            (if from { &mut guides.vertical } else { &mut guides.horizontal }).remove(i);
+            (if to { &mut guides.vertical } else { &mut guides.horizontal }).push(at);
+        }
+        guides.prune_colors();
+        if rgb.is_some() {
+            guides.set_color(to, at, rgb);
+        }
+        Ok(())
+    })?;
+    Ok(Value::Null)
+}
+
 /// View › New Guide / guide moves (undoable, like Photoshop's "New Guide"/"Move Guide" states).
 fn guide_cmd(s: &mut Session, p: &Value, op: &str) -> Result<Value> {
     let vertical = p.get("orientation").and_then(Value::as_str).unwrap_or("horizontal") == "vertical";
@@ -1013,6 +1053,15 @@ pub fn specs() -> Vec<CommandSpec> {
             r##"{"orientation":"horizontal|vertical","index":n,"position":px or "<number><unit>"} (units as for view.newGuide)"##,
             has_doc,
             |s, p| guide_cmd(s, p, "move")
+        ),
+        spec!(
+            "view.editGuide",
+            "Edit Guide",
+            &[],
+            None,
+            r##"{"orientation":"horizontal|vertical","index":n,"newOrientation":"horizontal|vertical"?,"position":px or "<number><unit>"?,"color":name or "#rrggbb"?} (Edit Selected Guides: units and colours as for view.newGuide; % is of the new orientation's extent; whatever is left out stays as it was)"##,
+            has_doc,
+            edit_guide
         ),
         spec!("view.deleteGuide", "Delete Guide", &[], None, r##"{"orientation":"horizontal|vertical","index":n}"##, has_doc, |s, p| guide_cmd(s, p, "delete")),
         spec!("view.clearGuides", "Clear Guides", &["View"], None, "{}", has_doc, |s, p| guide_cmd(s, p, "clear")),
@@ -1407,12 +1456,12 @@ mod tests {
         assert!(s.clipboard.is_none(), "a refused copy leaves the clipboard alone");
         s.execute("layer.layerMask.revealAll", json!({})).unwrap();
         assert!(s.execute("edit.copy", json!({"target": "mask"})).is_ok());
-        // An adjustment layer has no pixels of its own: Copy is only enabled while its mask is
-        // targeted (#2928).
+        // An adjustment layer has no pixels of its own: Copy takes the layer whole (#2344), and
+        // its mask while that is targeted (#2928).
         s.execute("file.new", json!({"width": 20, "height": 20})).unwrap();
         let a = s.execute("layer.newAdjustmentLayer.levels", json!({})).unwrap()["layer"].as_u64().unwrap();
         s.execute("layer.select", json!({"layer": a})).unwrap();
-        assert!(!s.is_enabled("edit.copy"), "no pixels to copy");
+        assert!(s.is_enabled("edit.copy"), "the layer itself can be copied");
         s.execute("layer.layerMask.revealAll", json!({})).unwrap();
         assert!(s.is_enabled_with("edit.copy", &json!({"target": "mask"})), "the mask can be copied");
     }
@@ -1869,6 +1918,56 @@ mod tests {
         assert_eq!(shape.surface().map(|c| c.format().sample), Some(s.active().unwrap().doc.depth), "converted to 16 bits");
     }
 
+    /// #2344: fill and adjustment layers have no pixels of their own, so with no selection Copy
+    /// takes them whole and Paste recreates them, in the same or another document, in one step.
+    #[test]
+    fn copy_paste_keeps_fill_and_adjustment_layers() {
+        for (depth, other) in [(8, 16), (16, 32), (32, 8)] {
+            let mut s = Session::new();
+            s.execute("file.new", json!({"width": 60, "height": 40, "depth": depth})).unwrap();
+            s.execute("layer.newFillLayer.gradient", json!({"from": "#000000", "to": "#ffffff", "angle": 0})).unwrap();
+            let LayerContent::Fill(fill) = active_content(&s) else { panic!("a fill layer") };
+            let src = s.active().unwrap().active_layer.unwrap();
+            assert!(s.is_enabled("edit.copy"), "{depth}-bit: a fill layer can be copied");
+            assert_eq!(s.execute("edit.copy", json!({})).unwrap()["bounds"], json!([0, 0, 60, 40]), "{depth}-bit: what it shows");
+            let clip = s.clipboard.clone().unwrap();
+            assert!(clip.surface.rgba(59, 20)[0] > clip.surface.rgba(0, 20)[0], "{depth}-bit: the clip holds the gradient's pixels");
+            let steps = s.active().unwrap().history.past_len();
+            s.execute("edit.pasteSpecial.pasteInPlace", json!({})).unwrap();
+            assert_eq!(s.active().unwrap().history.past_len(), steps + 1, "{depth}-bit: one history step");
+            assert_eq!(active_content(&s), LayerContent::Fill(fill.clone()), "{depth}-bit: the paste is the same fill layer");
+            assert_ne!(s.active().unwrap().active_layer, Some(src), "{depth}-bit: a new layer");
+            s.undo();
+            assert_eq!(s.active().unwrap().active_layer, Some(src), "{depth}-bit: undo removes the paste");
+            s.redo();
+            assert!(matches!(active_content(&s), LayerContent::Fill(_)), "{depth}-bit: redo brings it back");
+
+            s.execute("layer.newAdjustmentLayer.levels", json!({})).unwrap();
+            let LayerContent::Adjustment(levels) = active_content(&s) else { panic!("an adjustment layer") };
+            assert_eq!(s.execute("edit.copy", json!({})).unwrap()["bounds"], json!([0, 0, 60, 40]), "{depth}-bit: it applies to the canvas");
+            s.execute("file.new", json!({"width": 30, "height": 30, "depth": other})).unwrap();
+            s.execute("edit.paste", json!({})).unwrap();
+            assert_eq!(active_content(&s), LayerContent::Adjustment(levels), "{depth}-bit: the same Levels layer in the {other}-bit document");
+            assert_eq!(s.active().unwrap().doc.layers.len(), 2, "{depth}-bit: pasted above the Background");
+        }
+    }
+
+    /// #2344: several adjustment layers, which show nothing alone, still copy and paste together.
+    #[test]
+    fn several_adjustment_layers_copy_together() {
+        let mut s = Session::new();
+        s.execute("file.new", json!({"width": 40, "height": 40})).unwrap();
+        let a = s.execute("layer.newAdjustmentLayer.levels", json!({})).unwrap()["layer"].as_u64().unwrap();
+        let b = s.execute("layer.newAdjustmentLayer.levels", json!({})).unwrap()["layer"].as_u64().unwrap();
+        s.execute("layer.select", json!({"layer": a})).unwrap();
+        s.execute("layer.select", json!({"layer": b, "mode": "toggle"})).unwrap();
+        assert_eq!(s.execute("edit.copy", json!({})).unwrap()["bounds"], json!([0, 0, 40, 40]));
+        s.execute("edit.pasteSpecial.pasteInPlace", json!({})).unwrap();
+        let d = &s.active().unwrap().doc;
+        assert_eq!(d.layers.len(), 5, "both are pasted");
+        assert!(d.layers[3..].iter().all(|l| matches!(l.content, LayerContent::Adjustment(_))));
+    }
+
     #[test]
     fn merge_visible_keeps_hidden_layers() {
         let mut s = session();
@@ -2080,6 +2179,60 @@ mod tests {
         let g = &s.active().unwrap().doc.guides;
         assert!(g.vertical.is_empty() && g.colors.is_empty());
         assert_eq!(s.active().unwrap().history.can_undo(), undo_before);
+    }
+
+    #[test]
+    fn editing_a_guide_changes_what_is_given_in_one_undoable_step() {
+        let mut s = Session::new();
+        s.execute("file.new", json!({"width": 400, "height": 200})).unwrap();
+        s.execute("view.newGuide", json!({"orientation": "vertical", "position": 10})).unwrap();
+        s.execute("view.newGuide", json!({"orientation": "vertical", "position": 20, "color": "magenta"})).unwrap();
+        s.execute("view.newGuide", json!({"orientation": "vertical", "position": 30})).unwrap();
+        let guides = |s: &Session| s.active().unwrap().doc.guides.clone();
+        // Position only: the guide keeps its index and its own colour.
+        s.execute("view.editGuide", json!({"orientation": "vertical", "index": 1, "position": "50%"})).unwrap();
+        let g = guides(&s);
+        assert_eq!(g.vertical, vec![10.0, 200.0, 30.0]);
+        assert_eq!((g.color(true, 20.0), g.color(true, 200.0)), (None, Some([0xff, 0x00, 0xff])));
+        // Colour only: an uncoloured guide gets one; the position stays.
+        s.execute("view.editGuide", json!({"orientation": "vertical", "index": 0, "color": "#123456"})).unwrap();
+        assert_eq!(guides(&s).color(true, 10.0), Some([0x12, 0x34, 0x56]));
+        // Turning it: % is of the new orientation's extent, and the colour goes along.
+        s.execute("view.editGuide", json!({"orientation": "vertical", "index": 1, "newOrientation": "horizontal", "position": "25%"})).unwrap();
+        let g = guides(&s);
+        assert_eq!((g.vertical.clone(), g.horizontal.clone()), (vec![10.0, 30.0], vec![50.0]));
+        assert_eq!((g.color(true, 200.0), g.color(false, 50.0)), (None, Some([0xff, 0x00, 0xff])));
+        // One step each: undo restores the vertical guide with its colour.
+        s.undo();
+        let g = guides(&s);
+        assert_eq!((g.vertical.clone(), g.horizontal.is_empty()), (vec![10.0, 200.0, 30.0], true));
+        assert_eq!(g.color(true, 200.0), Some([0xff, 0x00, 0xff]));
+    }
+
+    #[test]
+    fn bad_guide_edits_are_refused_without_a_history_step() {
+        let mut s = Session::new();
+        s.execute("file.new", json!({"width": 400, "height": 200})).unwrap();
+        s.execute("view.newGuide", json!({"orientation": "vertical", "position": 10, "color": "green"})).unwrap();
+        let before = s.active().unwrap().doc.guides.clone();
+        for bad in [
+            json!({}),
+            json!({"orientation": "vertical"}),
+            json!({"orientation": "vertical", "index": 1}),
+            json!({"orientation": "horizontal", "index": 0}),
+            json!({"orientation": "vertical", "index": -1}),
+            json!({"orientation": "vertical", "index": "0"}),
+            json!({"orientation": "vertical", "index": u64::MAX}),
+            json!({"orientation": "diagonal", "index": 0}),
+            json!({"orientation": "vertical", "index": 0, "newOrientation": 3}),
+            json!({"orientation": "vertical", "index": 0, "position": "far"}),
+            json!({"orientation": "vertical", "index": 0, "position": 1e12}),
+            json!({"orientation": "vertical", "index": 0, "color": "puce"}),
+        ] {
+            assert!(s.execute("view.editGuide", bad.clone()).is_err(), "{bad}");
+        }
+        assert_eq!(s.active().unwrap().doc.guides, before);
+        assert_eq!(s.active().unwrap().history.undo_label(), Some("New Guide"));
     }
 
     #[test]

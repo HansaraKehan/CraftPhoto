@@ -59,7 +59,7 @@ id = "UI-217-8"
 target = "Tool-specific canvas right-click menu; right-click spelling suggestions in text fields"
 status = "partial"
 issue = 217
-note = "paint_mouse.rs brush picker and canvas_tool_menu.rs selection actions; text_field_menu.rs gives every text field its right-click Undo/Cut/Copy/Paste/Delete/Select All menu (#2921); other tools missing; the Type tool's edit menu starts with spelling suggestions and Add to Dictionary over a misspelled word (#4370); Ignore / Ignore All, suggestions in the non-editing type menu and in generic text fields are not there yet"
+note = "paint_mouse.rs brush picker and canvas_tool_menu.rs selection actions; text_field_menu.rs gives every text field its right-click Undo/Cut/Copy/Paste/Delete/Select All menu (#2921); other tools missing; the Type tool's edit menu starts with spelling suggestions and Add to Dictionary over a misspelled word (#4370); over committed type the Type tool opens the type layer menu (#7324); Ignore / Ignore All, suggestions in the non-editing type menu and in generic text fields are not there yet"
 
 [[item]]
 id = "UI-217-9"
@@ -73,7 +73,7 @@ id = "UI-217-10"
 target = "Appearance: animation toggle, canvas pattern toggle per theme, start-screen recents"
 status = "partial"
 issue = 217
-note = "interface.enableAnimations (prefs_ui.rs sync_animations, #3273) zeroes egui animation_time and scroll animation in both styles; the Home screen lists recent files (canvas.rs home_recent, #2691); no canvas pattern toggle yet (#2264) and no option to hide the Home screen recents"
+note = "interface.enableAnimations (prefs_ui.rs sync_animations, #3273) zeroes egui animation_time and scroll animation in both styles; the Home screen lists recent files (canvas.rs home_recent, #2691); the canvas dot pattern toggle is interface.showCanvasDots (#2264, global rather than per theme); interface.showHomeRecentFiles hides the Home screen recents (#4382)"
 
 [[item]]
 id = "UI-217-11"
@@ -164,4 +164,4 @@ id = "UI-217-23"
 target = "Layer clipboard: copy/paste whole layers (masks, styles, type) between documents"
 status = "partial"
 issue = 217
-note = "layer.copyToDocument copies layers into another open document keeping names, content, masks, styles and blending, converting to the destination's profile and depth, as one history step (layer_copy_cmds.rs, #589). It is the command a drag between documents dispatches; there is still no copy/paste layer clipboard"
+note = "Edit › Copy with no pixel selection takes layers whole and Paste recreates them in this or another open document, converted to its profile and depth, as one history step (edit_cmds.rs takes_whole, paste_layers): smart objects (#2428), type, shape and group layers (#2670), fill and adjustment layers (#2344), and several selected layers with their masks and styles (#2478). layer.copyToDocument is the drag between documents (layer_copy_cmds.rs, #589). Missing: a single pixel layer copies its pixels only, leaving its mask and styles behind"

@@ -169,7 +169,7 @@ fn corpus_photoshop_txt2_survives_an_unedited_save() {
     println!("Txt2 kept byte-for-byte in {checked} Photoshop type files");
 }
 
-/// A text layer created in Photocraft (no PSD data) exports as an editable type layer and
+/// A text layer created in PhotoCraft (no PSD data) exports as an editable type layer and
 /// imports back with the same model.
 #[test]
 fn created_text_layer_roundtrips_through_psd() {

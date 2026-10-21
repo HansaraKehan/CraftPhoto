@@ -1,8 +1,8 @@
 use photocraft_cms::{Builtin, Intent, Profile, Transform};
 use photocraft_codecs::{ChannelLayout, SampleType as CodecSample, decode};
-use photocraft_color::{ColorMode, SampleType};
-use photocraft_doc::{Document, Layer, LayerContent};
-use photocraft_geom::Size;
+use photocraft_color::{ColorMode, PixelFormat, SampleType};
+use photocraft_doc::{Document, Layer, LayerContent, LayerMask};
+use photocraft_geom::{Rect, Size};
 use photocraft_io::{ExportOptions, document_to_image, export};
 use photocraft_raster::Surface;
 
@@ -12,6 +12,32 @@ fn document(depth: SampleType, alpha: f32) -> Document {
     let surface = Surface::with_default(doc.pixel_format(), &[0.3, 0.6, 0.1, 0.2, alpha]);
     doc.layers.push(Layer::new("Ink", LayerContent::Raster(surface)));
     doc.layers.push(Layer::new("Empty", LayerContent::Raster(Surface::new(doc.pixel_format()))));
+    doc
+}
+
+/// Three bands exercise opaque, translucent and empty pixels in the same composite.
+fn mixed_region_document(depth: SampleType, opaque: bool) -> Document {
+    let mut doc = Document::new("CMYK regions", Size::new(48, 16), ColorMode::Cmyk, depth);
+    let mut bottom = Surface::new(doc.pixel_format());
+    bottom.fill_rect(Rect::new(0, 0, 16, 16), &[0.2, 0.6, 0.1, 0.15, 1.0]);
+    bottom.fill_rect(Rect::new(16, 0, 32, 16), &[0.1, 0.2, 0.7, 0.25, 0.5]);
+    if opaque {
+        bottom.fill_rect(doc.bounds(), &[0.2, 0.6, 0.1, 0.15, 1.0]);
+    }
+    doc.layers.push(Layer::new("Ink", LayerContent::Raster(bottom)));
+    let mut surface = Surface::new(doc.pixel_format());
+    surface.fill_rect(Rect::new(0, 0, 16, 16), &[0.7, 0.1, 0.3, 0.2, 1.0]);
+    let mut top = Layer::new("Masked ink", LayerContent::Raster(surface));
+    top.opacity = 0.5;
+    top.mask = Some(LayerMask {
+        surface: Surface::with_default(PixelFormat::new(ColorMode::Grayscale, depth, false), &[0.5]),
+        enabled: true,
+        linked: true,
+        density: 1.0,
+        feather: 0.0,
+    });
+    doc.layers.push(top);
+    doc.resolution_dpi = 300.0;
     doc
 }
 
@@ -68,6 +94,69 @@ fn tiff_keeps_true_zero_alpha_when_composited() {
         assert_eq!(tag(&result.bytes, 277), Some(5));
         assert_eq!(tag(&result.bytes, 338), Some(2));
         assert!(image.to_normalized().as_chunks::<5>().0.iter().all(|px| px[4].abs() < f32::EPSILON));
+    }
+}
+
+#[test]
+fn flat_and_layered_tiff_agree_for_mixed_cmyk_regions() {
+    let custom = photocraft_cms::synth::cmyk_profile(&photocraft_cms::synth::CmykParams {
+        description: "Mixed regions uncoated".into(),
+        tvi: [0.26, 0.26, 0.26, 0.3],
+        grid_a2b: 5,
+        grid_b2a: 9,
+        ..Default::default()
+    });
+    let coated = Builtin::CoatedCmyk.profile().to_bytes();
+    for (name, profile) in [("untagged", None), ("coated", Some(coated.clone())), ("uncoated", Some(custom.to_bytes()))] {
+        for (depth, sample) in [(SampleType::U8, CodecSample::U8), (SampleType::U16, CodecSample::U16), (SampleType::F32, CodecSample::F32)] {
+            for opaque in [false, true] {
+                let context = format!("{name}, {depth:?}, opaque={opaque}");
+                let mut doc = mixed_region_document(depth, opaque);
+                doc.icc_profile = profile.clone();
+                let flat = export(&doc, "tiff", &ExportOptions::default()).unwrap();
+                let layered = export(&doc, "tiff", &ExportOptions { tiff_layers: true, ..Default::default() }).unwrap();
+                let image = decode(&flat.bytes).unwrap();
+                let reference = decode(&layered.bytes).unwrap();
+                assert!(!flat.warnings.iter().any(|warning| warning.contains("sRGB")), "{context}: {:?}", flat.warnings);
+                // Flat composites embed the fallback profile; the layered path keeps the source tag.
+                assert_eq!(image.icc.as_deref(), Some(profile.as_ref().unwrap_or(&coated).as_slice()), "{context}");
+                assert_eq!(reference.icc.as_deref(), profile.as_deref().map(Vec::as_slice), "{context}");
+                assert!(image.meta.photoshop_layers.is_none(), "{context}");
+                assert!(reference.meta.photoshop_layers.is_some(), "{context}");
+                for (decoded, bytes) in [(&image, &flat.bytes), (&reference, &layered.bytes)] {
+                    assert_eq!(decoded.dimensions(), (48, 16), "{context}");
+                    assert_eq!(decoded.layout(), if opaque { ChannelLayout::Cmyk } else { ChannelLayout::CmykA }, "{context}");
+                    assert_eq!(decoded.sample_type(), sample, "{context}");
+                    assert_eq!(decoded.meta.dpi, Some((300.0, 300.0)), "{context}");
+                    assert_eq!(tag(bytes, 262), Some(5), "{context}");
+                    assert_eq!(tag(bytes, 277), Some(if opaque { 4 } else { 5 }), "{context}");
+                    assert_eq!(tag(bytes, 338), if opaque { None } else { Some(2) }, "{context}");
+                }
+                // The PSD-backed layered path inverts CMYK samples twice, so allow one stored level.
+                let tolerance = match depth {
+                    SampleType::U8 => 1.0 / 255.0,
+                    SampleType::U16 => 1.0 / 65535.0,
+                    SampleType::F32 => 1e-6,
+                };
+                let actual = image.to_normalized();
+                let expected = reference.to_normalized();
+                assert_eq!(actual.len(), expected.len(), "{context}");
+                let difference = actual.iter().zip(&expected).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                assert!(difference <= tolerance + 1e-6, "{context}: maximum sample difference {difference}");
+                if !opaque {
+                    for (i, px) in actual.as_chunks::<5>().0.iter().enumerate() {
+                        match i % 48 {
+                            0..16 => assert_eq!(px[4], 1.0, "{context}: opaque region"),
+                            16..32 => assert!((px[4] - 0.5).abs() <= tolerance, "{context}: translucent region: {px:?}"),
+                            _ => assert_eq!(px[4], 0.0, "{context}: empty region"),
+                        }
+                    }
+                }
+                let back = photocraft_io::import("regions.tiff", &flat.bytes).unwrap().document;
+                assert_eq!((back.mode, back.depth), (ColorMode::Cmyk, depth), "{context}");
+                assert_eq!(back.resolution_dpi, 300.0, "{context}");
+            }
+        }
     }
 }
 

@@ -10,6 +10,7 @@ use photocraft_engine::prefs::FontPreview;
 struct State {
     current: String,
     families: Vec<String>,
+    button: egui::Id,
     popup: egui::Id,
     preview: FontPreview,
 }
@@ -22,10 +23,11 @@ fn harness_with(preview: FontPreview) -> Harness<'static, State> {
     // Enough families that the unfiltered menu hits its maximum height and scrolls.
     let mut families: Vec<String> = (0..60).map(|i| format!("Family {i:02}")).collect();
     families.push("Zeta Sans".into());
-    let state = State { current: "Family 00".into(), families, popup: egui::Id::NULL, preview };
+    let state = State { current: "Family 00".into(), families, button: egui::Id::NULL, popup: egui::Id::NULL, preview };
     let mut h = Harness::builder().with_size(vec2(600.0, 900.0)).build_ui_state(
         |ui, s: &mut State| {
-            s.popup = ui.make_persistent_id(egui::IdSalt::new("type-font")).with("popup");
+            s.button = ui.make_persistent_id(egui::IdSalt::new("type-font"));
+            s.popup = s.button.with("popup");
             let fams = s.families.clone();
             font_picker_in(ui, &mut s.current, 170.0, &fams, s.preview);
         },
@@ -43,6 +45,16 @@ fn popup_rect(h: &Harness<'static, State>) -> Option<Rect> {
 
 fn open(h: &mut Harness<'static, State>) {
     h.query_all_by_role(Role::ComboBox).next().unwrap().click();
+    h.run();
+}
+
+/// A native click can leave the opening button held across several rendered frames.
+fn hold_open<S>(h: &mut Harness<'_, S>, button: egui::Pos2) {
+    h.hover_at(button);
+    h.run();
+    h.event(egui::Event::PointerButton { pos: button, button: egui::PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE });
+    h.run_steps(4);
+    h.event(egui::Event::PointerButton { pos: button, button: egui::PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE });
     h.run();
 }
 
@@ -71,6 +83,35 @@ fn hovering_a_font_row_sets_preview_and_leaving_clears_it() {
     assert!(h.ctx.data(|d| d.get_temp::<String>(hover_id)).is_none());
 }
 
+/// #7406: hovering a font highlights its row without moving anything: the other rows keep
+/// their place, the menu its width, and every row (the selected one too) takes one height.
+#[test]
+fn hovering_a_font_row_moves_no_other_row() {
+    let mut h = harness();
+    // The app's theme: its hovered and selected buttons draw a stroke (egui's default style
+    // would hide the jump).
+    crate::PhotocraftApp::setup_context(&h.ctx, crate::theme::ThemeKind::ALL[0]);
+    h.run();
+    open(&mut h);
+    let rows = |h: &Harness<'static, State>| -> Vec<Rect> { (0..8).map(|i| h.get_by_label(&format!("Family {i:02}")).rect()).collect() };
+    let before = rows(&h);
+    let width = popup_rect(&h).expect("font menu open").width();
+    let tops: Vec<f32> = before.windows(2).map(|w| w[1].top() - w[0].top()).collect();
+    assert!(tops.windows(2).all(|t| (t[0] - t[1]).abs() < 0.01), "rows are evenly spaced, the selected Family 00 included: {tops:?}");
+    for hovered in [2, 5] {
+        h.hover_at(before[hovered].center());
+        h.run_steps(2);
+        let after = rows(&h);
+        for (i, (b, a)) in before.iter().zip(&after).enumerate() {
+            if i != hovered {
+                assert_eq!(b, a, "hovering Family {hovered:02} moved Family {i:02}");
+            }
+        }
+        assert_eq!(after[hovered].center(), before[hovered].center(), "the hovered row stays centred where it was");
+        assert_eq!(popup_rect(&h).map(|r| r.width()), Some(width), "the menu keeps its width");
+    }
+}
+
 #[test]
 fn clearing_the_query_restores_the_menu_height() {
     let mut h = harness();
@@ -93,15 +134,18 @@ fn clearing_the_query_restores_the_menu_height() {
 #[test]
 fn reopening_focuses_the_search_field_and_clicking_it_keeps_the_menu_open() {
     let mut h = harness();
-    open(&mut h);
+    let button = h.query_all_by_role(Role::ComboBox).next().unwrap().rect().center();
+    hold_open(&mut h, button);
     assert!(h.get_by_role(Role::TextInput).is_focused(), "search is focused on first open");
-    h.get_by_role(Role::TextInput).type_text("zeta");
+    h.event(egui::Event::Text("zeta".into()));
     h.run();
-    // Close without choosing, then reopen: the query stays and the field is focused again.
-    h.key_press(Key::Escape);
-    h.run();
+    assert_eq!(h.get_by_role(Role::TextInput).value().as_deref(), Some("zeta"), "typing goes straight to the search field");
+    // Close and reopen on consecutive passes: the query stays and the field is focused again.
+    h.input_mut().events.push(egui::Event::Key { key: Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE });
+    h.step();
     assert!(popup_rect(&h).is_none(), "Escape closes the menu");
-    open(&mut h);
+    h.query_all_by_role(Role::ComboBox).next().unwrap().click_accesskit();
+    h.run();
     let search = h.get_by_role(Role::TextInput);
     assert_eq!(search.value().as_deref(), Some("zeta"));
     assert!(search.is_focused(), "search is focused on reopen with a query");
@@ -121,6 +165,64 @@ fn reopening_focuses_the_search_field_and_clicking_it_keeps_the_menu_open() {
 }
 
 #[test]
+fn opening_click_release_returns_focus_to_search_before_typing() {
+    let mut h = harness();
+    let button = h.query_all_by_role(Role::ComboBox).next().unwrap().rect().center();
+    h.hover_at(button);
+    h.run();
+    h.event(egui::Event::PointerButton { pos: button, button: egui::PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE });
+    h.run_steps(4);
+    assert!(h.get_by_role(Role::TextInput).is_focused());
+    // A native opening click can hand focus back to its button when it ends, after the
+    // search has already been focused for several passes. Model that platform handoff.
+    let id = h.state().button;
+    h.ctx.memory_mut(|m| m.request_focus(id));
+    h.event(egui::Event::PointerButton { pos: button, button: egui::PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE });
+    h.run();
+    assert!(h.get_by_role(Role::TextInput).is_focused(), "the opening release leaves the search focused");
+    h.event(egui::Event::Text("zeta".into()));
+    h.run();
+    assert_eq!(h.get_by_role(Role::TextInput).value().as_deref(), Some("zeta"));
+    assert!(h.query_by_label("Family 01").is_none());
+}
+
+#[test]
+fn first_options_bar_open_searches_without_changing_the_tool_or_edited_text() {
+    use crate::{PhotocraftApp, Services};
+    use photocraft_doc::LayerContent;
+    use serde_json::json;
+
+    for editing in [false, true] {
+        let mut h = Harness::builder().with_size(vec2(1600.0, 1000.0)).with_max_steps(64).build_eframe(move |cc| {
+            PhotocraftApp::setup_context(&cc.egui_ctx, Default::default());
+            let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), Services::default());
+            app.run("file.new", json!({"width": 200, "height": 100})).unwrap();
+            app.run("type.create", json!({"text": "Sample", "font": "Inter", "size": 18})).unwrap();
+            app.ui.tool = crate::state::Tool::Type;
+            if editing {
+                super::edit_active(&mut app).unwrap();
+            }
+            app.sync_views();
+            app
+        });
+        h.run_steps(8);
+        let button = h.query_all_by_role(Role::ComboBox).find(|n| n.value().as_deref() == Some("Inter")).unwrap().rect().center();
+        hold_open(&mut h, button);
+        // Native typing carries key events as well as text; an unfocused search would let
+        // the first key switch tools, or replace the selected inline text instead.
+        h.event(egui::Event::Key { key: Key::J, physical_key: Some(Key::J), pressed: true, repeat: false, modifiers: Modifiers::NONE });
+        h.event(egui::Event::Text("JetBrains".into()));
+        h.run();
+        let search = h.query_all_by_role(Role::TextInput).find(|n| n.is_focused()).expect("font search focused on first open");
+        assert_eq!(search.value().as_deref(), Some("JetBrains"));
+        assert_eq!(h.state().ui.tool, crate::state::Tool::Type);
+        let st = h.state().session.active().unwrap();
+        let LayerContent::Text(text) = &st.doc.layer(st.active_layer.unwrap()).unwrap().content else { panic!("type layer") };
+        assert_eq!(text.text, "Sample");
+    }
+}
+
+#[test]
 fn arrows_apply_fonts_without_closing_and_enter_accepts() {
     let mut h = harness();
     open(&mut h);
@@ -135,6 +237,88 @@ fn arrows_apply_fonts_without_closing_and_enter_accepts() {
     h.key_press(Key::Enter);
     h.run();
     assert!(popup_rect(&h).is_none());
+}
+
+/// #7407: as in Photoshop, the field keeps the focus once a font is picked (click or Enter),
+/// and ↑ / ↓ on it step through the families with the menu closed. Escape ends it.
+#[test]
+fn arrows_on_the_field_step_through_the_families_after_a_pick() {
+    let mut h = harness();
+    open(&mut h);
+    h.get_by_label("Family 03").click();
+    h.run();
+    assert_eq!(h.state().current, "Family 03");
+    assert!(popup_rect(&h).is_none(), "picking closes the menu");
+    let button = h.state().button;
+    assert!(h.ctx.memory(|m| m.has_focus(button)), "the field keeps the focus");
+    let press = |h: &mut Harness<'static, State>, key: Key| {
+        h.key_press(key);
+        h.run();
+        assert!(popup_rect(h).is_none(), "{key:?} leaves the menu closed");
+        assert!(h.ctx.memory(|m| m.has_focus(button)), "{key:?} keeps the focus on the field");
+        h.state().current.clone()
+    };
+    assert_eq!(press(&mut h, Key::ArrowDown), "Family 04");
+    assert_eq!(press(&mut h, Key::ArrowDown), "Family 05");
+    assert_eq!(press(&mut h, Key::ArrowUp), "Family 04");
+    // Enter in the open menu is a pick too.
+    open(&mut h);
+    h.key_press(Key::ArrowDown);
+    h.key_press(Key::Enter);
+    h.run();
+    assert_eq!(h.state().current, "Family 05");
+    assert_eq!(press(&mut h, Key::ArrowDown), "Family 06");
+    // Escape takes the focus away; the arrows then leave the font alone.
+    h.key_press(Key::Escape);
+    h.run();
+    assert!(!h.ctx.memory(|m| m.has_focus(button)));
+    h.key_press(Key::ArrowDown);
+    h.run();
+    assert_eq!(h.state().current, "Family 06");
+}
+
+/// The first arrow right after a pick (in the very next frame) steps the font and keeps the
+/// focus on the field, also between focusable widgets: the field's lock filter only holds from
+/// the frame after it got the focus, and egui would read that arrow as a move to "Below".
+#[test]
+fn the_first_arrow_after_a_pick_keeps_the_focus_between_neighbours() {
+    for (enter, picked, stepped) in [(false, "Family 05", "Family 06"), (true, "Family 04", "Family 05")] {
+        let families: Vec<String> = (0..20).map(|i| format!("Family {i:02}")).collect();
+        let state = State { current: "Family 03".into(), families, button: egui::Id::NULL, popup: egui::Id::NULL, preview: FontPreview::Off };
+        let mut h = Harness::builder().with_size(vec2(600.0, 900.0)).build_ui_state(
+            |ui, s: &mut State| {
+                let _ = ui.button("Above");
+                s.button = ui.make_persistent_id(egui::IdSalt::new("type-font"));
+                s.popup = s.button.with("popup");
+                let fams = s.families.clone();
+                font_picker_in(ui, &mut s.current, 170.0, &fams, s.preview);
+                let _ = ui.button("Below");
+            },
+            state,
+        );
+        h.run();
+        open(&mut h);
+        if enter {
+            h.key_press(Key::ArrowDown);
+            h.key_press(Key::Enter);
+        } else {
+            h.get_by_label("Family 05").click();
+        }
+        // Frame by frame up to the pick, then the arrow in the next frame.
+        for _ in 0..8 {
+            if h.state().current == picked && popup_rect(&h).is_none() {
+                break;
+            }
+            h.step();
+        }
+        assert_eq!(h.state().current, picked, "enter: {enter}");
+        h.key_press(Key::ArrowDown);
+        h.step();
+        h.run();
+        assert_eq!(h.state().current, stepped, "enter: {enter}");
+        let button = h.state().button;
+        assert!(h.ctx.memory(|m| m.has_focus(button)), "enter: {enter}: the arrow moved the focus off the field");
+    }
 }
 
 #[test]
@@ -411,6 +595,7 @@ fn localized_font_names_label_the_menu_but_pick_the_family() {
     let state = State {
         current: "Arial".into(),
         families: vec!["Arial".into(), "MS Gothic".into(), "Zeta Sans".into()],
+        button: egui::Id::NULL,
         popup: egui::Id::NULL,
         preview: FontPreview::Medium,
     };
@@ -519,8 +704,8 @@ fn options_bar_hover_previews_with_the_character_picker_also_shown() {
     };
     let pickers: Vec<_> = h.query_all_by_role(Role::ComboBox).filter(|n| n.value().as_deref() == Some("Inter")).collect();
     assert_eq!(pickers.len(), 2, "options bar and Character section both show the font picker");
-    pickers[0].click();
-    h.run();
+    let button = pickers[0].rect().center();
+    hold_open(&mut h, button);
     h.query_all_by_role(Role::TextInput).find(|n| n.is_focused()).expect("search field focused").type_text("JetBrains Mono");
     h.run();
     h.get_by_label("JetBrains Mono").hover();

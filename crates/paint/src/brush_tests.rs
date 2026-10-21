@@ -189,26 +189,59 @@ fn pencil_dabs_sit_on_the_pixel_grid() {
 
 #[test]
 fn pencil_1px_line_is_a_clean_8_connected_staircase() {
-    // #2139: a 1 px Pencil line is one pixel per column (or row, when steep) on the ideal line
-    // between the end pixels: no doubled pixels at the steps.
+    // #2139: a 1 px Pencil line is one pixel per column (or row, when steep) on the line: no
+    // doubled pixels at the steps.
     let b = BrushSettings { aliased: true, hardness: 1.0, size: 1.0, ..brush() };
     let cases = [((2.5, 2.5), (22.5, 9.5)), ((3.5, 30.5), (10.5, 5.5)), ((1.2, 1.7), (25.8, 4.1)), ((5.5, 5.5), (17.5, 17.5)), ((20.3, 3.6), (4.9, 12.2))];
     for ((ax, ay), (bx, by)) in cases {
         let s = paint(&b, &[StrokePoint::new(ax, ay, 1.0), StrokePoint::new(bx, by, 1.0)], 40, 40);
         let painted: Vec<(i32, i32)> = (0..40).flat_map(|y| (0..40).map(move |x| (x, y))).filter(|&(x, y)| s.rgba(x, y)[3] > 0.0).collect();
         let (a, e) = ((ax.floor(), ay.floor()), (bx.floor(), by.floor()));
-        let steep = (e.1 - a.1).abs() > (e.0 - a.0).abs();
+        let steep = (by - ay).abs() > (bx - ax).abs();
         let major = |p: (f64, f64)| if steep { (p.1, p.0) } else { (p.0, p.1) };
-        let ((m0, n0), (m1, n1)) = (major(a), major(e));
+        let ((m0, _), (m1, _)) = (major(a), major(e));
+        let ((am, an), (bm, bn)) = (major((ax, ay)), major((bx, by)));
         assert_eq!(painted.len() as f64, (m1 - m0).abs() + 1.0, "{a:?}->{e:?}: one pixel per step, got {painted:?}");
         for &(x, y) in &painted {
-            let (m, n) = major((f64::from(x), f64::from(y)));
-            let ideal = n0 + (n1 - n0) * (m - m0) / (m1 - m0);
-            assert!((n - ideal).abs() <= 0.5 + 1e-9, "{a:?}->{e:?}: ({x},{y}) is off the line");
+            if (f64::from(x), f64::from(y)) == a {
+                continue; // The pixel the stroke starts in.
+            }
+            // The pixel's centre is within half a pixel of the line where it crosses its column.
+            let (m, n) = major((f64::from(x) + 0.5, f64::from(y) + 0.5));
+            let on_line = an + (bn - an) * (m - am) / (bm - am);
+            assert!((n - on_line).abs() <= 0.5 + 1e-9, "{a:?}->{e:?}: ({x},{y}) is off the line");
         }
         let columns: std::collections::BTreeSet<i64> = painted.iter().map(|&(x, y)| major((f64::from(x), f64::from(y))).0 as i64).collect();
         assert_eq!(columns.len(), painted.len(), "{a:?}->{e:?}: a column holds two pixels");
     }
+}
+
+#[test]
+fn pencil_1px_line_is_the_same_whichever_way_and_however_smoothed() {
+    // #6336: a ⇧-click line between pixel centres painted different pixels depending on which end
+    // it started from, and Smoothing (which splits it into pieces along the line) bent it.
+    let pixels = |a: (f64, f64), e: (f64, f64), amount: f32| {
+        let mut b = BrushSettings { aliased: true, hardness: 1.0, size: 1.0, ..brush() };
+        b.smoothing.amount = amount;
+        let s = paint(&b, &[StrokePoint::new(a.0, a.1, 1.0), StrokePoint::new(e.0, e.1, 1.0)], 24, 24);
+        (0..24).flat_map(|y| (0..24).map(move |x| (x, y))).filter(|&(x, y)| s.rgba(x, y)[3] > 0.0).collect::<Vec<_>>()
+    };
+    for (a, e) in [((3.5, 3.5), (4.5, 5.5)), ((3.5, 3.5), (8.5, 5.5)), ((2.5, 20.5), (9.5, 17.5)), ((1.5, 1.5), (20.5, 9.5))] {
+        let line = pixels(a, e, 0.0);
+        assert_eq!(line, pixels(e, a, 0.0), "{a:?}->{e:?} differs from {e:?}->{a:?}");
+        for amount in [0.1, 0.5, 0.9] {
+            assert_eq!(pixels(a, e, amount), line, "{a:?}->{e:?} at Smoothing {amount}");
+            assert_eq!(pixels(e, a, amount), line, "{e:?}->{a:?} at Smoothing {amount}");
+        }
+    }
+    // One right and two down: three pixels, one per row.
+    assert_eq!(pixels((3.5, 3.5), (4.5, 5.5), 0.1), vec![(3, 3), (4, 4), (4, 5)]);
+    // A straight line fed as many pointer samples along it paints the line's pixels.
+    let b = BrushSettings { aliased: true, hardness: 1.0, size: 1.0, ..brush() };
+    let samples: Vec<StrokePoint> = (0..=37).map(|i| StrokePoint::new(1.5 + 19.0 * f64::from(i) / 37.0, 1.5 + 8.0 * f64::from(i) / 37.0, 1.0)).collect();
+    let s = paint(&b, &samples, 24, 24);
+    let sampled: Vec<(i32, i32)> = (0..24).flat_map(|y| (0..24).map(move |x| (x, y))).filter(|&(x, y)| s.rgba(x, y)[3] > 0.0).collect();
+    assert_eq!(sampled, pixels((1.5, 1.5), (20.5, 9.5), 0.0));
 }
 
 // ---------- spacing ----------
@@ -261,6 +294,28 @@ fn pressure_controls_size_with_minimum() {
     assert!((d[0].radius - 5.0).abs() < 1e-3, "min diameter 25 % of 40 → r 5, got {}", d[0].radius);
     assert!((d.last().unwrap().radius - 20.0).abs() < 0.5);
     assert!(d.windows(2).all(|w| w[1].radius >= w[0].radius - 1e-4));
+}
+
+#[test]
+fn each_dynamic_responds_through_its_own_curve() {
+    // A hard size curve (half pressure gives a fifth of the size range) and a linear opacity.
+    let curve = crate::ResponseCurve::new(&[[0.0, 0.0], [0.5, 0.2], [1.0, 1.0]]);
+    let b = BrushSettings {
+        size: 40.0,
+        shape_dynamics: ShapeDynamics { enabled: true, size: Dynamic { curve, ..Dynamic::controlled(Control::PenPressure) }, ..Default::default() },
+        transfer: Transfer { enabled: true, opacity: Dynamic::controlled(Control::PenPressure), ..Default::default() },
+        ..brush()
+    };
+    let d = dabs_of(&b, &[StrokePoint::new(0.0, 0.0, 0.5), StrokePoint::new(1.0, 0.0, 0.5)]);
+    assert!((d[0].radius - 4.0).abs() < 1e-3, "20 % of a 40 px diameter → r 4, got {}", d[0].radius);
+    assert!((d[0].opacity - 0.5).abs() < 1e-3, "opacity keeps its linear response: {}", d[0].opacity);
+    // The curve is part of the brush's JSON.
+    let json = serde_json::to_value(&b).unwrap();
+    let stored: Vec<[f32; 2]> = serde_json::from_value(json["shapeDynamics"]["size"]["curve"].clone()).unwrap();
+    assert_eq!(stored, vec![[0.0, 0.0], [0.5, 0.2], [1.0, 1.0]]);
+    assert_eq!(json["transfer"]["opacity"]["curve"], serde_json::json!([[0.0, 0.0], [1.0, 1.0]]));
+    let back: BrushSettings = serde_json::from_value(json).unwrap();
+    assert_eq!(back.shape_dynamics.size.curve, curve);
 }
 
 #[test]
@@ -850,6 +905,38 @@ fn smoothing_without_catch_up_stops_while_the_pointer_pauses() {
         s.push(StrokePoint { time: t, ..StrokePoint::new(100.0, 0.0, 1.0) }, &mut out);
     }
     assert_eq!(out.len(), n, "held still: the brush doesn't move");
+}
+
+#[test]
+fn a_smoothed_brush_keeps_the_pressure_of_where_it_is_when_the_pen_lifts() {
+    // #5713: a fast stroke at full pressure, lifted in the last sample. The brush trails far
+    // behind the pointer; it used to take the lift's pressure there, and the end catch-up drew
+    // a hairline from the trailing brush to the pointer.
+    let pts: Vec<StrokePoint> =
+        (0..=20).map(|i| StrokePoint { time: f64::from(i) * 4.0, ..StrokePoint::new(f64::from(i) * 10.0, 0.0, if i < 20 { 1.0 } else { 0.05 }) }).collect();
+    let out = smooth_points(&Smoothing { amount: 0.8, ..Default::default() }, 1.0, &pts);
+    let (last, rest) = out.split_last().unwrap();
+    assert_eq!((last.x, last.pressure), (200.0, 0.05), "the catch-up still ends at the pen's last sample");
+    let lifted = rest.last().unwrap();
+    assert!(lifted.x < 190.0, "the brush lags the pointer: {}", lifted.x);
+    for p in rest {
+        assert!(p.pressure > 0.5, "the trailing brush at x {} has pressure {}", p.x, p.pressure);
+    }
+}
+
+#[test]
+fn a_pulled_string_brush_takes_the_pose_along_the_string() {
+    let ps = Smoothing { amount: 0.2, pulled_string: true, catch_up_on_end: false, ..Default::default() };
+    let a = StrokePoint { rotation: 350.0, ..StrokePoint::new(0.0, 0.0, 1.0) };
+    let b = StrokePoint { rotation: 10.0, tilt_x: 40.0, ..StrokePoint::new(100.0, 0.0, 0.0) };
+    let out = smooth_points(&ps, 1.0, &[a, b]);
+    // The 20 px string leaves the brush 80 % of the way to the pointer.
+    let p = out.last().unwrap();
+    assert!((p.x - 80.0).abs() < 1e-4, "{}", p.x);
+    assert!((p.pressure - 0.2).abs() < 1e-4, "{}", p.pressure);
+    assert!((p.tilt_x - 32.0).abs() < 1e-3, "{}", p.tilt_x);
+    // Rotation the short way round: 350° + 80 % of 20°.
+    assert!((p.rotation - 6.0).abs() < 1e-3, "{}", p.rotation);
 }
 
 #[test]
@@ -1470,4 +1557,52 @@ fn an_aliased_stroke_at_partial_opacity_is_one_flat_colour() {
     for x in 3..60 {
         assert_eq!(s.rgba(x, 5), first, "pixel {x} of the Pencil line");
     }
+}
+
+/// Photoshop (measured): a 100 px brush with a 20 px Dual Brush tip resized to 50 / 2 / 1 px has a
+/// 10 / 0.4 / 0.2 px dual tip, unrounded and with no floor, and back at 100 px it is 20 px again; past
+/// 5000 px the dual tip is capped there and the proportion is lost (#4809).
+#[test]
+fn resizing_scales_the_dual_tip_like_photoshop() {
+    let mut b = BrushSettings { size: 100.0, ..brush() };
+    b.dual_brush.enabled = true;
+    b.dual_brush.size = 20.0;
+    for (main, dual) in [(50.0, 10.0), (2.0, 0.4), (1.0, 0.2), (100.0, 20.0), (240.0, 48.0), (100.0, 20.0)] {
+        b.resize_with_dual_brush(main);
+        assert_eq!(b.size, main);
+        assert!((b.dual_brush.size - dual).abs() < 1e-4, "main {main}: dual {} != {dual}", b.dual_brush.size);
+    }
+    // The cap: 300 px at 100 px would be 15000 px at 5000 px; Photoshop stores 5000 and scales from it.
+    b.dual_brush.size = 300.0;
+    b.resize_with_dual_brush(MAX_BRUSH_SIZE);
+    assert_eq!(b.dual_brush.size, MAX_BRUSH_SIZE);
+    b.resize_with_dual_brush(100.0);
+    assert_eq!(b.dual_brush.size, 100.0);
+    // A sub-pixel dual tip renders at the renderer's smallest diameter.
+    b.dual_brush.size = 20.0;
+    b.resize_with_dual_brush(1.0);
+    assert_eq!(b.bounded_for_render().dual_brush.size, 0.5);
+}
+
+#[test]
+fn resizing_with_bad_sizes_leaves_the_dual_tip_alone() {
+    let mut b = BrushSettings { size: 100.0, ..brush() };
+    b.dual_brush.enabled = true;
+    b.dual_brush.size = 20.0;
+    for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0, -5.0] {
+        b.size = 100.0;
+        b.resize_with_dual_brush(bad);
+        assert_eq!(b.dual_brush.size, 20.0, "{bad}");
+    }
+    for bad_dual in [f32::NAN, 0.0, -3.0] {
+        b.size = 100.0;
+        b.dual_brush.size = bad_dual;
+        b.resize_with_dual_brush(50.0);
+        assert_eq!(b.dual_brush.size.to_bits(), bad_dual.to_bits(), "a bad dual size {bad_dual} is left as it was");
+    }
+    // A disabled dual tip keeps its size.
+    b.dual_brush = DualBrush { enabled: false, size: 20.0, ..Default::default() };
+    b.size = 100.0;
+    b.resize_with_dual_brush(50.0);
+    assert_eq!(b.dual_brush.size, 20.0);
 }

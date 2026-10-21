@@ -24,7 +24,7 @@ fn sections_with_boxes_have_flags() {
 
 /// What each section's controls edit, set to non-default values.
 fn edit_section(i: usize, b: &mut BrushSettings) {
-    let dynamic = |jitter: f32, control: Control, minimum: f32| paint::Dynamic { jitter, control, fade_steps: 40, minimum };
+    let dynamic = |jitter: f32, control: Control, minimum: f32| paint::Dynamic { jitter, control, fade_steps: 40, minimum, ..Default::default() };
     match i {
         0 => {
             b.size = 87.0;
@@ -97,7 +97,15 @@ fn edit_section(i: usize, b: &mut BrushSettings) {
             b.transfer.flow = dynamic(0.25, Control::Fade, 0.3);
             b.transfer.wetness = dynamic(0.35, Control::PenPressure, 0.1);
             b.transfer.mix = dynamic(0.45, Control::Fade, 0.2);
-            b.mixer = paint::MixerSettings { wet: 0.9, load: 0.15, mix: 0.7, flow: 0.8, sample_all_layers: true };
+            b.mixer = paint::MixerSettings {
+                wet: 0.9,
+                load: 0.15,
+                mix: 0.7,
+                flow: 0.8,
+                sample_all_layers: true,
+                load_after_stroke: false,
+                clean_after_stroke: false,
+            };
         }
         7 => {
             let p = &mut b.pose;
@@ -400,6 +408,21 @@ fn brush_mode_dropdown_shows_outside_the_pro_themes() {
 }
 
 #[test]
+fn brush_and_eraser_size_fields_keep_sizes_above_2500_px() {
+    // #5708: outside the Pro themes the Size field capped at 2500 px and clamped a bigger brush
+    // (set from the picker or `]`) on the next frame; Photoshop and the engine allow 5000 px.
+    for tool in [crate::state::Tool::Brush, crate::state::Tool::Eraser] {
+        let mut h = options_bar_harness(tool);
+        let n = h.state().session.journal.len();
+        h.state_mut().session.tools.brush.size = 4000.0;
+        h.run_steps(4);
+        assert_eq!(h.state().session.tools.brush.size, 4000.0, "{tool:?}");
+        let j = &h.state().session.journal;
+        assert_eq!(j.len(), n, "showing the bar issues nothing: {:?}", &j[n..]);
+    }
+}
+
+#[test]
 fn airbrush_smoothing_options_and_symmetry_buttons_work() {
     // #1177: in the default (Photoshop) theme these options-bar buttons did nothing.
     use egui_kittest::kittest::Queryable;
@@ -471,6 +494,56 @@ fn mixer_brush_options_update_the_persisted_mixer_settings() {
     let (id, params) = h.state().session.journal.last().unwrap();
     assert_eq!(id, "tools.setBrush");
     assert_eq!(params["brush"]["mixer"]["sampleAllLayers"], true);
+}
+
+#[test]
+fn mixer_brush_clean_brush_and_the_automatic_load_keep_the_foreground_out() {
+    use egui_kittest::kittest::Queryable;
+    let mut h = options_bar_harness(crate::state::Tool::MixerBrush);
+    // A red image, an empty layer above it, a blue foreground, and a brush that samples all layers.
+    for (id, p) in [
+        ("file.new", json!({"width": 200, "height": 40, "background": "transparent"})),
+        ("edit.fill", json!({"color": "#ff0000"})),
+        ("layer.new.layer", json!({})),
+        ("tools.setColors", json!({"foreground": "#0000ff"})),
+        ("tools.setBrush", json!({"brush": {"size": 8, "pressureSize": false, "mixer": {"sampleAllLayers": true}}})),
+    ] {
+        h.state_mut().run(id, p).unwrap();
+    }
+    h.run_steps(3);
+    for label in ["Current Brush Load", "Load the brush after each stroke", "Clean the brush after each stroke"] {
+        assert!(h.get_by_label(label).rect().is_positive(), "missing Mixer Brush option {label}");
+    }
+
+    // Turn the automatic Load off: one tools.setBrush call.
+    h.get_by_label("Load the brush after each stroke").click();
+    h.run_steps(3);
+    assert!(!h.state().session.tools.brush.mixer.load_after_stroke);
+    let (id, params) = last_journal(h.state()).unwrap();
+    assert_eq!((id.as_str(), &params["brush"]["mixer"]["loadAfterStroke"]), ("tools.setBrush", &json!(false)));
+
+    // Current Brush Load › Clean Brush empties the brush.
+    h.get_by_label("Current Brush Load").click();
+    h.run_steps(3);
+    h.get_by_label("Clean Brush").click();
+    h.run_steps(3);
+    assert_eq!(last_journal(h.state()).map(|(id, _)| id), Some("brush.mixer.clean".to_string()));
+    assert_eq!(h.state().session.tools.mixer.reservoir, None);
+
+    // The stroke the canvas commits on release lays down only the red it picks up.
+    crate::retouch_ui::finish_stroke(h.state_mut(), crate::state::Tool::MixerBrush, &[[5.0, 20.0, 1.0], [195.0, 20.0, 1.0]], egui::Modifiers::NONE);
+    let d = h.state().session.active().unwrap();
+    let c = d.doc.layer(d.active_layer.unwrap()).unwrap().surface().unwrap().rgba(100, 20);
+    assert!(c[3] > 0.1 && c[0] > 0.99 && c[2] < 0.01, "the stroke carries no foreground: {c:?}");
+    // With the automatic Load off, the stroke did not refill the brush either.
+    assert_eq!(h.state().session.tools.mixer.reservoir, None);
+
+    // Load Brush fills it with the foreground again.
+    h.get_by_label("Current Brush Load").click();
+    h.run_steps(3);
+    h.get_by_label("Load Brush").click();
+    h.run_steps(3);
+    assert_eq!(h.state().session.tools.mixer.reservoir, Some([0.0, 0.0, 1.0, 1.0]));
 }
 
 #[test]
@@ -1266,6 +1339,27 @@ fn hand_tool_offers_scale_buttons_and_requests_the_right_view() {
     h.run_steps(1);
     assert!(h.state().ui.views[0].fill_pending);
     assert!(!h.state().ui.views[0].fit_pending);
+}
+
+#[test]
+fn a_dynamic_gets_its_own_response_curve() {
+    use egui_kittest::kittest::Queryable;
+    let mut h = harness(0, 1);
+    h.state_mut().run("tools.setBrush", json!({"shapeDynamics": {"enabled": true, "size": {"control": "penPressure"}}})).unwrap();
+    h.run_steps(3);
+    // Only Size has a control with an input to shape; its curve button shows the editor.
+    assert_eq!(h.query_all_by_label("Response curve").count(), 1);
+    h.get_by_label("Response curve").click();
+    h.run_steps(3);
+    h.get_by_label("Soft").click();
+    h.run_steps(3);
+    let (id, p) = last_journal(h.state()).unwrap();
+    assert_eq!(id, "tools.setBrush");
+    let curve: Vec<[f32; 2]> = serde_json::from_value(p["brush"]["shapeDynamics"]["size"]["curve"].clone()).unwrap();
+    assert_eq!(curve, vec![[0.0, 0.0], [0.3, 0.6], [1.0, 1.0]]);
+    let b = &h.state().session.tools.brush;
+    assert_eq!(b.shape_dynamics.size.curve.points(), curve);
+    assert!(b.shape_dynamics.roundness.curve.is_linear() && b.transfer.opacity.curve.is_linear());
 }
 
 #[test]

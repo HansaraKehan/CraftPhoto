@@ -162,6 +162,116 @@ fn answer(open: &Open, answer: Option<FileDialogAnswer>) {
 }
 
 #[test]
+fn menu_place_starts_transform_for_each_chosen_image() {
+    for command in ["file.placeEmbedded", "file.placeLinked"] {
+        let (mut app, open, _) = app();
+        app.run("edit.fill", json!({"color": "#ff0000"})).unwrap();
+        let bytes = photocraft_io::export(&app.session.active().unwrap().doc, "source.png", &Default::default()).unwrap().bytes;
+        let ctx = egui::Context::default();
+        let initial_layers = app.session.active().unwrap().doc.layer_count();
+        let initial_history = app.session.active().unwrap().history.past_len();
+        let linked_dir = (command == "file.placeLinked").then(|| {
+            let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let dir = std::env::temp_dir().join(format!("photocraft-menu-place-{}-{unique}", std::process::id()));
+            std::fs::create_dir(&dir).unwrap();
+            dir
+        });
+        for index in 0..2 {
+            menus::invoke(&mut app, &ctx, command, json!({})).unwrap();
+            app.poll_file_dialog(&ctx, None);
+            let picked = if let Some(dir) = &linked_dir {
+                let path = dir.join(format!("drawing-{index}.png"));
+                std::fs::write(&path, &bytes).unwrap();
+                FileDialogAnswer::Paths(vec![path.to_string_lossy().into_owned()])
+            } else {
+                FileDialogAnswer::Contents(format!("drawing-{index}.png"), bytes.clone())
+            };
+            answer(&open, Some(picked));
+            app.poll_file_dialog(&ctx, None);
+            let st = app.session.active().unwrap();
+            assert_eq!(st.doc.layer_count(), initial_layers + index + 1);
+            assert_eq!(st.doc.layer(st.active_layer.unwrap()).unwrap().name, format!("drawing-{index}"));
+            let transform = app.ui.transform.as_ref().expect("File > Place must offer transform handles after the picker completes");
+            assert_eq!(transform.made, Some(crate::state::MadeLayer::Place));
+            if index == 0 {
+                let layer = st.active_layer.unwrap();
+                let photocraft_doc::LayerContent::Smart(smart) = &st.doc.layer(layer).unwrap().content else { panic!("placed Smart Object") };
+                let original_scale = smart.transform.m[0];
+                let transform = app.ui.transform.as_mut().unwrap();
+                let left = transform.quad[0][0];
+                for corner in &mut transform.quad {
+                    corner[0] = left + (corner[0] - left) * 2.0;
+                }
+                crate::transform_tool::commit(&mut app);
+                assert!(app.ui.transform.is_none(), "resizing the placed image must commit");
+                let st = app.session.active().unwrap();
+                let photocraft_doc::LayerContent::Smart(smart) = &st.doc.layer(layer).unwrap().content else { panic!("placed Smart Object") };
+                assert!((smart.transform.m[0] - original_scale * 2.0).abs() < 1e-8, "placement width must double");
+                assert_eq!(app.session.active().unwrap().history.past_len(), initial_history + 1);
+            } else {
+                crate::transform_tool::cancel(&mut app);
+                assert_eq!(app.session.active().unwrap().doc.layer_count(), initial_layers + 1);
+                assert_eq!(app.session.active().unwrap().history.past_len(), initial_history + 1);
+            }
+        }
+        if let Some(dir) = linked_dir {
+            for index in 0..2 {
+                std::fs::remove_file(dir.join(format!("drawing-{index}.png"))).unwrap();
+            }
+            std::fs::remove_dir(dir).unwrap();
+        }
+    }
+}
+
+#[test]
+fn cancelled_or_invalid_menu_place_does_not_start_transform() {
+    for command in ["file.placeEmbedded", "file.placeLinked"] {
+        for reply in [None, Some(FileDialogAnswer::Contents("broken.png".into(), b"not an image".to_vec()))] {
+            let (mut app, open, _) = app();
+            let ctx = egui::Context::default();
+            let before = app.session.active().unwrap().doc.clone();
+            let history = app.session.active().unwrap().history.past_len();
+            menus::invoke(&mut app, &ctx, command, json!({})).unwrap();
+            app.poll_file_dialog(&ctx, None);
+            answer(&open, reply);
+            app.poll_file_dialog(&ctx, None);
+            assert!(app.ui.transform.is_none());
+            assert_eq!(app.session.active().unwrap().doc, before);
+            assert_eq!(app.session.active().unwrap().history.past_len(), history);
+        }
+    }
+}
+
+#[test]
+fn menu_place_preserves_an_unfinished_transform() {
+    for start_before_picker in [true, false] {
+        let (mut app, open, _) = app();
+        app.run("edit.fill", json!({"color": "#ff0000"})).unwrap();
+        app.run("layer.new.layerFromBackground", json!({})).unwrap();
+        let bytes = photocraft_io::export(&app.session.active().unwrap().doc, "source.png", &Default::default()).unwrap().bytes;
+        let ctx = egui::Context::default();
+        if !start_before_picker {
+            menus::invoke(&mut app, &ctx, "file.placeEmbedded", json!({})).unwrap();
+            app.poll_file_dialog(&ctx, None);
+        }
+        crate::transform_tool::begin(&mut app, &ctx).unwrap();
+        let transform = app.ui.transform.clone();
+        let doc = app.session.active().unwrap().doc.clone();
+        let history = app.session.active().unwrap().history.past_len();
+        if start_before_picker {
+            assert!(menus::invoke(&mut app, &ctx, "file.placeEmbedded", json!({})).is_err());
+            assert!(!app.file_dialog_open());
+        } else {
+            answer(&open, Some(FileDialogAnswer::Contents("source.png".into(), bytes)));
+            app.poll_file_dialog(&ctx, None);
+        }
+        assert_eq!(app.ui.transform, transform);
+        assert_eq!(app.session.active().unwrap().doc, doc);
+        assert_eq!(app.session.active().unwrap().history.past_len(), history);
+    }
+}
+
+#[test]
 fn open_starts_in_the_last_used_folder() {
     let (mut app, open, _) = app();
     let ctx = egui::Context::default();
@@ -219,8 +329,21 @@ fn scripts_browse_lists_only_script_files() {
     assert!(matches!(
         open.borrow().first().map(|(r, _)| r),
         Some(FileDialogRequest::Open { multiple: false, extensions: Some(exts), .. })
-            if exts.iter().map(String::as_str).collect::<Vec<_>>() == ["psjs", "ccjs", "jsx", "js", "jsxbin", "json", "txt"]
+            if exts.iter().map(String::as_str).collect::<Vec<_>>() == ["psjs", "ccjs", "jsx", "js", "jsxbin", "json", "txt", "pcdroplet"]
     ));
+}
+
+#[test]
+fn scripts_browse_extendscript_picks_report_the_error() {
+    // Photoshop scripts stay in the picker (matching its filter) and choosing one shows why it won't run.
+    let (mut app, open, _) = app();
+    let ctx = egui::Context::default();
+    menus::invoke(&mut app, &ctx, "file.scripts.browse", json!({})).unwrap();
+    app.poll_file_dialog(&ctx, None);
+    answer(&open, Some(FileDialogAnswer::Contents("resize.jsx".into(), b"alert('hi');".to_vec())));
+    app.poll_file_dialog(&ctx, None);
+    assert!(app.ui.status_error);
+    assert!(app.ui.status.contains("not Photoshop ExtendScript"), "{}", app.ui.status);
 }
 
 #[test]
@@ -565,6 +688,53 @@ fn smart_source(app: &PhotocraftApp, id: u64) -> photocraft_doc::SmartSource {
 }
 
 #[test]
+fn place_embedded_uses_the_single_file_picker_and_accepts_contents() {
+    let (mut app, open, _) = app();
+    let ctx = egui::Context::default();
+    assert!(menus::is_enabled(&app, "file.placeEmbedded"));
+    let source = photocraft_io::export(&app.session.active().unwrap().doc, "source.png", &Default::default()).unwrap().bytes;
+    let layers_before = app.session.active().unwrap().doc.layers.len();
+
+    // Cancel leaves the document alone and does not report an error.
+    menus::invoke(&mut app, &ctx, "file.placeEmbedded", json!({})).unwrap();
+    app.poll_file_dialog(&ctx, None);
+    assert!(matches!(open.borrow().as_slice(), [(FileDialogRequest::Open { multiple: false, .. }, _)]));
+    answer(&open, None);
+    app.poll_file_dialog(&ctx, None);
+    assert_eq!(app.session.active().unwrap().doc.layers.len(), layers_before);
+    assert!(!app.ui.status_error, "{}", app.ui.status);
+
+    // The Web picker returns the selected file's name and bytes instead of a filesystem path.
+    menus::invoke(&mut app, &ctx, "file.placeEmbedded", json!({})).unwrap();
+    app.poll_file_dialog(&ctx, None);
+    answer(&open, Some(FileDialogAnswer::Contents("source.png".into(), source)));
+    app.poll_file_dialog(&ctx, None);
+    assert!(!app.ui.status_error, "{}", app.ui.status);
+    let st = app.session.active().unwrap();
+    assert_eq!(st.doc.layers.len(), layers_before + 1);
+    let layer = st.doc.layer(st.active_layer.unwrap()).unwrap();
+    assert_eq!(layer.name, "source");
+    assert_eq!(app.ui.transform.as_ref().and_then(|t| t.made), Some(crate::state::MadeLayer::Place));
+    assert!(matches!(
+        &layer.content,
+        photocraft_doc::LayerContent::Smart(sm)
+            if matches!(&sm.source, photocraft_doc::SmartSource::Embedded { file_name, .. } if file_name == "source.png")
+    ));
+
+    // Finish the successful placement before starting the next picker.
+    crate::transform_tool::commit(&mut app);
+    assert!(app.ui.transform.is_none());
+
+    // Invalid contents are reported without adding a layer.
+    menus::invoke(&mut app, &ctx, "file.placeEmbedded", json!({})).unwrap();
+    app.poll_file_dialog(&ctx, None);
+    answer(&open, Some(FileDialogAnswer::Contents("broken.png".into(), b"not an image".to_vec())));
+    app.poll_file_dialog(&ctx, None);
+    assert!(app.ui.status_error);
+    assert_eq!(app.session.active().unwrap().doc.layers.len(), layers_before + 1);
+}
+
+#[test]
 fn replace_contents_picks_a_file_for_every_instance() {
     let (mut app, open, _, ids) = smart_app();
     let ctx = egui::Context::default();
@@ -668,6 +838,37 @@ fn quick_export_selected_layers_writes_separate_pngs_with_one_prompt() {
     assert!(!app.ui.status_error, "{}", app.ui.status);
 }
 
+/// #6599: Quick Export as PNG with Location = Same Folder asks before replacing the document's
+/// own file (a document opened from photo.png), and keeps writing beside a PSD without a prompt.
+#[test]
+fn same_folder_quick_export_asks_before_replacing_the_documents_own_file() {
+    let dir = std::env::temp_dir().join(format!("photocraft-quick-own-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let own = dir.join("photo.png").to_string_lossy().into_owned();
+    std::fs::write(&own, b"original").unwrap();
+    let (mut app, open, _) = app();
+    app.run("prefs.set", json!({"path": "export.quickExportLocation", "value": "sameFolder"})).unwrap();
+    app.session.active_mut().unwrap().path = Some(own.clone());
+    let ctx = egui::Context::default();
+    menus::invoke(&mut app, &ctx, "file.export.quickExportAsPng", Value::Null).unwrap();
+    app.poll_file_dialog(&ctx, None);
+    assert_eq!(open.borrow().len(), 1, "the save dialog asks");
+    assert_eq!(std::fs::read(&own).unwrap(), b"original", "nothing written before the answer");
+    answer(&open, Some(FileDialogAnswer::SaveTo(own.clone())));
+    app.poll_file_dialog(&ctx, None);
+    assert!(std::fs::read(&own).unwrap().starts_with(b"\x89PNG\r\n\x1a\n"), "replaced once confirmed: {}", app.ui.status);
+
+    // Beside a PSD, Same Folder still writes without a prompt.
+    app.session.active_mut().unwrap().path = Some(dir.join("photo.psd").to_string_lossy().into_owned());
+    std::fs::write(&own, b"earlier export").unwrap();
+    menus::invoke(&mut app, &ctx, "file.export.quickExportAsPng", Value::Null).unwrap();
+    app.poll_file_dialog(&ctx, None);
+    assert!(open.borrow().is_empty(), "no dialog");
+    assert!(std::fs::read(&own).unwrap().starts_with(b"\x89PNG\r\n\x1a\n"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn cancelling_multi_layer_quick_export_writes_nothing() {
     let (mut app, open, written) = app();
@@ -742,6 +943,14 @@ fn export_as_with_several_artboards_selected_writes_one_file_each() {
     // The sibling path is built with `Path::join`, so Windows turns the separator into `\`.
     let second = written.borrow()[1].replace('\\', "/");
     assert!(second.starts_with("/out/boards-2-") && second.ends_with(".jpg"), "{:?}", written.borrow());
+    let written = written.borrow();
+    assert_eq!(written.len(), 2);
+    // First file uses the exact path from the dialog (forward slashes in test)
+    assert_eq!(std::path::Path::new(&written[0]).file_name().and_then(|n| n.to_str()), Some("boards.jpg"));
+    // Second file is generated by batch_paths which uses platform path separators
+    let sibling = std::path::Path::new(&written[1]);
+    assert_eq!(sibling.parent(), std::path::Path::new(&written[0]).parent());
+    assert_eq!(sibling.file_name().and_then(|name| name.to_str()), Some("boards-2-Capsule.jpg"));
     let mut got = sizes.borrow().iter().map(|(_, w, h)| (*w, *h)).collect::<Vec<_>>();
     got.sort_unstable();
     assert_eq!(got, [(10, 25), (20, 15)], "each board at its own size, scaled to 50 %");
@@ -793,4 +1002,129 @@ fn save_as_openraster_of_what_it_cannot_hold_is_a_copy() {
     let err = app.save_automation(None).unwrap_err();
     assert!(err.contains("OpenRaster"), "{err}");
     assert_eq!(written.borrow().len(), 1);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn render_video_menu_asks_for_directory_and_writes_frames_only_after_confirmation() {
+    let (mut app, open, _) = app();
+    let ctx = egui::Context::default();
+    let dir = std::env::temp_dir().join(format!(
+        "pc-render-video-ui-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    let path = dir.to_string_lossy().into_owned();
+
+    let result = menus::invoke(&mut app, &ctx, "file.export.renderVideo", json!({})).unwrap();
+    assert_eq!(result["fileDialog"], "folder");
+    app.poll_file_dialog(&ctx, None);
+    assert!(matches!(open.borrow().as_slice(), [(FileDialogRequest::Folder { .. }, _)]));
+    assert!(!dir.exists(), "a menu click must not create an output directory");
+
+    answer(&open, None);
+    app.poll_file_dialog(&ctx, None);
+    assert!(!dir.exists(), "cancelling the picker must not render video");
+
+    menus::invoke(&mut app, &ctx, "file.export.renderVideo", json!({})).unwrap();
+    app.poll_file_dialog(&ctx, None);
+    answer(&open, Some(FileDialogAnswer::FolderTo(path.clone())));
+    app.poll_file_dialog(&ctx, None);
+    let rendered: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|entry| entry.unwrap().path()).collect();
+    assert_eq!(rendered.len(), 1, "a document without a timeline exports one frame");
+    assert_eq!(rendered[0].extension().and_then(|ext| ext.to_str()), Some("png"));
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    // Commands that already supply a directory must not open a file picker.
+    let result = menus::invoke(&mut app, &ctx, "file.export.renderVideo", json!({"dir": path})).unwrap();
+    assert!(result["frames"].as_u64().is_some());
+    assert!(!app.file_dialog_open());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// How many times each path was written, standing in for its size and modification time.
+type Disk = Rc<RefCell<std::collections::HashMap<String, u64>>>;
+
+/// Gives `app` file stamps from a fake disk that its own writes update too.
+fn on_disk(app: &mut PhotocraftApp) -> Disk {
+    let disk = Disk::default();
+    let (read, wrote) = (disk.clone(), disk.clone());
+    app.services.file_stamp = Some(Box::new(move |path| read.borrow().get(path).map(|&n| crate::FileStamp { len: n, modified: None })));
+    let mut write = app.services.write.take().unwrap();
+    app.services.write = Some(Box::new(move |path, bytes| {
+        write(path, bytes)?;
+        *wrote.borrow_mut().entry(path.to_string()).or_default() += 1;
+        Ok(())
+    }));
+    disk
+}
+
+fn changed_by_another_app(disk: &Disk, path: &str) {
+    *disk.borrow_mut().entry(path.to_string()).or_default() += 1;
+}
+
+fn disk_prompt(app: &PhotocraftApp) -> Option<&crate::state::Dialog> {
+    app.ui.dialogs.iter().find(|d| crate::disk_change_prompt::owns(&d.fields))
+}
+
+#[test]
+fn save_asks_before_replacing_a_file_another_app_changed() {
+    let ctx = egui::Context::default();
+    let (mut app, _open, written) = app();
+    let disk = on_disk(&mut app);
+    changed_by_another_app(&disk, "/pics/a.psd");
+    app.opened_from("/pics/a.psd");
+    app.run("layer.new.layer", json!({})).unwrap();
+    // Unchanged on disk: Save writes at once.
+    menus::invoke(&mut app, &ctx, "file.save", json!({})).unwrap();
+    assert_eq!(*written.borrow(), ["/pics/a.psd"]);
+    assert!(disk_prompt(&app).is_none());
+
+    // Our own save isn't a change; another app's write after it is.
+    changed_by_another_app(&disk, "/pics/a.psd");
+    app.run("layer.new.layer", json!({})).unwrap();
+    let r = menus::invoke(&mut app, &ctx, "file.save", json!({})).unwrap();
+    assert_eq!(r["confirmationPending"], true);
+    assert_eq!(written.borrow().len(), 1, "nothing is written before the answer");
+    let prompt = disk_prompt(&app).expect("Save asks first");
+    assert!(prompt.fields["message"].as_str().unwrap().contains("a.psd"));
+
+    // Cancel leaves the file and the unsaved document alone.
+    let id = prompt.id;
+    app.ui.close_dialog(id);
+    assert_eq!(written.borrow().len(), 1);
+    assert!(app.session.active().unwrap().is_dirty());
+
+    // Replace writes it, and the next Save doesn't ask again.
+    let id = menus::invoke(&mut app, &ctx, "file.save", json!({})).unwrap()["dialog"].as_u64().unwrap();
+    crate::dialogs::confirm(&mut app, id).unwrap();
+    assert_eq!(written.borrow().len(), 2);
+    assert!(!app.session.active().unwrap().is_dirty());
+    app.run("layer.new.layer", json!({})).unwrap();
+    menus::invoke(&mut app, &ctx, "file.save", json!({})).unwrap();
+    assert_eq!(written.borrow().len(), 3);
+    assert!(disk_prompt(&app).is_none());
+}
+
+#[test]
+fn save_of_a_flat_file_asks_after_the_dialog_when_another_app_changed_it() {
+    let ctx = egui::Context::default();
+    // Lowercase: the Save dialog lowercases a typed extension by default.
+    let path = "/pics/My image.jpg";
+    let (mut app, open, written) = jpeg_app(None, false);
+    let disk = on_disk(&mut app);
+    changed_by_another_app(&disk, path);
+    app.opened_from(path);
+    app.run("image.adjustments.invert", json!({})).unwrap();
+    changed_by_another_app(&disk, path);
+    menus::invoke(&mut app, &ctx, "file.save", json!({})).unwrap();
+    app.poll_file_dialog(&ctx, None);
+    answer(&open, Some(FileDialogAnswer::SaveTo(path.into())));
+    app.poll_file_dialog(&ctx, None);
+    assert!(written.borrow().is_empty(), "the changed file is not replaced before the answer");
+    let id = disk_prompt(&app).expect("Save asks first").id;
+    crate::dialogs::confirm(&mut app, id).unwrap();
+    assert_eq!(*written.borrow(), [path]);
+    assert!(!app.session.active().unwrap().is_dirty());
+    assert_eq!(app.session.journal.last().map(|s| s.0.as_str()), Some("file.save"), "still recorded as a plain Save");
 }

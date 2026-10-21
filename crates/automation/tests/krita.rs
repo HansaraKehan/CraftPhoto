@@ -4,14 +4,15 @@
 use photocraft_automation::Headless;
 use serde_json::json;
 
-/// A tiled pixel file with one raw 64x64 tile of `bgra` at (0, 0).
+/// A tiled pixel file with one raw 64x64 tile of `bgra` at (0, 0). Krita writes a raw tile
+/// (flag 0) as plain interleaved pixels; only LZF tiles are split into byte planes.
 fn tiles(bgra: [u8; 4]) -> Vec<u8> {
     let n = 64 * 64;
     let mut out = b"VERSION 2\nTILEWIDTH 64\nTILEHEIGHT 64\nPIXELSIZE 4\nDATA 1\n".to_vec();
     out.extend(format!("0,0,LZF,{}\n", 1 + n * 4).into_bytes());
     out.push(0);
-    for b in bgra {
-        out.extend(std::iter::repeat_n(b, n));
+    for _ in 0..n {
+        out.extend(bgra);
     }
     out
 }

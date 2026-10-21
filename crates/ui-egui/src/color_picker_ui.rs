@@ -171,7 +171,7 @@ pub fn open(app: &mut PhotocraftApp, target: &str) -> u64 {
     let c = if target == "background" { app.session.tools.background } else { app.session.tools.foreground };
     let rgb = [c[0], c[1], c[2]];
     let label = if target == "background" { "Color Picker (Background Color)" } else { "Color Picker (Foreground Color)" };
-    let mut fields = initial_fields(target, label, rgb);
+    let mut fields = fields_with_web(app, target, label, rgb);
     // A colour that was picked as CMYK shows the inks it was picked as, not what its sRGB stand-in converts to (#4196).
     if let Some(cmyk) = app.session.tools.picked_cmyk(rgb) {
         fields.insert("__cmyk".into(), json!(cmyk));
@@ -192,10 +192,23 @@ pub(crate) fn initial_fields(target: &str, label: &str, rgb: [f32; 3]) -> Map<St
     f
 }
 
+/// Seed [`initial_fields`] with the last Only Web Colors setting. With web-only on, the opening
+/// colour is snapped and `__orig` follows it: OK without an edit is "unchanged", so opening the
+/// picker never rewrites a fill behind the user's back (#4995).
+pub(crate) fn fields_with_web(app: &PhotocraftApp, target: &str, label: &str, rgb: [f32; 3]) -> Map<String, Value> {
+    let mut f = initial_fields(target, label, rgb);
+    f.insert("__webOnly".into(), json!(app.ui.color_panel.web_only));
+    if app.ui.color_panel.web_only {
+        set_rgb(&mut f, rgb, Keep::Nothing);
+        f.insert("__orig".into(), f["color"].clone());
+    }
+    f
+}
+
 /// Open the picker on `rgb` for something other than the tool colours: OK runs `command` with
 /// `params` plus `"color": "#rrggbb"` (e.g. a gradient stop's colour).
 pub fn open_for_command(app: &mut PhotocraftApp, label: &str, rgb: [f32; 3], command: &str, params: Value) -> u64 {
-    let mut f = initial_fields("command", label, rgb);
+    let mut f = fields_with_web(app, "command", label, rgb);
     f.insert("__command".into(), json!(command));
     f.insert("__params".into(), params);
     app.ui.open_dialog(DialogKind::Command, f)
@@ -204,33 +217,16 @@ pub fn open_for_command(app: &mut PhotocraftApp, label: &str, rgb: [f32; 3], com
 /// Open the picker on `rgb` for a colour field of another dialog (e.g. Edit › Fill's Color…): OK
 /// writes `"#rrggbb"` into `field` of dialog `dialog`, which stays open; Cancel leaves it alone.
 pub fn open_for_field(app: &mut PhotocraftApp, label: &str, rgb: [f32; 3], dialog: u64, field: &str) -> u64 {
-    let hsv = rgb_to_hsv(rgb);
-    let mut f = Map::new();
-    f.insert("__colorPicker".into(), json!("field"));
-    f.insert("__label".into(), json!(label));
+    let mut f = fields_with_web(app, "field", label, rgb);
     f.insert("__dialog".into(), json!(dialog));
     f.insert("__field".into(), json!(field));
-    f.insert("color".into(), json!(hex(rgb)));
-    f.insert("__orig".into(), json!(hex(rgb)));
-    f.insert("__hsv".into(), json!(hsv));
-    f.insert("__mode".into(), json!("h"));
-    f.insert("__webOnly".into(), json!(false));
     app.ui.open_dialog(DialogKind::Command, f)
 }
 
 /// Open the picker on `rgb` for a colour the shell keeps itself (e.g. the Crop shield's custom
 /// colour): OK hands `"#rrggbb"` to `target`'s setter in [`confirm`]; Cancel leaves it alone.
 pub fn open_for_target(app: &mut PhotocraftApp, target: &str, label: &str, rgb: [f32; 3]) -> u64 {
-    let hsv = rgb_to_hsv(rgb);
-    let mut f = Map::new();
-    f.insert("__colorPicker".into(), json!(target));
-    f.insert("__label".into(), json!(label));
-    f.insert("color".into(), json!(hex(rgb)));
-    f.insert("__orig".into(), json!(hex(rgb)));
-    f.insert("__hsv".into(), json!(hsv));
-    f.insert("__mode".into(), json!("h"));
-    f.insert("__webOnly".into(), json!(false));
-    app.ui.open_dialog(DialogKind::Command, f)
+    app.ui.open_dialog(DialogKind::Command, fields_with_web(app, target, label, rgb))
 }
 
 /// Set by a dialog body (to the picker's title) to open the Color Picker on its `color` field.
@@ -367,7 +363,7 @@ pub fn current(f: &Map<String, Value>) -> Components {
 
 fn set_rgb(f: &mut Map<String, Value>, rgb: [f32; 3], keep: Keep) {
     let web = f.get("__webOnly").and_then(Value::as_bool).unwrap_or(false);
-    let (rgb, keep) = if web { (rgb.map(|v| (v * 5.0).round() / 5.0), Keep::Nothing) } else { (rgb, keep) };
+    let (rgb, keep) = if web { (web_safe(rgb), Keep::Nothing) } else { (rgb, keep) };
     f.insert("color".into(), json!(hex(rgb)));
     for key in ["__hsv", "__lab", "__cmyk"] {
         f.remove(key);
@@ -688,9 +684,14 @@ fn fields(ui: &mut egui::Ui, f: &mut Map<String, Value>, mode: &str, now: &Compo
                 let focused = ui.memory(|m| m.has_focus(id));
                 let pasted = if focused { take_hex_paste(ui) } else { None };
                 let typing = if focused { ui.data(|d| d.get_temp::<String>(id)) } else { None };
+                // Drop stale typing when another path (web snap, field drag, Current) changed `color`.
+                let shown = hex(rgb);
                 let mut h = match pasted {
                     Some(c) => hex(c).trim_start_matches('#').to_ascii_uppercase(),
-                    None => typing.unwrap_or_else(|| hex(rgb).trim_start_matches('#').to_ascii_uppercase()),
+                    None => match typing {
+                        Some(t) if parse_hex(&t).is_none() || parse_hex(&t).map(hex).as_deref() == Some(shown.as_str()) => t,
+                        _ => shown.trim_start_matches('#').to_ascii_uppercase(),
+                    },
                 };
                 let r = crate::widgets::text_field_ex(ui, id, &mut h, "", 64.0, true, Some(6));
                 if let Some(c) = pasted {
@@ -782,6 +783,9 @@ pub fn confirm(app: &mut PhotocraftApp, f: &Map<String, Value>) -> Result<Value,
     }
     if crate::layer_style::color_picker::owns(f) {
         return crate::layer_style::color_picker::confirm(app, f);
+    }
+    if crate::solid_fill_ui::owns_new(f) {
+        return crate::solid_fill_ui::confirm_new(app, f);
     }
     if crate::solid_fill_ui::owns(f) {
         return crate::solid_fill_ui::confirm(app, f);
@@ -1041,11 +1045,54 @@ mod tests {
         h.get_by_label("Only Web Colors").click();
         h.run_steps(2);
         assert_eq!(color(&h), "#003366");
+        assert_eq!(h.get_by_role(Role::TextInput).value().as_deref(), Some("003366"), "hex field follows the snap while it has focus");
         h.get_by_label("Only Web Colors").click();
         h.run_steps(2);
         h.get_by_label("Click to restore the current colour").click();
         h.run_steps(2);
         assert_eq!(color(&h), "#123456");
+    }
+
+    #[test]
+    fn web_only_snaps_hex_field_and_component_edits() {
+        let mut f = Map::new();
+        f.insert("color".into(), json!("#123456"));
+        f.insert("__webOnly".into(), json!(true));
+        set_rgb(&mut f, parse_hex("#ff8800").unwrap(), Keep::Nothing);
+        assert_eq!(f["color"], json!("#ff9900"));
+        set_rgb(&mut f, hsv_to_rgb(40.0, 1.0, 1.0), Keep::Hsv([40.0, 1.0, 1.0]));
+        assert_eq!(f["color"], json!("#ff9900"));
+        assert!(f.get("__hsv").is_none(), "kept HSV does not outlive a web snap");
+        set_rgb(&mut f, photocraft_color::convert::lab_to_srgb([50.0, 40.0, 20.0]).map(|c| c.clamp(0.0, 1.0)), Keep::Lab([50.0, 40.0, 20.0]));
+        assert_eq!(not_web_safe(parse_hex(f["color"].as_str().unwrap()).unwrap()), None);
+        assert!(f.get("__lab").is_none());
+    }
+
+    #[test]
+    fn web_only_survives_reopen_and_other_picker_targets() {
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+        app.ui.color_panel.web_only = true;
+        let id = open(&mut app, "foreground");
+        let f = &app.ui.dialog_mut(id).unwrap().fields;
+        assert_eq!(f["__webOnly"], json!(true));
+        assert_eq!(f["color"], json!(hex(web_safe([app.session.tools.foreground[0], app.session.tools.foreground[1], app.session.tools.foreground[2]]))));
+        assert_eq!(f["__orig"], f["color"], "the opening snap moves __orig too, so OK with no edit is unchanged");
+        app.ui.dialogs.clear();
+        let id = open_for_target(&mut app, "noteColor", "Color Picker", [1.0, 0.53, 0.0]);
+        let f = &app.ui.dialogs.iter().find(|d| d.id == id).unwrap().fields;
+        assert_eq!(f["__webOnly"], json!(true));
+        assert_eq!(f["color"], json!("#ff9900"));
+        assert_eq!(f["__orig"], json!("#ff9900"), "a non-web-safe start colour is not committed by opening the picker");
+    }
+
+    #[test]
+    fn sample_at_snaps_when_only_web_colors_is_on() {
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+        let id = open(&mut app, "foreground");
+        let f = &mut app.ui.dialog_mut(id).unwrap().fields;
+        f.insert("__webOnly".into(), json!(true));
+        set_rgb(f, [0.07, 0.2, 0.34], Keep::Nothing);
+        assert_eq!(f["color"], json!("#003366"));
     }
 
     #[test]

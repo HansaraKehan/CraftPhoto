@@ -253,6 +253,12 @@ pub const PIXLS_FILES: &[(&str, &str)] = &[
     ("Canon/PowerShot%20SX50%20HS/IMG_4059.CR2", "IMG_4059.CR2"),
     ("Canon/PowerShot%20SX50%20HS/CRW_4061.DNG", "CRW_4061.DNG"),
     ("Nikon/D3/JD1_8203.NEF", "JD1_8203.NEF"),
+    // Modern lossy NEF curve: the encoded range is two bits smaller than the sensor ADUs.
+    ("Nikon/Z%206/DSC_0751.NEF", "DSC_0751.NEF"),
+    ("Nikon/Z%206/DSC_0754.NEF", "DSC_0754.NEF"),
+    // Uncompressed packed NEF selected by maker-note mode, despite TIFF Compression 34713.
+    ("Nikon/Z%206/DSC_0750.NEF", "DSC_0750.NEF"),
+    ("Nikon/Z%206/DSC_0753.NEF", "DSC_0753.NEF"),
     ("Sony/DSC-RX0/DSC00009.ARW", "DSC00009.ARW"),
     ("Panasonic/DC-G9/P1000475.RW2", "P1000475.RW2"),
     ("Olympus/E-1/E_1__C106743_gredos.ORF", "E_1__C106743_gredos.ORF"),

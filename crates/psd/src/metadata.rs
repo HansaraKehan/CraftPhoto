@@ -40,7 +40,7 @@ pub fn parse_shmd(data: &[u8]) -> Result<Vec<MetadataItem>> {
     let mut r = Reader::new(data);
     let count = r.u32()?;
     r.check_count(u64::from(count), 16)?;
-    let mut out = Vec::with_capacity(count as usize);
+    let mut out = crate::descriptor::vec_for_count(count);
     for _ in 0..count {
         let signature = r.array()?;
         let key = r.array()?;

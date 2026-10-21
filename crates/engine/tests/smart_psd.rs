@@ -615,3 +615,58 @@ fn cs2_plld_only_smart_object_saves_its_new_transform() {
     }
     assert!(photocraft_engine::smart_cmds::contents_of(&again, photocraft_doc::LayerId(aid)).is_ok(), "the contents are available");
 }
+
+/// Photoshop stores a smart object's filtered pixels without its filter mask and mixes the
+/// unfiltered ones back in through the mask (`compose::filter_mask`): the layer record we write
+/// holds the filtered pixels wherever the mask shows any of the filter, and opening the file
+/// mixes them back to what the document showed.
+#[test]
+fn a_soft_filter_mask_is_stored_the_way_photoshop_stores_it() {
+    use photocraft_doc::LayerMask;
+    use photocraft_raster::Surface;
+    let mut s = session(8);
+    s.execute("layer.smartObjects.convertToSmartObject", json!({})).unwrap();
+    s.execute("filter.blur.gaussianBlur", json!({"radius": 4})).unwrap();
+    let id = s.active().unwrap().active_layer.unwrap();
+    // A mask ramping from hiding the blur (left) to showing it (right).
+    s.edit("mask", |doc, _| {
+        let snapshot = doc.clone();
+        let l = doc.layer_mut(id).unwrap();
+        let LayerContent::Smart(sm) = &mut l.content else { panic!("smart") };
+        let mut m = LayerMask::reveal_all();
+        m.surface = Surface::new(photocraft_color::PixelFormat::GRAY8);
+        let r = Rect::new(0, 0, W, H);
+        m.surface.write_region(r, &(0..H).flat_map(|_| (0..W).map(|x| x as f32 / (W - 1) as f32)).collect::<Vec<_>>());
+        sm.filter_mask = Some(m);
+        refresh_layer(&snapshot, l).map(|_| ())
+    })
+    .unwrap();
+    let doc = s.active().unwrap().doc.clone();
+    let (_, sm) = smart(&doc);
+    let mixed = sm.cache.clone().unwrap();
+    // The same smart object with the mask switched off: filtered everywhere.
+    let mut unmasked = sm.clone();
+    unmasked.filter_mask.as_mut().unwrap().enabled = false;
+    let filtered = photocraft_engine::smart_cmds::render(&doc, &unmasked).unwrap().unwrap();
+
+    let out = photocraft_io::export(&doc, "psd", &Default::default()).unwrap();
+    let file = photocraft_psd::PsdFile::from_bytes(&out.bytes).unwrap();
+    let name = doc.layer(id).unwrap().name.clone();
+    let record = (0..file.layers().len()).filter_map(|i| file.layer(i)).find(|l| l.name() == name).unwrap();
+    let img = record.rgba8().unwrap();
+    // A column where the mask shows about half the blur, over opaque content.
+    let (x, y) = (W / 2, 20);
+    let at = (((y - img.top) as u32 * img.width + (x - img.left) as u32) * 4) as usize;
+    let stored = &img.data[at..at + 4];
+    let want = filtered.pixel(x, y);
+    let half = mixed.pixel(x, y);
+    let gap = (0..3).map(|c| (want[c] - half[c]).abs()).fold(0.0f32, f32::max);
+    assert!(gap > 3.0 / 255.0, "the mask's mix must show at ({x}, {y}) for this test to mean anything");
+    for c in 0..3 {
+        assert!((f32::from(stored[c]) / 255.0 - want[c]).abs() <= 1.5 / 255.0, "channel {c}: stored {stored:?}, filtered {want:?}, mixed {half:?}");
+    }
+    // Opening the file mixes the unfiltered pixels back in: it shows what the document showed.
+    let back = photocraft_io::import("x.psd", &out.bytes).unwrap().document;
+    let d = max_diff(&photocraft_compose::flatten(&back).px, &photocraft_compose::flatten(&doc).px);
+    assert!(d <= 2.0 / 255.0, "re-opened differs by {d}");
+}

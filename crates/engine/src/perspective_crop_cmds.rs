@@ -188,7 +188,8 @@ fn warp_layers(layers: &mut [Layer], h: &Homography, interp: Interp, clip: Rect,
 fn apply(doc: &mut Document, q: &[[f64; 2]; 4], h: &Homography, size: (u32, u32), interp: Interp, bg: [f32; 4]) -> Result<()> {
     let (w, ht) = size;
     let clip = Rect::from_xywh(0, 0, w, ht);
-    let bg = photocraft_raster::from_rgba(&doc.pixel_format(), bg);
+    // The Background stays opaque, whatever the background colour's alpha.
+    let bg = photocraft_raster::from_rgba(&doc.pixel_format(), [bg[0], bg[1], bg[2], 1.0]);
     let background_id = doc.background().map(|l| l.id);
     warp_layers(&mut doc.layers, h, interp, clip, &bg, background_id)?;
     for ch in doc.channels.iter_mut().chain(doc.quick_mask.as_mut()) {
@@ -296,6 +297,31 @@ mod tests {
             s.execute("edit.undo", json!({})).unwrap();
             assert_eq!(s.active().unwrap().doc.size, Size::new(160, 120), "one undo step");
         }
+    }
+
+    /// Corners past the canvas: the uncovered Background is the background colour, opaque even
+    /// when that colour has alpha (the Background stays opaque).
+    #[test]
+    fn uncovered_background_is_opaque() {
+        let q = [[-20.0, -20.0], [180.0, -20.0], [180.0, 140.0], [-20.0, 140.0]];
+        let mut s = skewed_ramp(SampleType::U8, &q, 100.0, 80.0);
+        s.execute("tools.setColors", json!({"background": "#00ff0080"})).unwrap();
+        s.execute(CMD, json!({"corners": q, "width": 100, "height": 80})).unwrap();
+        let corner = s.active().unwrap().doc.layers[0].surface().unwrap().rgba(0, 0);
+        assert_eq!(corner, [0.0, 1.0, 0.0, 1.0]);
+    }
+
+    /// #7557: a quad low on a strongly converging photo (its horizon crosses the canvas, with the
+    /// canvas centre beyond it) is cropped, not left blank in the background colour.
+    #[test]
+    fn a_quad_below_a_horizon_across_the_canvas_keeps_its_content() {
+        let mut doc = Document::with_background("red", Size::new(100, 100), ColorMode::Rgb, SampleType::U8, Color::WHITE);
+        doc.layers[0].surface_mut().unwrap().fill_rect(Rect::from_xywh(0, 0, 100, 100), &[1.0, 0.0, 0.0, 1.0]);
+        let mut s = Session::new();
+        s.add_document(doc, None);
+        s.execute(CMD, json!({"corners": [[40, 70], [60, 70], [90, 95], [10, 95]], "width": 50, "height": 39})).unwrap();
+        let px = s.active().unwrap().doc.layers[0].surface().unwrap().rgba(25, 20);
+        assert_eq!(px, [1.0, 0.0, 0.0, 1.0]);
     }
 
     /// Bad quads and params are refused with an error, and the document is untouched.

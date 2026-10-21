@@ -21,7 +21,13 @@ fn png_u16_rgba_is_clean() {
 fn tiff_is_clean_for_all_integer_and_f32_layouts() {
     for l in ChannelLayout::ALL {
         for s in [SampleType::U8, SampleType::U16, SampleType::F32, SampleType::F16] {
-            assert!(warns(&test_image(l, s), Format::Tiff).is_empty(), "{l:?} {s:?}");
+            let w = warns(&test_image(l, s), Format::Tiff);
+            if l.is_lab() && s.is_float() {
+                // CIELab has no float form: it is written with 16 bits, and says so.
+                assert_eq!(w, vec![FidelityWarning::DepthReduced { from: s, to: SampleType::U16 }], "{l:?} {s:?}");
+            } else {
+                assert!(w.is_empty(), "{l:?} {s:?}");
+            }
         }
     }
 }
@@ -115,6 +121,12 @@ fn in_range_float_not_clipped() {
     assert!(!w.contains(&W::RangeClipped));
 }
 #[test]
+fn hdr_float_to_fits_clips() {
+    let img = Image::from_f32(2, 1, ChannelLayout::Gray, &[0.5, 3.0]).unwrap();
+    assert!(warns(&img, Format::Fits).contains(&W::RangeClipped));
+    assert!(!warns(&test_image(ChannelLayout::Gray, SampleType::F32), Format::Fits).contains(&W::RangeClipped));
+}
+#[test]
 fn float_to_exr_and_tiff_is_clean() {
     for f in [Format::OpenExr, Format::Tiff, Format::Pnm] {
         assert!(warns(&test_image(ChannelLayout::Rgb, SampleType::F32), f).is_empty(), "{f:?}");
@@ -172,6 +184,7 @@ fn every_warning_has_a_message() {
         W::AlphaDiscarded,
         W::AlphaBinarized,
         W::CmykConverted { to: ChannelLayout::Rgb },
+        W::LabConverted { to: ChannelLayout::Rgb },
         W::ColorToGray,
         W::PaletteQuantized,
         W::LossyCompression,
@@ -203,6 +216,8 @@ fn warnings_match_actual_roundtrip_behaviour() {
                 assert_eq!(w.contains(&W::AlphaDiscarded), alpha_lost, "{f:?} {l:?} {s:?}");
                 let cmyk_lost = l.is_cmyk() && !back.layout().is_cmyk();
                 assert_eq!(w.iter().any(|w| matches!(w, W::CmykConverted { .. })), cmyk_lost, "{f:?} {l:?} {s:?}");
+                let lab_lost = l.is_lab() && !back.layout().is_lab();
+                assert_eq!(w.iter().any(|w| matches!(w, W::LabConverted { .. })), lab_lost, "{f:?} {l:?} {s:?}");
             }
         }
     }

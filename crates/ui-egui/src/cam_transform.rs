@@ -212,11 +212,11 @@ pub(crate) fn cursor(app: &PhotocraftApp, ctx: &egui::Context, xf: &ViewXform, p
     Some(match h {
         Hit::Corner(i) => {
             let (a, b) = (q.get(i)?, q.get((i + 2) % 4)?);
-            crate::type_transform::resize_cursor([a[0] - b[0], a[1] - b[1]], xf.flip)
+            crate::tool_cursor::resize([a[0] - b[0], a[1] - b[1]], xf)
         }
         Hit::Edge(i) => {
             let (a, b) = (mid(i)?, mid(i + 2)?);
-            crate::type_transform::resize_cursor([a[0] - b[0], a[1] - b[1]], xf.flip)
+            crate::tool_cursor::resize([a[0] - b[0], a[1] - b[1]], xf)
         }
         Hit::Outside => {
             crate::type_transform::rotation_cursor(ctx, p);

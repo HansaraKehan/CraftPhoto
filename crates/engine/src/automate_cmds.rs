@@ -24,6 +24,22 @@ fn bad(cmd: &str, msg: impl Into<String>) -> EngineError {
     EngineError::BadParams { cmd: cmd.into(), msg: msg.into() }
 }
 
+/// Photoshop ExtendScript / UXP script suffixes — not PhotoCraft JSON or command lists.
+fn extendscript_ext(path: &str) -> Option<&str> {
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    let dot = name.rfind('.')?;
+    let ext = &name[dot + 1..];
+    let lower = ext.to_ascii_lowercase();
+    matches!(lower.as_str(), "js" | "jsx" | "jsxbin" | "psjs" | "ccjs").then_some(ext)
+}
+
+fn reject_extendscript(cmd: &str, path: &str) -> Result<()> {
+    match extendscript_ext(path) {
+        Some(_) => Err(bad(cmd, "PhotoCraft scripts are JSON or command lists (one command.id {json} per line), not Photoshop ExtendScript (.js/.jsx)")),
+        None => Ok(()),
+    }
+}
+
 /// Session state of the File-menu commands (not saved, not history).
 #[derive(Clone, Debug, Default)]
 pub struct FileMenuState {
@@ -127,6 +143,12 @@ fn run_steps(s: &mut Session, steps: &[(String, Value)]) -> Vec<Value> {
 /// File › Scripts › Browse…: run a script file on the session.
 fn browse(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "file.scripts.browse";
+    if let Some(path) = p.get("path").and_then(Value::as_str) {
+        reject_extendscript(cmd, path)?;
+    }
+    if let Some(name) = p.get("name").and_then(Value::as_str) {
+        reject_extendscript(cmd, name)?;
+    }
     let steps = match (p.get("path").and_then(Value::as_str), p.get("script").and_then(Value::as_str), p.get("steps")) {
         (Some(path), _, _) => parse_script(&String::from_utf8_lossy(&read_file(path)?))?,
         (_, Some(text), _) => parse_script(text)?,

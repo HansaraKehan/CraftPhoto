@@ -12,13 +12,19 @@ entry, so an OpenRaster file with another extension still opens as one.
 |---|---|---|
 | Pixel layers (any size and position, also off-canvas) | yes | yes, cropped to their pixels |
 | Groups, nested | yes | yes |
-| Pass-through groups | `isolation="auto"` without a blend mode | `isolation="auto"` |
+| Pass-through groups | `isolation="auto"` (before 0.0.6, only without a blend mode) | `isolation="auto"` |
 | Names, visibility, opacity | yes | yes |
 | Blend modes | the `svg:*` names, `svg:plus`, and Krita's `krita:*` names | `svg:*` where the spec has the mode, else `krita:*` (read back by Krita, Normal elsewhere) |
 | Locks | `edit-locked`, `alpha-preserve` | the same |
 | 8 and 16-bit | yes (the deepest layer sets the depth) | 8-bit documents as 8-bit PNGs, 16 and 32-bit as 16-bit PNGs |
 | Resolution | `xres` | `xres` and `yres` |
 | Merged image and thumbnail | not read (we render our own) | written (`mergedimage.png`, `Thumbnails/thumbnail.png`) |
+
+Files declaring OpenRaster 0.0.6 or newer default to isolated groups; an explicit
+`isolation="auto"` passes through regardless of the group's own composite operation. Older
+files and files without a recognized version keep the legacy inference from the group's
+blend mode. Pass-through group opacity still uses PhotoCraft's interpolation against the
+backdrop, which can differ from 0.0.6's per-child opacity multiplication for overlapping children.
 
 Saving reports what OpenRaster can't hold, layer by layer: pixel masks are applied to the
 layer's pixels, fill opacity is folded into the pixels, text, shape, fill and smart object layers
@@ -53,7 +59,9 @@ are covered by tests.
 
 Unit tests (`crates/io/src/ora/tests.rs`) round-trip layers, groups, pass-through, offsets,
 opacity, visibility, locks and every blend mode at 8 and 16 bit, check masks, rendered layer
-kinds, the archive layout and malformed input. `crates/automation/tests/openraster.rs` saves,
+kinds, the archive layout and malformed input. Synthetic 8/16-bit pixel fixtures check modern
+and legacy group-isolation defaults, explicit isolation and pass-through.
+`crates/automation/tests/openraster.rs` saves,
 reopens, edits and saves in place through the agent surface, and checks that a document with an
 adjustment layer never overwrites its `.ora`; the CLI test converts both ways.
 

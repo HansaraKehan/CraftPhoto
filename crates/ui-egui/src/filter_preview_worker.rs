@@ -160,7 +160,7 @@ mod tests {
         let (old, result) = finish(&mut worker);
         assert!(result.is_ok());
         let latest = key(1, 0, 256);
-        assert_ne!(old, latest); // The canvas must discard this result before uploading.
+        assert_ne!(old, latest); // The canvas paints this as the drag's frame; the newest one is computed next.
         assert!(worker.start(latest.clone(), ctx, |_| Computed { result: None, ms: 1.0 }).unwrap());
         assert_eq!(finish(&mut worker).0, latest);
     }

@@ -121,6 +121,9 @@ fn warp_layer(doc_sel: Option<&Surface>, group: Locks, l: &mut Layer, w: &Warp, 
     // A selection limits the linked mask exactly as it limits the pixels (#4175, as Free Transform
     // and Perspective Warp do, #3083); a layer that moves whole takes its whole mask along.
     let mask_sel = doc_sel.filter(|_| !crate::transform_cmds::moves_whole(l));
+    // The masks (and so a fill's frame) move, but a fill layer's cached render isn't warped:
+    // drop it, the fill re-renders from its model.
+    l.fill_cache = None;
     match &mut l.content {
         LayerContent::Group(g) => {
             for c in g.children.iter_mut() {

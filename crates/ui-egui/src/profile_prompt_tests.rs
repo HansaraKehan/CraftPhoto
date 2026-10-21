@@ -34,7 +34,7 @@ fn harness(background: bool) -> Harness<'static, PhotocraftApp> {
 fn open_together(h: &mut Harness<'static, PhotocraftApp>, n: usize) {
     let message = "The document “shot.png” has an embedded color profile that does not match the current RGB working space.";
     for _ in 0..n {
-        crate::prefs_ui::open_mismatch(h.state_mut(), message, "preserve", false, "__stacked");
+        crate::prefs_ui::open_mismatch(h.state_mut(), message, "preserve", false, "__stacked", serde_json::json!({}));
     }
     for _ in 0..100 {
         h.run_steps(2);

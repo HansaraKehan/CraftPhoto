@@ -181,16 +181,21 @@ fn screen(doc: Document, setup: &[(&str, serde_json::Value)], name: &str) -> Opt
     let ok2 = ok.clone();
     let setup: Vec<(String, serde_json::Value)> = setup.iter().map(|(a, b)| (a.to_string(), b.clone())).collect();
     let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-        egui_kittest::Harness::builder().with_size(egui::vec2(1000.0, 700.0)).with_pixels_per_point(1.0).with_max_steps(64).wgpu().build_eframe(move |cc| {
-            PhotocraftApp::setup_context(&cc.egui_ctx, Default::default());
-            let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), Default::default());
-            if let Some(rs) = cc.wgpu_render_state.as_ref() {
-                ok2.store(gpu_canvas::supports_f16_canvas(&rs.adapter) && std::env::var("PHOTOCRAFT_CANVAS_F16").as_deref() != Ok("0"), Ordering::SeqCst);
-                app.set_wgpu(rs.clone());
-            }
-            app.session.open_document(doc, None);
-            app
-        })
+        egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .with_pixels_per_point(1.0)
+            .with_max_steps(64)
+            .wgpu_setup(gpu_canvas::wgpu_setup())
+            .build_eframe(move |cc| {
+                PhotocraftApp::setup_context(&cc.egui_ctx, Default::default());
+                let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), Default::default());
+                if let Some(rs) = cc.wgpu_render_state.as_ref() {
+                    ok2.store(gpu_canvas::supports_f16_canvas(&rs.adapter) && std::env::var("PHOTOCRAFT_CANVAS_F16").as_deref() != Ok("0"), Ordering::SeqCst);
+                    app.set_wgpu(rs.clone());
+                }
+                app.session.open_document(doc, None);
+                app
+            })
     }));
     let Ok(mut harness) = built else {
         eprintln!("skipping: no GPU adapter");
@@ -258,4 +263,25 @@ fn thirty_two_bit_preview_exposes_values_above_one() {
     let clipped = enc(dec(1.0) / 8.0) * 255.0;
     eprintln!("shown {got}, want {want:.1} (clipped would be {clipped:.1})");
     assert!((got - want).abs() <= 3.0, "shown {got}, want {want:.1} (clipped {clipped:.1})");
+}
+
+/// A 16-bit canvas whose float textures don't fit the canvas budget (a small graphics card,
+/// #4536) stays on the GPU as `Rgba8Unorm` instead of falling back to the CPU canvas.
+#[test]
+fn sixteen_bit_canvas_too_big_for_floats_stays_on_the_gpu_in_8_bit() {
+    let _gpu = gpu_lock();
+    let Some((g, _rs)) = canvas() else { return };
+    let doc = gradient(SampleType::U16, 512, 256, 0.0, 1.0);
+    let size = [512, 256];
+    let floats = gpu_canvas::canvas_texture_bytes(size, gpu_canvas::DEFAULT_TILE, 8);
+    assert_eq!(g.format_for(SampleType::U16, size), TextureFormat::Rgba16Float, "fits by default");
+    // Room for the 8-bit set, not the float one.
+    g.set_canvas_budget(floats - 1);
+    assert_eq!(g.format_for(SampleType::U16, size), TextureFormat::Rgba8Unorm);
+    assert!(g.fits_canvas(&doc));
+    assert_ne!(g.refresh(doc.id.0, &doc, None, None).kind, gpu_canvas::REFRESH_OVER_BUDGET);
+    assert_eq!(g.texture_info(doc.id.0).map(|(f, _)| f), Some(TextureFormat::Rgba8Unorm));
+    g.set_canvas_budget(floats);
+    assert_eq!(g.format_for(SampleType::U16, size), TextureFormat::Rgba16Float);
+    g.release();
 }

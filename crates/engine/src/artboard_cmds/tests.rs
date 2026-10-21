@@ -146,8 +146,8 @@ fn export_to_files_and_pdf() {
     let r = s.execute("file.export.artboardsToFiles", json!({"dir": d, "prefix": "site"})).unwrap();
     let files: Vec<String> = r["files"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
     assert_eq!(files.len(), 2);
-    assert!(files[0].ends_with("site_Empty_One.png"), "{files:?}");
-    assert!(files[1].ends_with("site_Red Board.png"), "{files:?}");
+    assert!(files[0].ends_with("site_0000_Empty_One.png"), "{files:?}");
+    assert!(files[1].ends_with("site_0001_Red Board.png"), "{files:?}");
     let img = photocraft_io::import("x.png", &std::fs::read(&files[1]).unwrap()).unwrap().document;
     assert_eq!((img.size.width, img.size.height), (10, 10));
     let img2 = photocraft_io::import("x.png", &std::fs::read(&files[0]).unwrap()).unwrap().document;
@@ -329,6 +329,33 @@ fn export_rejects_a_board_too_far_from_the_origin() {
     let one = artboard_document(doc(&s), doc(&s).artboards()[0].0).unwrap().unwrap();
     assert_eq!((one.size.width, one.size.height), (50, 50));
     assert_eq!(one.artboards()[0].2.rect, Rect::new(0, 0, 50, 50));
+}
+
+/// Artboards to Files moves paths, notes, slices and Count/Ruler marks with the board, like its
+/// layers and guides, so they land on the same pixels in the exported file.
+#[test]
+fn artboard_export_moves_paths_notes_slices_and_marks_with_the_board() {
+    use photocraft_doc::{CountGroup, NamedPath, Note, Path, Slice, Subpath};
+    let mut s = session(8);
+    s.execute("layer.new.artboard", json!({"x": 200, "y": 100, "width": 50, "height": 50})).unwrap();
+    s.edit("marks", |d, _| {
+        d.paths.push(NamedPath { name: "P".into(), path: Path::new(vec![Subpath::polygon(&[(210.0, 110.0), (240.0, 110.0), (240.0, 140.0)])]), psd_raw: None });
+        d.work_path = Some(Path::new(vec![Subpath::polygon(&[(205.0, 105.0), (215.0, 105.0), (215.0, 115.0)])]));
+        d.notes.push(Note { position: [220.0, 120.0], popup: [220.0, 120.0, 260.0, 160.0], ..Default::default() });
+        d.slices.list.push(Slice { id: 1, rect: Rect::new(210, 110, 230, 130), ..Default::default() });
+        d.measurement.count_groups.push(CountGroup { points: vec![[225.0, 125.0]], ..Default::default() });
+        Ok(())
+    })
+    .unwrap();
+    let one = artboard_document(doc(&s), doc(&s).artboards()[0].0).unwrap().unwrap();
+    let k = &one.paths[0].path.subpaths[0].knots[0].anchor;
+    assert_eq!((k.x, k.y), (10.0, 10.0));
+    let w = &one.work_path.as_ref().unwrap().subpaths[0].knots[0].anchor;
+    assert_eq!((w.x, w.y), (5.0, 5.0));
+    assert_eq!(one.notes[0].position, [20.0, 20.0]);
+    assert_eq!(one.notes[0].popup, [20.0, 20.0, 60.0, 60.0]);
+    assert_eq!(one.slices.list[0].rect, Rect::new(10, 10, 30, 30));
+    assert_eq!(one.measurement.count_groups[0].points, vec![[25.0, 25.0]]);
 }
 
 /// #1531: a board 40×40 at (10, 10) holding a red square at (10..30)², the artboard active.

@@ -158,3 +158,36 @@ sync_github_name = false
 [people.yeniufuklar-com]
 real_name = "Ufuk Efe"
 sync_github_name = true
+
+[people.nicolasfalesy]
+sync_github_name = true
+
+[people.sidney]
+real_name = "Sidney Markowitz"
+sync_github_name = true
+
+[people.TaylorBurke]
+sync_github_name = true
+
+[people.1Git2Clone]
+sync_github_name = true
+
+[people.Silvertree2010]
+display_name = "Netter"
+sync_github_name = false
+
+[people.Byxis]
+sync_github_name = true
+
+[people.00xJS]
+sync_github_name = true
+
+[people.guillehr2]
+real_name = "Guillem Hermida"
+sync_github_name = true
+
+[people.fjamesprice]
+sync_github_name = true
+
+[people.ha1des]
+sync_github_name = true

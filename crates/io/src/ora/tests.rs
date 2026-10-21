@@ -205,6 +205,84 @@ fn gray16_png(w: u32, h: u32) -> Vec<u8> {
     codecs::encode(&Image::from_raw(w, h, ChannelLayout::Gray, CSample::U16, data).unwrap(), Format::Png, &Default::default()).unwrap()
 }
 
+/// A green Multiply layer over a red backdrop distinguishes isolation (green) from
+/// pass-through (black), even though both groups use Normal compositing by default.
+fn group_isolation_document(version: Option<&str>, attributes: &str, depth: SampleType) -> Document {
+    let version = version.map(|v| format!("version=\"{v}\"")).unwrap_or_default();
+    let xml = format!(
+        r#"<image {version} w="1" h="1"><stack>
+          <stack name="Group" {attributes}>
+            <layer name="Multiply" src="green.png" composite-op="svg:multiply"/>
+          </stack>
+          <layer name="Backdrop" src="red.png"/>
+        </stack></image>"#
+    );
+    let fmt = PixelFormat::new(ColorMode::Rgb, depth, true);
+    let png = |rgba| {
+        let image = Image::from_raw(1, 1, ChannelLayout::Rgba, csample(depth), px(fmt, rgba)).unwrap();
+        codecs::encode(&image, Format::Png, &Default::default()).unwrap()
+    };
+    let bytes = archive(&xml, &[("green.png", png([0.0, 1.0, 0.0, 1.0])), ("red.png", png([1.0, 0.0, 0.0, 1.0]))]);
+    let result = crate::import("isolation.ora", &bytes).unwrap();
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    assert_eq!(result.document.depth, depth);
+    result.document
+}
+
+#[test]
+fn omitted_group_isolation_defaults_to_isolated_since_version_0_0_6() {
+    for depth in [SampleType::U8, SampleType::U16] {
+        for version in ["0.0.6", " 0.0.6 ", "0.0.6+app.1", "0.0.6-rc.1", "0.0.10", "0.1.0", "1.0.0"] {
+            let d = group_isolation_document(Some(version), "", depth);
+            assert_eq!(d.layers[1].blend, BlendMode::Normal, "{version}, {depth:?}");
+            assert_eq!(photocraft_compose::flatten(&d).px, [[0.0, 1.0, 0.0, 1.0]], "{version}, {depth:?}");
+        }
+    }
+}
+
+#[test]
+fn explicit_group_isolation_preserves_isolate_and_auto() {
+    for depth in [SampleType::U8, SampleType::U16] {
+        for version in ["0.0.3", "0.0.5", "0.0.6"] {
+            for (attributes, blend, expected) in [
+                ("isolation=' isolate '", BlendMode::Normal, [0.0, 1.0, 0.0, 1.0]),
+                ("isolation=' auto '", BlendMode::PassThrough, [0.0, 0.0, 0.0, 1.0]),
+                ("isolation='isolate' composite-op='svg:multiply'", BlendMode::Multiply, [0.0, 0.0, 0.0, 1.0]),
+            ] {
+                let d = group_isolation_document(Some(version), attributes, depth);
+                assert_eq!(d.layers[1].blend, blend, "{version}, {attributes}, {depth:?}");
+                assert_eq!(photocraft_compose::flatten(&d).px, [expected], "{version}, {attributes}, {depth:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn auto_group_ignores_its_composite_op_since_version_0_0_6() {
+    for depth in [SampleType::U8, SampleType::U16] {
+        let d = group_isolation_document(Some("0.0.6"), "isolation='auto' composite-op='svg:screen'", depth);
+        assert_eq!(d.layers[1].blend, BlendMode::PassThrough);
+        assert_eq!(photocraft_compose::flatten(&d).px, [[0.0, 0.0, 0.0, 1.0]], "{depth:?}");
+    }
+}
+
+#[test]
+fn legacy_group_isolation_keeps_inference_from_blend_mode() {
+    for depth in [SampleType::U8, SampleType::U16] {
+        for version in [None, Some("0.0.3"), Some("0.0.5"), Some("unknown"), Some("0.0"), Some("0.0.6.0")] {
+            for (attributes, blend, expected) in [
+                ("", BlendMode::PassThrough, [0.0, 0.0, 0.0, 1.0]),
+                ("composite-op='svg:screen'", BlendMode::Screen, [1.0, 1.0, 0.0, 1.0]),
+                ("isolation='auto' composite-op='svg:screen'", BlendMode::Screen, [1.0, 1.0, 0.0, 1.0]),
+            ] {
+                let d = group_isolation_document(version, attributes, depth);
+                assert_eq!(d.layers[1].blend, blend, "{version:?}, {attributes}, {depth:?}");
+                assert_eq!(photocraft_compose::flatten(&d).px, [expected], "{version:?}, {attributes}, {depth:?}");
+            }
+        }
+    }
+}
+
 #[test]
 fn reads_other_applications_stacks() {
     // The shapes Krita, MyPaint and GIMP write: a root stack with attributes, `auto`
@@ -416,6 +494,9 @@ fn lossy_documents() -> Vec<(&'static str, Document)> {
         }),
         ("clipped", with(&|d| d.layers[1].clipped = true)),
         ("fill opacity", with(&|d| d.layers[0].fill_opacity = 0.5)),
+        ("pixel lock", with(&|d| d.layers[0].locks.pixels = true)),
+        // Not the bottom layer: with its transparency lock, `Base` would become the Background.
+        ("position lock", with(&|d| d.layers[1].locks.position = true)),
         ("float", doc(SampleType::F32)),
         ("profile", with(&|d| d.icc_profile = Some(photocraft_cms::Builtin::DisplayP3.profile().to_bytes()))),
         ("metadata", with(&|d| d.metadata.xmp = Some("<x/>".into()))),
@@ -442,6 +523,15 @@ fn plain_documents_lose_nothing() {
         d.icc_profile = Some(photocraft_cms::Builtin::Srgb.profile().to_bytes());
         assert_eq!(losses(&d), Vec::<String>::new(), "{depth:?} tagged sRGB");
         assert_eq!(export(&d).unwrap().warnings, Vec::<String>::new());
+        // OpenRaster's edit-locked and alpha-preserve hold Lock All and Lock Transparent Pixels.
+        d.layers[0].locks.all = true;
+        d.layers[1].locks.transparency = true;
+        assert_eq!(losses(&d), Vec::<String>::new(), "{depth:?} locked");
+        // A Background (every new document's bottom layer) loses nothing for its position lock.
+        d.layers[0].locks.all = false;
+        d.layers[0].locks.position = true;
+        assert!(d.background().is_some());
+        assert_eq!(losses(&d), Vec::<String>::new(), "{depth:?} Background");
     }
     let mut cmyk = doc(SampleType::U8);
     cmyk.mode = ColorMode::Cmyk;

@@ -6,7 +6,7 @@ use egui::{Rect, Sense, Stroke, pos2, vec2};
 use photocraft_doc::{Layer, LayerContent};
 use serde_json::{Value, json};
 
-use crate::props_layout::{LABEL_GAP, LABEL_W, quick_actions_ui, section};
+use crate::props_layout::{LABEL_GAP, LABEL_W, quick_actions_ui, section, stacked_label};
 use crate::theme::{ROW_GAP, Tokens};
 use crate::{PhotocraftApp, widgets};
 
@@ -33,11 +33,10 @@ pub fn transform_params(layer: u64, b: [i32; 4], w: Option<f32>, h: Option<f32>,
     Some(json!({"layer": layer, "rect": b, "quad": quad}))
 }
 
-/// A number field that reports a value once committed (drag released, Enter, focus lost).
-fn field(ui: &mut egui::Ui, id: &str, label: &str, current: f32, width: f32, u: LenUnit, extent: f64) -> Option<f32> {
-    let t = Tokens::get(ui.ctx());
-    let (r, _) = ui.allocate_exact_size(vec2(LABEL_W, 22.0), Sense::hover());
-    ui.painter().text(pos2(r.right() - 2.0, r.center().y), egui::Align2::RIGHT_CENTER, tl!(label), egui::FontId::proportional(12.0), t.text_dim);
+/// A number field that reports a value once committed (drag released, Enter, focus lost). `label` is its own
+/// label and the one stacked with it in the same column ("W" over "X"), which share a centre.
+fn field(ui: &mut egui::Ui, id: &str, label: (&str, &str), current: f32, width: f32, u: LenUnit, extent: f64) -> Option<f32> {
+    stacked_label(ui, tl!(label.0), &[tl!(label.0), tl!(label.1)], LABEL_W, 2.0);
     let key = ui.make_persistent_id(("layer-props-field", id));
     let mut v = ui.data(|d| d.get_temp::<f32>(key)).unwrap_or_else(|| u.shown(f64::from(current), extent));
     let resp = widgets::value_field(ui, &mut v, -300_000.0..=300_000.0, u.unit.suffix(), width);
@@ -137,24 +136,24 @@ pub fn properties(app: &mut PhotocraftApp, ui: &mut egui::Ui, layer: &Layer) {
             let w = ((ui.available_width() - 2.0 * (LABEL_W + LABEL_GAP) - LINK_W - 2.0 * LABEL_GAP) / 2.0).max(36.0);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = LABEL_GAP;
-                if let Some(v) = field(ui, "w", "W", b.width() as f32, w, u, dw) {
+                if let Some(v) = field(ui, "w", ("W", "X"), b.width() as f32, w, u, dw) {
                     run.extend(transform_params(layer.id.0, bb, Some(v), None, linked).map(|p| ("edit.transform".to_string(), p)));
                 }
                 if crate::icons::button(ui, if linked { "link" } else { "unlink" }, LINK_W, linked, tl!("Link width and height")).clicked() {
                     ui.data_mut(|d| d.insert_temp(link_key, !linked));
                 }
-                if let Some(v) = field(ui, "h", "H", b.height() as f32, w, u, dh) {
+                if let Some(v) = field(ui, "h", ("H", "Y"), b.height() as f32, w, u, dh) {
                     run.extend(transform_params(layer.id.0, bb, None, Some(v), linked).map(|p| ("edit.transform".to_string(), p)));
                 }
             });
             ui.add_space(ROW_GAP);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = LABEL_GAP;
-                if let Some(v) = field(ui, "x", "X", b.x0 as f32, w, u, dw) {
+                if let Some(v) = field(ui, "x", ("X", "W"), b.x0 as f32, w, u, dw) {
                     run.push(("layer.translate".into(), json!({"layer": layer.id.0, "dx": (v - b.x0 as f32).round() as i32, "dy": 0})));
                 }
                 ui.add_space(LINK_W + LABEL_GAP);
-                if let Some(v) = field(ui, "y", "Y", b.y0 as f32, w, u, dh) {
+                if let Some(v) = field(ui, "y", ("Y", "H"), b.y0 as f32, w, u, dh) {
                     run.push(("layer.translate".into(), json!({"layer": layer.id.0, "dx": 0, "dy": (v - b.y0 as f32).round() as i32})));
                 }
             });
@@ -279,6 +278,40 @@ mod tests {
             assert_eq!(sections.iter().any(|(title, _)| title == "Gradient Options"), gradient);
             assert!(!sections.iter().any(|(title, _)| title == "Color stops" || title == "Opacity stops"));
         }
+    }
+
+    /// #7314: in the Transform section W sits over X and H over Y, and each pair shares a centre.
+    #[test]
+    fn transform_labels_are_centred_on_each_other() {
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+        app.run("file.new", json!({"width": 200, "height": 120})).unwrap();
+        app.run("layer.new.layer", json!({})).unwrap();
+        app.run("select.rect", json!({"x": 10, "y": 10, "width": 100, "height": 60})).unwrap();
+        app.run("edit.fill", json!({"contents": "color", "color": "#336699"})).unwrap();
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(280.0, 900.0)).build_ui_state(
+            |ui, app: &mut PhotocraftApp| {
+                if ui.ctx().cumulative_pass_nr() == 0 {
+                    PhotocraftApp::setup_context(ui.ctx(), crate::theme::ThemeKind::ProMedium);
+                    return;
+                }
+                let state = app.session.active().unwrap();
+                let layer = state.doc.layer(state.active_layer.unwrap()).unwrap().clone();
+                properties(app, ui, &layer);
+            },
+            app,
+        );
+        h.run_steps(3);
+        let centres: Vec<(String, f32)> = h
+            .output()
+            .shapes
+            .iter()
+            .filter_map(|s| if let egui::Shape::Text(t) = &s.shape { Some(t) } else { None })
+            .filter(|t| t.galley.text().chars().count() == 1)
+            .map(|t| (t.galley.text().to_string(), t.pos.x + t.galley.size().x * 0.5))
+            .collect();
+        let at = |l: &str| centres.iter().find(|(s, _)| s == l).map(|(_, x)| *x).unwrap_or_else(|| panic!("no {l} label in {centres:?}"));
+        assert!((at("W") - at("X")).abs() < 0.01, "W and X: {centres:?}");
+        assert!((at("H") - at("Y")).abs() < 0.01, "H and Y: {centres:?}");
     }
 
     #[test]

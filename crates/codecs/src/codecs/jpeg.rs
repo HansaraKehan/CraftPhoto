@@ -33,6 +33,8 @@ pub(crate) struct JpegMeta {
     pub exif: Option<Vec<u8>>,
     pub xmp: Option<String>,
     pub dpi: Option<(f32, f32)>,
+    /// The APP13 Photoshop image resource blocks (`8BIM` ...), segments joined, without the header.
+    pub photoshop: Option<Vec<u8>>,
     pub adobe_transform: Option<u8>,
     /// (width, height, components) from the first SOFn.
     pub frame: Option<(u32, u32, u8)>,
@@ -108,6 +110,7 @@ pub(crate) fn scan_metadata(b: &[u8]) -> JpegMeta {
         .or_else(|| m.xmp.as_deref().and_then(xmp_resolution))
         .or_else(|| m.exif.as_deref().and_then(exif_resolution))
         .or(jfif_dpi);
+    m.photoshop = Some(photoshop).filter(|p| !p.is_empty());
     if !icc_parts.is_empty() {
         icc_parts.sort_by_key(|p| p.0);
         let total = icc_parts[0].1 as usize;
@@ -226,7 +229,7 @@ pub(crate) fn decode(bytes: &[u8], limits: &Limits) -> Result<Image, CodecError>
     }
     let mut img = Image::from_raw(w, h, layout, SampleType::U8, px)?;
     img.icc = meta.icc;
-    img.meta = Metadata { exif: meta.exif, xmp: meta.xmp, dpi: meta.dpi, ..Default::default() };
+    img.meta = Metadata { exif: meta.exif, xmp: meta.xmp, dpi: meta.dpi, photoshop_resources: meta.photoshop, ..Default::default() };
     if end == DataEnd::Truncated {
         img.warnings.push(DecodeWarning::Truncated { format: F });
     }

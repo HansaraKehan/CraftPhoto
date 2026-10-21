@@ -37,6 +37,10 @@ impl Edge {
     }
 }
 
+/// Polygon coordinates are clamped to `±COORD_LIMIT`: far outside any `i32` pixel rectangle,
+/// and small enough that edge slopes and positions never overflow to infinity or NaN.
+const COORD_LIMIT: f64 = 1e15;
+
 /// A combination step: a component (set of polygons filled with `rule`) and how it folds into
 /// the result so far.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,6 +70,19 @@ impl Rasterizer {
 
     /// Adds a component made of closed polygons (open input is closed implicitly).
     pub fn add_component(&mut self, polys: &[Vec<(f64, f64)>], op: PathOp, rule: FillRule) {
+        self.push_component(polys, op, rule);
+        self.sort_edges();
+    }
+
+    /// Restores the `y0` order of the edges after [`Self::push_component`]. The sort is stable,
+    /// so sorting once after many components orders the edges exactly like sorting after each.
+    pub(crate) fn sort_edges(&mut self) {
+        self.edges.sort_by(|a, b| a.y0.total_cmp(&b.y0));
+    }
+
+    /// [`Self::add_component`] without restoring the edge order: callers adding many components
+    /// sort once at the end with [`Self::sort_edges`].
+    pub(crate) fn push_component(&mut self, polys: &[Vec<(f64, f64)>], op: PathOp, rule: FillRule) {
         let comp = self.comps.len() as u32;
         self.comps.push(Component { op, rule });
         if op != PathOp::Combine && comp != 0 {
@@ -77,11 +94,13 @@ impl Rasterizer {
                 continue;
             }
             for i in 0..n {
-                let a = poly[i];
-                let b = poly[(i + 1) % n];
+                let (a, b) = (poly[i], poly[(i + 1) % n]);
                 if !(a.0.is_finite() && a.1.is_finite() && b.0.is_finite() && b.1.is_finite()) {
                     continue;
                 }
+                // Far beyond any pixel rectangle; keeps edge arithmetic from overflowing.
+                let clamp = |p: (f64, f64)| (p.0.clamp(-COORD_LIMIT, COORD_LIMIT), p.1.clamp(-COORD_LIMIT, COORD_LIMIT));
+                let (a, b) = (clamp(a), clamp(b));
                 self.bounds = Some(match self.bounds {
                     None => (a.0.min(b.0), a.1.min(b.1), a.0.max(b.0), a.1.max(b.1)),
                     Some(bb) => (bb.0.min(a.0.min(b.0)), bb.1.min(a.1.min(b.1)), bb.2.max(a.0.max(b.0)), bb.3.max(a.1.max(b.1))),
@@ -90,10 +109,15 @@ impl Rasterizer {
                     continue;
                 }
                 let (p, q, dir) = if a.1 < b.1 { (a, b, 1) } else { (b, a, -1) };
-                self.edges.push(Edge { x0: p.0, y0: p.1, y1: q.1, dir, comp, dxdy: (q.0 - p.0) / (q.1 - p.1) });
+                let dxdy = (q.0 - p.0) / (q.1 - p.1);
+                // Only a vanishingly short edge has an infinite slope once clamped: like a
+                // horizontal edge it covers no area, and it would turn coverage into NaN.
+                if !dxdy.is_finite() {
+                    continue;
+                }
+                self.edges.push(Edge { x0: p.0, y0: p.1, y1: q.1, dir, comp, dxdy });
             }
         }
-        self.edges.sort_by(|a, b| a.y0.total_cmp(&b.y0));
     }
 
     /// Pixel bounds of everything that may be covered (`None` = nothing; the whole plane
@@ -426,6 +450,43 @@ mod tests {
     fn inverted_empty_is_full() {
         let r = Rasterizer::new(true);
         assert!(r.render(Rect::new(0, 0, 4, 4)).iter().all(|v| *v == 1.0));
+    }
+
+    #[test]
+    fn huge_finite_coordinates_keep_edges_finite() {
+        // The diagonal runs from far left of row 3 to far right of row 4, crossing x = 0 at
+        // y = 4: row 3 is outside the triangle on the canvas, row 4 inside. Its slope used to
+        // overflow to infinity, and the NaN it gave at the edge's top dropped that boundary,
+        // filling row 3 (#5195).
+        let mut r = Rasterizer::new(false);
+        r.add_component(&[vec![(-1e308, 3.0), (1e308, 5.0), (-1e308, 5.0)]], PathOp::Combine, FillRule::NonZero);
+        let c = r.render(Rect::new(0, 0, 10, 8));
+        assert!(c.iter().all(|v| v.is_finite() && (0.0..=1.0).contains(v)));
+        for (y, row) in c.chunks(10).enumerate() {
+            let expect = if y == 4 { 1.0 } else { 0.0 };
+            assert!(row.iter().all(|v| (v - expect).abs() < 1e-3), "row {y}: {row:?}");
+        }
+    }
+
+    #[test]
+    fn sorting_edges_once_matches_sorting_per_component() {
+        // Components sharing top rows (tied `y0`s) and a subtraction: one stable sort at the end
+        // gives the exact edge order (and so the exact bits) of a sort after every component.
+        let comps = [
+            (vec![square(1.0, 1.0, 6.0), vec![(2.5, 1.0), (9.0, 4.0), (3.0, 8.5)]], PathOp::Combine, FillRule::NonZero),
+            (vec![square(3.0, 1.0, 2.5)], PathOp::Subtract, FillRule::EvenOdd),
+            (vec![vec![(0.5, 1.0), (8.0, 1.0), (4.2, 7.7)]], PathOp::Exclude, FillRule::NonZero),
+        ];
+        let (mut each, mut once) = (Rasterizer::new(false), Rasterizer::new(false));
+        for (polys, op, rule) in &comps {
+            each.add_component(polys, *op, *rule);
+            once.push_component(polys, *op, *rule);
+        }
+        once.sort_edges();
+        let rect = Rect::new(0, 0, 10, 10);
+        let (a, b) = (each.render(rect), once.render(rect));
+        assert!(a.iter().zip(&b).all(|(p, q)| p.to_bits() == q.to_bits()));
+        assert!(sum(&a) > 1.0);
     }
 
     #[test]

@@ -67,7 +67,7 @@ camera colour tables were copied.
 
 | Format | Status |
 |---|---|
-| DNG | Uncompressed (8–16 bit, packed or not), Deflate (compression 8, predictors 1 and 2), lossless JPEG and JPEG XL (DNG 1.7, e.g. Samsung Expert RAW; decoded by `jxl-oxide`; not in wasm32 builds, where it is `Unsupported`); strips and tiles; CFA (Bayer) and LinearRaw (three-sample colour, or one-sample monochrome such as Leica Monochrom and film-scanner DNGs, developed as neutral grey with no white balance or colour matrix); LinearizationTable, BlackLevel (+ repeat, DeltaH/V), WhiteLevel, ActiveArea, DefaultCrop, ColorMatrix1/2, CameraCalibration, ForwardMatrix, AnalogBalance, AsShotNeutral / AsShotWhiteXY, BaselineExposure, Orientation, OpcodeList2 GainMap (lens shading) |
+| DNG | Uncompressed (8–16 bit, packed or not), Deflate (compression 8, predictors 1 and 2), lossless JPEG, lossy JPEG (DNG 1.4 compression 34892: 8-bit baseline JPEG tiles or strips, gray for CFA, YCbCr-coded RGB for LinearRaw; decoded by `zune-jpeg`, the stored 8-bit values then go through the same LinearizationTable / BlackLevel / WhiteLevel as every other depth) and JPEG XL (DNG 1.7, e.g. Samsung Expert RAW; decoded by `jxl-oxide`; not in wasm32 builds, where it is `Unsupported`); strips and tiles; CFA (Bayer) and LinearRaw (three-sample colour, or one-sample monochrome such as Leica Monochrom and film-scanner DNGs, developed as neutral grey with no white balance or colour matrix); LinearizationTable, BlackLevel (+ repeat, DeltaH/V), WhiteLevel, ActiveArea, DefaultCrop, ColorMatrix1/2, CameraCalibration, ForwardMatrix, AnalogBalance, AsShotNeutral / AsShotWhiteXY, BaselineExposure, Orientation, OpcodeList2 GainMap (lens shading) |
 | DNG (lossy JPEG, floating point; opcodes other than GainMap; ProfileGainTableMap) | Unsupported / not applied (reported) |
 | CR2 | Lossless JPEG with slices, borders and as-shot white balance from the maker note, black measured on the masked border. CR2 has no CFA tag and the row phase varies by model, so it is measured from the data (the green diagonal), with a Canon model-ID table as the fallback (see `src/cr2.rs`) |
 | CR2 sRAW / mRAW | Unsupported |
@@ -82,6 +82,12 @@ camera colour tables were copied.
 | Fujifilm compressed RAF, early FinePix / SuperCCD RAF (no CFA TIFF) | Unsupported (no public description of the compression); preview fallback |
 | CR3 | Native CRX unsupported; bounded JPEG-track/PRVW preview fallback with CMT1 orientation. I/O labels the result as an 8-bit camera preview |
 | X-Trans and other periodic non-Bayer CFAs (up to 16×16) | Demosaiced by one pattern-agnostic edge-directed method, whatever `Demosaic` is chosen |
+
+Nikon maker-note compression modes 6/10 select checked little-endian packed 12/14-bit
+rows even when TIFF Compression is 34713. The modern lossy `0x44 0x40` curve uses
+its smaller encoded domain while preserving sensor ADUs. Valid Nikon CropArea
+coordinates take precedence over model fallbacks. HE/HE* and lossy-after-split
+remain unsupported. Four pinned CC0 Z6 files cover both bit depths and both paths.
 
 ## Development pipeline
 
@@ -117,7 +123,8 @@ smallest preview at least 512 pixels long, fits and develops in one go.
 Camera Raw's tuned import fits at the default exposure and as-shot white balance first,
 then applies the user's Exposure, Temperature and Tint to that same rendering.
 The D5100's measured image area is 4928 × 3264 at (8, 8) in a 4992 × 3280
-sensor plane; it removes the border without changing levels, WB or calibration.
+sensor plane; the D90's is 4288 × 2848 at (10, 10) in a 4352 × 2868 plane; each
+removes the border without changing levels, WB or calibration.
 Measured image areas preserve an explicit file crop.
 
 For a slightly tighter camera JPEG, fitting can align the reference proxy using a bounded

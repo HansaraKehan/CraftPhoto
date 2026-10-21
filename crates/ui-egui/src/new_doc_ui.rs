@@ -633,7 +633,7 @@ pub fn body(app: &mut crate::PhotocraftApp, ui: &mut egui::Ui, f: &mut Map<Strin
             small_label(ui, tl!("Width"));
             ui.horizontal(|ui| {
                 let mut w = shown_size(f, "width", 1920.0, &unit, ppi);
-                if widgets::value_field_units(ui, &mut w, 0.01..=300_000.0, 110.0, widgets::unit_decimals(&unit), units).changed() {
+                if widgets::value_field_units(ui, &mut w, 0.0..=300_000.0, 110.0, widgets::unit_decimals(&unit), units).changed() {
                     set_size(f, "width", w, &unit, ppi);
                 }
                 let opts: Vec<(String, &str)> = UNITS.iter().map(|u| (u.0.to_string(), u.1)).collect();
@@ -645,7 +645,7 @@ pub fn body(app: &mut crate::PhotocraftApp, ui: &mut egui::Ui, f: &mut Map<Strin
             small_label(ui, tl!("Height"));
             ui.horizontal(|ui| {
                 let mut h = shown_size(f, "height", 1080.0, &unit, ppi);
-                if widgets::value_field_units(ui, &mut h, 0.01..=300_000.0, 110.0, widgets::unit_decimals(&unit), units).changed() {
+                if widgets::value_field_units(ui, &mut h, 0.0..=300_000.0, 110.0, widgets::unit_decimals(&unit), units).changed() {
                     set_size(f, "height", h, &unit, ppi);
                 }
                 ui.add_space(6.0);
@@ -794,6 +794,30 @@ mod tests {
         set_size(&mut f, "width", 300_000.0, "mm", 72.0);
         assert_eq!(command_params(&f)["width"], json!(300_000));
         assert_eq!(shown_size(&f, "width", 1920.0, "mm", 72.0), to_unit(300_000.0, "mm", 72.0));
+    }
+
+    /// #5661: 1 px at 300 ppi is 0.0033 in. Showing it in inches clamped the field to 0.01 in and
+    /// turned the width into 3 px without an edit.
+    #[test]
+    fn tiny_size_in_inches_is_not_changed_by_showing_it() {
+        use egui_kittest::Harness;
+        let app = crate::PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+        let mut f = crate::state::UiState::new_document_fields();
+        for (k, v) in [("width", json!(1)), ("height", json!(1)), ("resolution", json!(300.0)), ("__unit", json!("in"))] {
+            f.insert(k.into(), v);
+        }
+        let mut h = Harness::builder().with_size(vec2(1200.0, 800.0)).build_ui_state(
+            |ui, (app, f): &mut (crate::PhotocraftApp, Map<String, Value>)| {
+                if ui.ctx().fonts(|f| f.families().contains(&egui::FontFamily::Name("medium".into()))) {
+                    body(app, ui, f);
+                }
+            },
+            (app, f),
+        );
+        crate::PhotocraftApp::setup_context(&h.ctx, crate::theme::ThemeKind::ALL[0]);
+        h.run_steps(3);
+        let p = command_params(&h.state().1);
+        assert_eq!((p["width"].as_u64(), p["height"].as_u64()), (Some(1), Some(1)));
     }
 
     /// #1147: the Orientation buttons swap the typed values too: 841 x 1189 mm becomes 1189 x 841.

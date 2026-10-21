@@ -6,7 +6,7 @@ use std::fmt;
 
 use crate::format::{Format, caps};
 use crate::image::{ChannelLayout, Image, SampleType};
-use crate::options::EncodeOptions;
+use crate::options::{DdsCompression, EncodeOptions};
 
 /// Something that will be lost or altered when writing an image to a format.
 #[derive(Debug, Clone, PartialEq)]
@@ -28,6 +28,10 @@ pub enum FidelityWarning {
     AlphaBinarized,
     /// CMYK data will be converted (naively, not colour-managed) to another model.
     CmykConverted {
+        to: ChannelLayout,
+    },
+    /// L*a*b* data will be converted to another model (sRGB, D50 to D65).
+    LabConverted {
         to: ChannelLayout,
     },
     /// Colour data will be reduced to grayscale.
@@ -84,6 +88,7 @@ impl fmt::Display for FidelityWarning {
             CmykConverted { to } => {
                 write!(f, "CMYK will be converted to {to:?} (not colour-managed)")
             }
+            LabConverted { to } => write!(f, "Lab will be converted to {to:?} (sRGB)"),
             ColorToGray => write!(f, "colour will be converted to grayscale"),
             PaletteQuantized => write!(f, "colours will be quantized to a 256-colour palette"),
             LossyCompression => write!(f, "lossy compression"),
@@ -129,8 +134,8 @@ fn pick_layout(src: ChannelLayout, layouts: &[ChannelLayout], alpha: bool) -> Ch
     if layouts.contains(&cand) {
         return cand;
     }
-    // CMYK falls back to RGB; gray expands to RGB.
-    if cand.is_cmyk() || cand.is_gray() {
+    // CMYK and Lab fall back to RGB; gray expands to RGB.
+    if cand.is_cmyk() || cand.is_lab() || cand.is_gray() {
         cand = if cand.has_alpha() { ChannelLayout::Rgba } else { ChannelLayout::Rgb };
     }
     if layouts.contains(&cand) {
@@ -158,6 +163,10 @@ pub(crate) fn plan(image: &Image, format: Format, opts: &EncodeOptions) -> Plan 
             layout: if layout == ChannelLayout::GrayA { ChannelLayout::Gray } else { pick_layout(layout, c.layouts, c.alpha) },
             sample: crate::codecs::dpx::plan_sample(opts.dpx_bits, sample),
         },
+        // CIELab has no float form: float Lab is written with 16 bits.
+        Format::Tiff if layout.is_lab() && sample.is_float() => Plan { layout: pick_layout(layout, c.layouts, c.alpha), sample: SampleType::U16 },
+        // A block-compressed DDS stores RGBA whatever the source; uncompressed keeps gray and RGB.
+        Format::Dds if opts.dds.compression.is_block() => Plan { layout: ChannelLayout::Rgba, sample: SampleType::U8 },
         _ => Plan { layout: pick_layout(layout, c.layouts, c.alpha), sample: pick_sample(sample, c.depths) },
     }
 }
@@ -195,7 +204,8 @@ pub fn fidelity_warnings_with(image: &Image, format: Format, opts: &EncodeOption
     if lossy_depth {
         w.push(W::DepthReduced { from: ss, to: p.sample });
     }
-    if ss.is_float() && !p.sample.is_float() && image.has_out_of_range() {
+    // FITS stores floats as 0..1 (see `codecs::fits`), so out-of-range values are clipped too.
+    if ss.is_float() && (!p.sample.is_float() || format == Format::Fits) && image.has_out_of_range() {
         w.push(W::RangeClipped);
     }
 
@@ -203,11 +213,15 @@ pub fn fidelity_warnings_with(image: &Image, format: Format, opts: &EncodeOption
     if sl.has_alpha() && !p.layout.has_alpha() && image.has_translucency() {
         w.push(W::AlphaDiscarded);
     }
-    if format == Format::Gif && p.layout.has_alpha() && image.has_translucency() {
+    let binary_alpha = format == Format::Gif || (format == Format::Dds && opts.dds.compression == DdsCompression::Bc1);
+    if binary_alpha && p.layout.has_alpha() && image.has_translucency() {
         w.push(W::AlphaBinarized);
     }
     if sl.is_cmyk() && !p.layout.is_cmyk() {
         w.push(W::CmykConverted { to: p.layout });
+    }
+    if sl.is_lab() && !p.layout.is_lab() {
+        w.push(W::LabConverted { to: p.layout });
     }
     if !sl.is_gray() && p.layout.is_gray() {
         w.push(W::ColorToGray);
@@ -216,7 +230,7 @@ pub fn fidelity_warnings_with(image: &Image, format: Format, opts: &EncodeOption
     // Compression
     if format == Format::Gif {
         w.push(W::PaletteQuantized);
-    } else if c.lossy || (format == Format::WebP && !opts.webp_lossless) {
+    } else if c.lossy || (format == Format::WebP && !opts.webp_lossless) || (format == Format::Dds && opts.dds.compression.is_block()) {
         w.push(W::LossyCompression);
     }
 

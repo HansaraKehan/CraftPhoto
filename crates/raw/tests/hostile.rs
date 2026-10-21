@@ -49,6 +49,21 @@ fn samples() -> Vec<Vec<u8>> {
     out.push(m.build());
     m.storage = DngStorage::DeflateStrips { rows: 5, predictor: 2 };
     out.push(m.build());
+    // Lossy DNG (compression 34892): 8-bit baseline JPEG tiles of a CFA, and strips of LinearRaw RGB.
+    let mut l = DngSpec::cfa(w, h, cfa.iter().map(|&v| ((u32::from(v) - 64) * 255 / (4000 - 64)) as u16).collect());
+    l.bits = 8;
+    l.white = 255;
+    l.storage = DngStorage::LossyJpegTiles { width: 16, height: 8 };
+    l.active_area = Some([1, 2, 11, 22]);
+    out.push(l.build());
+    let rgb8: Vec<u16> = scene(w, h).iter().flat_map(|p| p.map(|v| (v * 255.0) as u16)).collect();
+    let mut l = DngSpec::cfa(w, h, rgb8);
+    l.samples = 3;
+    l.bits = 8;
+    l.white = 255;
+    l.linearization = Some((0..256u32).map(|v| (v * v / 4) as u16).collect());
+    l.storage = DngStorage::LossyJpegStrips { rows: 5 };
+    out.push(l.build());
     let mut data = vec![600u16; 40 * 10];
     for (i, v) in data.iter_mut().enumerate() {
         *v = 600 + (i as u16 * 7) % 3000;

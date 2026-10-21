@@ -27,6 +27,15 @@ const MIN_SPEED_STEP: f64 = 0.5;
 /// Maximum airbrush catch-up dabs for one input segment.
 const MAX_AIRBRUSH_DABS_PER_SEGMENT: usize = 512;
 
+/// The dab centre of the pixel-grid cell holding `v` (see [`PathWalker::pixel_grid`]): the
+/// pixel's centre for `offset` 0.5, the nearest pixel corner for 0. A value within rounding
+/// noise of a cell boundary counts as on it, so a line lands on the same pixels both ways.
+fn grid_cell(v: f64, offset: f64) -> f64 {
+    let w = v - offset + 0.5;
+    let w = if (w - w.round()).abs() < 1e-7 { w.round() } else { w };
+    w.floor() + offset
+}
+
 #[inline]
 fn lerp_pt(a: &StrokePoint, b: &StrokePoint, f: f64) -> StrokePoint {
     let ff = f as f32;
@@ -45,6 +54,27 @@ fn lerp_pt(a: &StrokePoint, b: &StrokePoint, f: f64) -> StrokePoint {
 // ---------------------------------------------------------------------------
 // Smoothing
 // ---------------------------------------------------------------------------
+
+/// The smoothed brush moved `f` of the way from `brush` towards the pointer `p`. Its pose
+/// (pressure, tilt, rotation, wheel) moves with it, so the lagging brush paints with the pose the
+/// pen had along the way, not the pointer's newest one. Taking the pointer's pressure made a fast
+/// stroke's lift thin the brush while it still trailed far behind, and the end catch-up a hairline
+/// (#5713). Time is the pointer's.
+fn pull(brush: &StrokePoint, p: &StrokePoint, f: f64) -> StrokePoint {
+    let ff = f as f32;
+    // Barrel rotation takes the shorter way round.
+    let dr = (p.rotation - brush.rotation + 540.0).rem_euclid(360.0) - 180.0;
+    StrokePoint {
+        x: brush.x + (p.x - brush.x) * f,
+        y: brush.y + (p.y - brush.y) * f,
+        pressure: brush.pressure + (p.pressure - brush.pressure) * ff,
+        tilt_x: brush.tilt_x + (p.tilt_x - brush.tilt_x) * ff,
+        tilt_y: brush.tilt_y + (p.tilt_y - brush.tilt_y) * ff,
+        rotation: (brush.rotation + dr * ff).rem_euclid(360.0),
+        wheel: brush.wheel + (p.wheel - brush.wheel) * ff,
+        time: p.time,
+    }
+}
 
 /// Incremental stroke smoothing: exponential (with optional time-based catch-up) or pulled string.
 #[derive(Clone, Debug)]
@@ -87,7 +117,7 @@ impl Smoother {
             let d = (dx * dx + dy * dy).sqrt();
             if d > len {
                 let k = (d - len) / d;
-                let np = StrokePoint { x: pos.x + dx * k, y: pos.y + dy * k, ..p };
+                let np = pull(&pos, &p, k);
                 self.pos = Some(np);
                 out.push(np);
             }
@@ -113,7 +143,7 @@ impl Smoother {
         };
         let mut cur = pos;
         for _ in 0..iters {
-            cur = StrokePoint { x: cur.x + (p.x - cur.x) * step, y: cur.y + (p.y - cur.y) * step, ..p };
+            cur = pull(&cur, &p, step);
             out.push(cur);
         }
         self.pos = Some(cur);
@@ -216,10 +246,14 @@ impl PathWalker {
     }
 
     /// Step pixel by pixel instead of by distance: one step per pixel along the segment's major
-    /// axis, on the line between the pixels holding its ends, each at the pixel's dab centre
-    /// (`offset` 0.5 for odd tip diameters, 0 for even ones, as `render::grid_center` snaps). A
-    /// small aliased tip (the Pencil) then draws a clean 8-connected staircase: stepping by
-    /// distance put two dabs in a row wherever the line crossed a pixel corner (#2139).
+    /// axis, each at the dab centre (`offset` 0.5 for odd tip diameters, 0 for even ones, as
+    /// `render::grid_center` snaps) of the pixel the segment's line crosses at that column (or
+    /// row, when steep). A small aliased tip (the Pencil) then draws a clean 8-connected
+    /// staircase: stepping by distance put two dabs in a row wherever the line crossed a pixel
+    /// corner (#2139). The line is sampled where it really runs, not between the pixels holding
+    /// the segment's ends, so a straight line split into pieces (by Smoothing, or the pointer
+    /// samples of a ⇧-drag) paints the pixels of the whole line, whichever end it starts from
+    /// (#6336).
     pub fn pixel_grid(mut self, offset: f64) -> Self {
         self.grid = Some(offset);
         self
@@ -228,19 +262,24 @@ impl PathWalker {
     /// Emits the pixel steps from `a` to `p` (see [`PathWalker::pixel_grid`]). False, emitting
     /// nothing, when the span is not finite or implausibly long: distance spacing takes over.
     fn grid_steps(&mut self, a: &StrokePoint, p: &StrokePoint, offset: f64, out: &mut impl FnMut(StepInput)) -> bool {
-        let cell = |v: f64| if offset > 0.0 { v.floor() } else { v.round() };
-        let (x0, y0) = (cell(a.x), cell(a.y));
-        let (dx, dy) = (cell(p.x) - x0, cell(p.y) - y0);
-        let n = dx.abs().max(dy.abs());
-        if !n.is_finite() || n > MAX_GRID_STEPS {
+        // The pieces of a 45° line differ in rounding noise: keep them all on one major axis.
+        let steep = (p.y - a.y).abs() > (p.x - a.x).abs() * (1.0 + 1e-9);
+        let (am, an, pm, pn) = if steep { (a.y, a.x, p.y, p.x) } else { (a.x, a.y, p.x, p.y) };
+        let (m0, m1) = (grid_cell(am, offset), grid_cell(pm, offset));
+        let (dm, dn) = (pm - am, pn - an);
+        let n = (m1 - m0).abs();
+        if !(n.is_finite() && dn.is_finite()) || n > MAX_GRID_STEPS || dm == 0.0 {
             return false;
         }
-        let steps = n as u64;
-        for i in 1..=steps {
-            let i = i as f64;
-            let mut q = lerp_pt(a, p, i / n);
-            q.x = x0 + (dx * i / n).round() + offset;
-            q.y = y0 + (dy * i / n).round() + offset;
+        let dir = (m1 - m0).signum();
+        for i in 1..=n as u64 {
+            let c = m0 + dir * i as f64;
+            // The last column's centre can sit up to half a pixel past `p`: the line goes on to
+            // it, so the next piece of a straight line picks up where this one left off.
+            let t = (c - am) / dm;
+            let mut q = lerp_pt(a, p, t.clamp(0.0, 1.0));
+            let cn = grid_cell(an + dn * t, offset);
+            (q.x, q.y) = if steep { (cn, c) } else { (c, cn) };
             self.emit(q, out);
         }
         true
@@ -356,6 +395,16 @@ pub fn control_value(c: Control, fade_steps: u32, s: &StepInput) -> f32 {
     }
 }
 
+/// A dynamic's control value passed through its own response curve ([`Dynamic::curve`]). Controls
+/// with no 0..1 input (Off, the direction controls) read 1 and skip the curve.
+pub fn dynamic_value(d: &Dynamic, s: &StepInput) -> f32 {
+    let v = control_value(d.control, d.fade_steps, s);
+    match d.control {
+        Control::Off | Control::InitialDirection | Control::Direction => v,
+        Control::Fade | Control::PenPressure | Control::PenTilt | Control::StylusWheel | Control::Rotation => d.curve.eval(v),
+    }
+}
+
 /// Angle contributed by a control, in degrees (counter-clockwise).
 pub fn control_angle(c: Control, fade_steps: u32, s: &StepInput) -> f32 {
     let p = &s.point;
@@ -384,7 +433,7 @@ fn scalar(d: &Dynamic, s: &StepInput, r: f32) -> f32 {
         return 1.0;
     }
     let min = d.minimum.clamp(0.0, 1.0);
-    let cv = control_value(d.control, d.fade_steps, s);
+    let cv = dynamic_value(d, s);
     let v = (min + (1.0 - min) * cv) * (1.0 - d.jitter.clamp(0.0, 1.0) * r);
     v.max(min)
 }
@@ -425,7 +474,7 @@ pub fn dynamic_color(b: &BrushSettings, s: &StepInput, seed: u64, index: u64) ->
     let cd = &b.color_dynamics;
     let (fg, bg) = (b.color, b.background);
     let r = |st: u64| rand01(seed, index, st);
-    let base = if cd.fg_bg.control != Control::Off { 1.0 - control_value(cd.fg_bg.control, cd.fg_bg.fade_steps, s) } else { 0.0 };
+    let base = if cd.fg_bg.control != Control::Off { 1.0 - dynamic_value(&cd.fg_bg, s) } else { 0.0 };
     let t = (base + (1.0 - base) * cd.fg_bg.jitter.clamp(0.0, 1.0) * r(stream::FG_BG)).clamp(0.0, 1.0);
     let rgb = [fg[0] + (bg[0] - fg[0]) * t, fg[1] + (bg[1] - fg[1]) * t, fg[2] + (bg[2] - fg[2]) * t];
     let [mut h, mut sat, mut v] = rgb_to_hsv(rgb);
@@ -444,7 +493,7 @@ pub fn base_diameter(b: &BrushSettings, s: &StepInput) -> f32 {
     let mut f = 1.0;
     if sd.enabled && sd.size.control != Control::Off {
         let min = sd.size.minimum.clamp(0.0, 1.0);
-        f = min + (1.0 - min) * control_value(sd.size.control, sd.size.fade_steps, s);
+        f = min + (1.0 - min) * dynamic_value(&sd.size, s);
     } else if b.pressure_size {
         f = s.point.pressure.clamp(0.0, 1.0);
     }
@@ -530,7 +579,7 @@ impl DabBuilder {
             // Scatter.
             let mut c = Point::new(s.point.x, s.point.y);
             if sc.enabled && sc.scatter.jitter > 0.0 {
-                let cv = control_value(sc.scatter.control, sc.scatter.fade_steps, s);
+                let cv = dynamic_value(&sc.scatter, s);
                 let amt = f64::from(sc.scatter.jitter * cv * radius);
                 let (ox, oy) = (rand_signed(seed, i, stream::SCATTER_X) as f64 * amt, rand_signed(seed, i, stream::SCATTER_Y) as f64 * amt);
                 if sc.both_axes {

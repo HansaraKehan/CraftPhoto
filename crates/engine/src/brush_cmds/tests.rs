@@ -371,6 +371,57 @@ fn resizing_a_brush_resizes_its_enabled_secondary_tip() {
     assert_eq!((s.tools.brush.size, s.tools.brush.dual_brush.size), (40.0, 9.0));
 }
 
+/// Every way of changing the main size scales the Dual Brush tip as Photoshop does (#4809): `[` /
+/// `]`, the options bar / Brushes panel / Alt+right-drag (`tools.setBrush` with only a size), down
+/// to 1 px and back without losing the proportion to a floor.
+#[test]
+fn every_size_change_scales_the_dual_tip_and_keeps_its_proportion() {
+    let mut s = session(32, 32);
+    s.execute("tools.setBrush", json!({"brush": {"size": 100, "dualBrush": {"enabled": true, "size": 20}}})).unwrap();
+    let sizes = |s: &Session| (s.tools.brush.size, s.tools.brush.dual_brush.size);
+    s.execute("tools.decreaseBrushSize", json!({})).unwrap();
+    assert_eq!(sizes(&s), (80.0, 16.0));
+    s.execute("tools.increaseBrushSize", json!({})).unwrap();
+    assert_eq!(sizes(&s), (100.0, 20.0));
+    // A coalesced drag (options bar slider, Alt+right-drag) is a run of size-only patches.
+    for size in [60, 10, 1] {
+        s.execute("tools.setBrush", json!({"brush": {"size": size}, "coalesce": "drag"})).unwrap();
+    }
+    assert_eq!(s.tools.brush.size, 1.0);
+    assert!((s.tools.brush.dual_brush.size - 0.2).abs() < 1e-5, "no 0.5 px floor: {}", s.tools.brush.dual_brush.size);
+    s.execute("tools.setBrush", json!({"brush": {"size": 100}})).unwrap();
+    assert_eq!(s.tools.brush.size, 100.0);
+    assert!((s.tools.brush.dual_brush.size - 20.0).abs() < 1e-3, "back to 20 px: {}", s.tools.brush.dual_brush.size);
+    // Painting with the sub-pixel dual tip works (the renderer bounds it).
+    s.execute("tools.setBrush", json!({"brush": {"size": 1}})).unwrap();
+    s.execute("paint.stroke", json!({"points": [[4, 16], [28, 16]]})).unwrap();
+}
+
+/// Picking a preset that captured its size sets both diameters from the preset: the dual tip is
+/// not scaled on top of that.
+#[test]
+fn a_captured_preset_size_is_not_scaled_twice() {
+    let mut s = session(32, 32);
+    s.execute("tools.setBrush", json!({"size": 40, "dualBrush": {"enabled": true, "size": 10}})).unwrap();
+    s.execute("brush.presets.save", json!({"name": "Dual40"})).unwrap();
+    s.execute("tools.setBrush", json!({"size": 200})).unwrap();
+    assert_eq!(s.tools.brush.dual_brush.size, 50.0);
+    s.execute("tools.setBrush", json!({"preset": "Dual40"})).unwrap();
+    assert_eq!((s.tools.brush.size, s.tools.brush.dual_brush.size), (40.0, 10.0));
+}
+
+#[test]
+fn bad_sizes_fail_and_leave_the_dual_tip_alone() {
+    let mut s = session(32, 32);
+    s.execute("tools.setBrush", json!({"brush": {"size": 100, "dualBrush": {"enabled": true, "size": 20}}})).unwrap();
+    for bad in [json!(1e30), json!("big"), json!([1]), json!({"x": 1}), json!(null)] {
+        let _ = s.execute("tools.setBrush", json!({"brush": {"size": bad}}));
+        assert_eq!(s.tools.brush.dual_brush.size, 20.0, "{bad}");
+        assert_eq!(s.tools.brush.size, 100.0, "{bad}");
+    }
+    assert!(s.execute("tools.setBrush", json!({"brush": {"size": 1e30}})).is_err());
+}
+
 #[test]
 fn an_uncaptured_preset_size_keeps_dual_brush_proportions() {
     let mut s = session(32, 32);
@@ -440,6 +491,26 @@ fn define_brush_from_selection() {
     s.execute("select.deselect", json!({})).unwrap();
     s.execute("paint.stroke", json!({"points": [[30, 32]], "color": "#ff0000"})).unwrap();
     assert!(rgba(&s, 30, 32)[3] > 0.9);
+}
+
+#[test]
+fn define_brush_from_selection_survives_allocation_failure() {
+    // The sampled tip is one f32 buffer over the whole selection, and the selection mask is a
+    // second of the same size. Both are reserved through the fallible allocator, so an allocation
+    // failure must be a graceful error (brush, presets, history and document untouched), never a
+    // panic or an OOM abort.
+    let mut s = session(40, 40);
+    s.execute("select.rect", json!({"x": 5, "y": 5, "width": 20, "height": 20})).unwrap();
+    let brush_before = s.tools.brush.clone();
+    let presets_before = s.tools.presets.clone();
+    let history_before = s.active().unwrap().history.past_len();
+    crate::allocation::fail_next_for_test();
+    let result = s.execute("brush.defineFromSelection", json!({"name": "Blob"}));
+    let _ = crate::allocation::capacity::<u8>(0, "reset failpoint");
+    assert!(result.is_err(), "an allocation failure must be reported, not panic");
+    assert_eq!(s.tools.brush, brush_before, "the current brush is unchanged");
+    assert_eq!(s.tools.presets, presets_before, "the preset list is unchanged");
+    assert_eq!(s.active().unwrap().history.past_len(), history_before, "no history step was recorded");
 }
 
 #[test]
@@ -743,6 +814,101 @@ fn mixer_brush_uses_the_brush_mixer_settings() {
     assert!(rgba(&s, 190, 5)[3] > 0.95);
 }
 
+/// A red image with an empty layer above it, a blue foreground, and a Mixer Brush that samples all
+/// layers, keeps its paint along the stroke (Load 100 %) and has the automatic Load off.
+fn mixer_over_red() -> Session {
+    let mut s = session(200, 30);
+    s.execute("edit.fill", json!({"color": "#ff0000"})).unwrap();
+    s.execute("layer.new.layer", json!({})).unwrap();
+    s.execute("tools.setColors", json!({"foreground": "#0000ff"})).unwrap();
+    let mixer = json!({"load": 1, "sampleAllLayers": true, "loadAfterStroke": false});
+    s.execute("tools.setBrush", json!({"brush": {"pressureSize": false, "spacing": 0.25, "mixer": mixer}})).unwrap();
+    s
+}
+
+fn mixer_row(s: &mut Session, y: i32) -> [f32; 4] {
+    s.execute("paint.mixerBrush", json!({"points": [[5, y], [195, y]], "size": 6})).unwrap();
+    rgba(s, 100, y)
+}
+
+#[test]
+fn clean_brush_keeps_the_foreground_out_of_the_next_stroke() {
+    let mut s = mixer_over_red();
+    s.execute("brush.mixer.load", json!({})).unwrap();
+    let state = s.execute("brush.mixer.clean", json!({})).unwrap();
+    assert_eq!((state["reservoir"].clone(), state["pickup"].clone()), (Value::Null, Value::Null));
+    let c = mixer_row(&mut s, 15);
+    assert!(c[3] > 0.1 && c[0] > 0.99 && c[2] < 0.01, "the clean brush lays down only the red it picks up: {c:?}");
+}
+
+#[test]
+fn the_automatic_clean_empties_the_reservoir() {
+    let mut s = mixer_over_red();
+    // The brush was never loaded, so the first stroke takes the foreground.
+    assert!(mixer_row(&mut s, 5)[2] > 0.2);
+    assert_eq!((s.tools.mixer.reservoir, s.tools.mixer.pickup), (None, None));
+    let c = mixer_row(&mut s, 15);
+    assert!(c[3] > 0.1 && c[2] < 0.01, "the cleaned brush lays down no blue: {c:?}");
+    // With the automatic Load on as well (the default), the brush is cleaned and then refilled
+    // after the stroke, so the next one starts with a full reservoir and no pickup.
+    s.execute("tools.setBrush", json!({"brush": {"mixer": {"loadAfterStroke": true}}})).unwrap();
+    mixer_row(&mut s, 25);
+    assert_eq!((s.tools.mixer.reservoir, s.tools.mixer.amount, s.tools.mixer.pickup), (Some([0.0, 0.0, 1.0, 1.0]), 1.0, None));
+}
+
+#[test]
+fn load_brush_after_a_clean_paints_the_foreground_again() {
+    let mut s = mixer_over_red();
+    s.execute("brush.mixer.clean", json!({})).unwrap();
+    assert!(mixer_row(&mut s, 5)[2] < 0.01);
+    let state = s.execute("brush.mixer.load", json!({})).unwrap();
+    assert_eq!(state["reservoir"], json!([0.0, 0.0, 1.0, 1.0]));
+    assert!(mixer_row(&mut s, 15)[2] > 0.2, "the loaded brush paints blue");
+    // A color param loads that color instead of the foreground, and the next stroke paints it.
+    s.execute("brush.mixer.load", json!({"color": [0.0, 1.0, 0.0]})).unwrap();
+    assert_eq!((s.tools.mixer.reservoir, s.tools.mixer.amount), (Some([0.0, 1.0, 0.0, 1.0]), 1.0));
+    assert_eq!(s.tools.mixer.next_load(s.tools.foreground), Some([0.0, 1.0, 0.0, 1.0]));
+    let c = mixer_row(&mut s, 25);
+    assert!(c[1] > 0.2 && c[2] < 0.01, "the stroke paints the loaded green, not the blue foreground: {c:?}");
+}
+
+#[test]
+fn with_the_automatic_load_off_a_new_foreground_loads_at_the_next_stroke() {
+    let mut s = mixer_over_red();
+    assert!(mixer_row(&mut s, 5)[2] > 0.2);
+    s.execute("tools.setColors", json!({"foreground": "#00ff00"})).unwrap();
+    let c = mixer_row(&mut s, 15);
+    assert!(c[1] > 0.2, "the new foreground is loaded: {c:?}");
+    // The automatic Clean emptied it again, and the foreground did not change.
+    let c = mixer_row(&mut s, 25);
+    assert!(c[3] > 0.1 && c[1] < 0.01 && c[2] < 0.01, "{c:?}");
+}
+
+#[test]
+fn load_and_clean_brush_refuse_bad_params_and_keep_the_paint() {
+    let mut s = mixer_over_red();
+    s.execute("brush.mixer.load", json!({"color": "#336699"})).unwrap();
+    let before = s.tools.mixer.clone();
+    for bad in [
+        json!({"color": 5}),
+        json!({"color": "#zz0000"}),
+        json!({"color": "#ff"}),
+        json!({"color": [2, 0, 0]}),
+        json!({"color": [0, 0]}),
+        json!({"color": [0, 0, 0, 0, 0]}),
+        json!({"color": {"r": 1}}),
+        json!({"color": ["a", 0, 0]}),
+    ] {
+        assert!(s.execute("brush.mixer.load", bad.clone()).is_err(), "{bad}");
+        assert_eq!(s.tools.mixer, before, "{bad}");
+    }
+    // Clean Brush takes no params, so anything extra is ignored, without a document too.
+    let mut empty = Session::new();
+    empty.execute("brush.mixer.clean", json!({"color": [], "junk": {"x": null}})).unwrap();
+    empty.execute("brush.mixer.load", json!({"color": null})).unwrap();
+    assert_eq!(empty.tools.mixer.reservoir, Some(empty.tools.foreground));
+}
+
 #[test]
 fn coalesced_set_brush_calls_journal_once_per_gesture() {
     let mut s = session(20, 20);
@@ -940,6 +1106,23 @@ fn an_offer_that_does_not_match_the_commit_is_ignored() {
     other["points"] = json!([[5.0, 5.0, 1.0], [40.0, 5.0, 1.0]]);
     let r = s.execute("paint.stroke", other).unwrap();
     assert!(r.get("fromLive").is_none());
+}
+
+#[test]
+fn set_brush_takes_a_per_dynamic_curve_and_a_patch_resets_it() {
+    let mut s = session(20, 20);
+    let curve = json!([[0.0, 0.0], [0.5, 0.2], [1.0, 1.0]]);
+    s.execute("tools.setBrush", json!({"shapeDynamics": {"enabled": true, "size": {"control": "penPressure", "curve": curve}}})).unwrap();
+    let with = s.tools.brush.clone();
+    assert_eq!(with.shape_dynamics.size.curve.points(), vec![[0.0, 0.0], [0.5, 0.2], [1.0, 1.0]]);
+    assert!(with.transfer.opacity.curve.is_linear(), "other dynamics keep their own curve");
+    // The panel's diff back to linear is a real patch, and applying it restores the linear curve.
+    let mut linear = with.clone();
+    linear.shape_dynamics.size.curve = photocraft_paint::ResponseCurve::LINEAR;
+    let patch = brush_patch(&with, &linear);
+    assert_eq!(patch["shapeDynamics"]["size"]["curve"], json!([[0.0, 0.0], [1.0, 1.0]]));
+    s.execute("tools.setBrush", patch).unwrap();
+    assert!(s.tools.brush.shape_dynamics.size.curve.is_linear());
 }
 
 #[test]
