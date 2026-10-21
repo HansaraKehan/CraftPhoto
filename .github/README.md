@@ -8,7 +8,8 @@ An unofficial native Android build (egui + wgpu) of [PhotoCraft](https://github.
 
 [What's new](WHATS-NEW.md) · [Get the app](#-get-the-app) · [Settings guide](#-settings-guide) · [App Suite Downloads](#-app-downloads)
 
-<img width="2304" height="1440" alt="Screenshot_20261016_160858" src="https://github.com/user-attachments/assets/f083d83d-0111-4d27-a9e5-06b2fbf065dd" />
+<img width="2304" height="1440" alt="Screenshot_20261021_232623" src="https://github.com/user-attachments/assets/446f134a-1675-4b85-990c-211706215c7f" />
+
 
 </div>
 
@@ -128,6 +129,8 @@ Open **Preferences → Tools → Pen & Touch**. Changes apply immediately.
 | `@recent` | Switch between the last two tools |
 
 Use **Record** to capture a key by pressing it, or **Pick** to choose from the list of commands.
+
+<img width="2304" height="1440" alt="Screenshot_20261021_232834" src="https://github.com/user-attachments/assets/2d63e236-7405-4d59-ab3e-c7f6afd81048" />
 
 ---
 
