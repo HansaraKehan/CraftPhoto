@@ -2,7 +2,7 @@
 
 # 🎨 PhotoCraft · Android Pen & Touch Edition
 
-**A Photoshop-style open-source image editor on your Android tablet, built for a stylus.**
+**A Photcraft-style open-source image editor on your Android tablet, built for a stylus.**
 
 An unofficial native Android build (egui + wgpu) of [PhotoCraft](https://github.com/storytold/photocraft). It runs full-screen with native touch, active pen, and keyboard/mouse support.
 
