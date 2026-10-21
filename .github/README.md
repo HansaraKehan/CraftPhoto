@@ -131,38 +131,6 @@ Use **Record** to capture a key by pressing it, or **Pick** to choose from the l
 
 ---
 
-## 🛠️ Troubleshooting
-
-| Problem | Try this |
-|---|---|
-| **Build says the patch no longer applies** | Upstream changed. Set `UPSTREAM_REF` to a good commit, or send the log to have the layer ported. |
-| **Build fails with a Rust error** | Copy the first red `error[...]` lines from the failed run and send them. |
-| **Pen button does nothing** | Check *Use this button* is on for that button in Preferences → Tools → Pen & Touch. |
-| **Fingers still draw in Pen only mode** | Confirm the strip shows **Pen only** (highlighted). Fingers on panels are meant to work. |
-| **A window won't scroll by touch** | Turn off *A finger tap clicks and a drag moves the item* and test again. Report which windows are affected. |
-| **Wrong device question at start** | Change it under Preferences → Tools → Pen & Touch → Device. |
-
----
-
-## 🧱 What's inside `android-layer/`
-
-`android-layer.tar.gz` holds everything added on top of upstream:
-
-```
-android-layer/
-└── android-layer.tar.gz
-    ├── android-layer.patch       Android edits to upstream (layout, touch UI, dialogs)
-    ├── translate_en.py           Runs after the patch; turns Chinese UI text into English at build time
-    └── overlay/
-        ├── crates/ui-egui/src/pen_touch/   Pen buttons, soft keys, modes, settings
-        ├── vendor/winit/…                  Stylus support & patched winit for hardware mouse/keyboard
-        └── apps/photocraft-android/…       The Android app shell, launcher, top bar, and file-manager bridge
-```
-
-More detail: [`docs/pen-touch.md`](docs/pen-touch.md).
-
----
-
 ## ℹ️ Status
 
 This edition is under active testing. The code was written without a local compiler, so each build is the first real test — expect a few fix-up rounds. Bug reports with build logs or a short description of what happened are very welcome.
