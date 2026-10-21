@@ -60,9 +60,6 @@ If an update won't install over an older build, uninstall the old one first.
   - The layer follows upstream's newest code. If upstream changes the same lines the layer edits, the run stops with **"The Android patch no longer applies"**. Send the log and the layer gets ported again.
   - To freeze a known-good version, add a repository variable `UPSTREAM_REF` (Settings → Secrets and variables → Actions → Variables) set to an upstream commit hash or branch. Delete it to follow the latest upstream again.
 
-### Signing
-Builds are signed with a key the workflow creates and caches. For a permanent key, add the secrets `ANDROID_KEYSTORE_B64` (a PKCS12 keystore, base64-encoded, with alias `photocraft`) and `ANDROID_KEYSTORE_PASSWORD`. APKs signed with different keys cannot update each other.
-
 ---
 
 ## 🖐️ How it feels to use
