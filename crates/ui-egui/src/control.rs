@@ -20,9 +20,11 @@
 //! - The synthetic input methods reject unknown fields, wrong types, unknown enum values and
 //!   out-of-range numbers before acting, naming the parameter (#2449)
 //! - `ui.resize {width, height}`: resize the main window
-//! - `ui.gpu.simulateLoss {error?}`: act as if the wgpu device was lost (or, with `error: true`,
-//!   reported an error): the app switches to the CPU renderer for the rest of the session, as on a
-//!   real loss. For testing the fallback; returns whether a GPU canvas was active
+//! - `ui.gpu.simulateLoss {error?, destroy?}`: act as if the wgpu device was lost (or, with
+//!   `error: true`, reported an error): the app switches to the CPU renderer for the rest of the
+//!   session, as on a real loss. For testing the fallback; returns whether a GPU canvas was active.
+//!   `destroy: true` destroys the window's real device instead, as a driver reset does: the app
+//!   saves its unsaved documents for recovery and closes (#3438); returns `destroyed`
 //! - `ui.screenshot {path?, focus?}`: capture the main window (PNG). Raises the window first (default)
 //!   because occluded macOS windows stop rendering
 //! - `ui.focus`: bring the main window to the front
@@ -207,6 +209,20 @@ fn num_field(p: &Value, key: &str) -> std::result::Result<Option<f64>, String> {
     match p.get(key) {
         None => Ok(None),
         Some(v) => v.as_f64().filter(|f| f.is_finite()).map(Some).ok_or_else(|| format!("{key} must be a finite number")),
+    }
+}
+
+/// A finite number that stays finite as `f32` (1e39 would turn into inf and silently reset
+/// rotation to 0° or zoom to 100%).
+fn f32_range(n: &f64) -> bool {
+    n.is_finite() && n.abs() <= f64::from(f32::MAX)
+}
+
+/// A `ui.set` numeric field the view stores as `f32`: `Ok(None)` when absent, else within `f32` range.
+fn f32_field(p: &Value, key: &str) -> std::result::Result<Option<f64>, String> {
+    match p.get(key) {
+        None => Ok(None),
+        Some(v) => v.as_f64().filter(f32_range).map(Some).ok_or_else(|| format!("{key} must be a finite number within f32 range")),
     }
 }
 
@@ -571,9 +587,9 @@ fn dispatch(app: &mut PhotocraftApp, ctx: &egui::Context, req: &ControlRequest) 
                 let dock = whole_object(&app.ui.dock, p.get("dock"), "dock")?;
                 // Which chip the Color panel edits.
                 let color_panel = whole_object(&app.ui.color_panel, p.get("colorPanel"), "colorPanel")?;
-                let dock_width = num_field(p, "dockWidth")?;
-                let zoom = num_field(p, "zoom")?;
-                let rotation = num_field(p, "rotation")?;
+                let dock_width = f32_field(p, "dockWidth")?;
+                let zoom = f32_field(p, "zoom")?;
+                let rotation = f32_field(p, "rotation")?;
                 if rotation.is_some() && app.session.active_index().is_none() {
                     return Err("no document open".into());
                 }
@@ -586,6 +602,9 @@ fn dispatch(app: &mut PhotocraftApp, ctx: &egui::Context, req: &ControlRequest) 
                         let (Some(x), Some(y)) = (a.first().and_then(Value::as_f64), a.get(1).and_then(Value::as_f64)) else {
                             return Err("center must be [x, y] of two numbers".into());
                         };
+                        if !f32_range(&x) || !f32_range(&y) {
+                            return Err("center must be finite numbers within f32 range".into());
+                        }
                         Some([x as f32, y as f32])
                     }
                     None => None,
@@ -758,6 +777,10 @@ fn dispatch(app: &mut PhotocraftApp, ctx: &egui::Context, req: &ControlRequest) 
                     crate::panels::request_dock_width(ctx, w as f32);
                 }
                 if let Some(i) = app.session.active_index() {
+                    if zoom.is_some() || center.is_some() || rotation.is_some() || fit {
+                        app.ui.views[i].zoom_animating = false;
+                        app.ui.views[i].zoom_anchor = None;
+                    }
                     if let Some(z) = zoom {
                         let size = app.session.documents().get(i).map_or([0, 0], |st| [st.doc.size.width, st.doc.size.height]);
                         app.ui.views[i].zoom = crate::zoom_levels::clamp(z as f32, size);
@@ -1200,6 +1223,11 @@ fn dispatch(app: &mut PhotocraftApp, ctx: &egui::Context, req: &ControlRequest) 
             ok(Value::Null)
         }
         "ui.gpu.simulateLoss" => {
+            if p.get("destroy").and_then(Value::as_bool).unwrap_or(false) {
+                let destroyed = app.destroy_window_device();
+                ctx.request_repaint();
+                return ok(json!({"destroyed": destroyed}));
+            }
             let error = p.get("error").and_then(Value::as_bool).unwrap_or(false);
             let fault = if error {
                 photocraft_gpu::Fault::Error("simulated error (ui.gpu.simulateLoss)".into())
@@ -1441,8 +1469,8 @@ mod tests {
         let dng = spec.build();
         for finish in ["commit", "cancel"] {
             let services = crate::Services {
-                import: Some(Box::new(|name, bytes, depth| {
-                    photocraft_io::import_with_svg_group_depth(name, bytes, depth).map(|r| (r.document, r.warnings)).map_err(|e| e.to_string())
+                import: Some(Box::new(|name, bytes, opts| {
+                    photocraft_io::import_with_options(name, bytes, opts).map(|r| (r.document, r.warnings)).map_err(|e| e.to_string())
                 })),
                 ..Default::default()
             };
@@ -1863,7 +1891,7 @@ mod tests {
         let ids: Vec<_> = entries.iter().filter_map(|row| row.get("id").and_then(Value::as_str)).collect();
         assert_eq!(
             ids,
-            ["view.zoomIn", "view.zoomOut", "view.fitOnScreen", "view.fillScreen", "view.actualPixels", "view.twoHundredPercent", "view.printSize"]
+            ["view.fitOnScreen", "view.fillScreen", "view.actualPixels", "view.twoHundredPercent", "view.printSize", "view.zoomIn", "view.zoomOut"]
         );
         assert_eq!(call(&mut app, &ctx, "ui.context.choose", json!({"id":"select.all"}))["ok"], false);
         assert_eq!(call(&mut app, &ctx, "ui.context.choose", json!({"id":"view.twoHundredPercent"}))["ok"], true);
@@ -2263,6 +2291,32 @@ mod tests {
     }
 
     #[test]
+    fn ui_set_rejects_view_numbers_beyond_f32_range() {
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+        let ctx = egui::Context::default();
+        app.run("file.new", json!({"width": 32, "height": 32})).unwrap();
+        app.sync_views();
+        let r = call(&mut app, &ctx, "ui.set", json!({"rotation": 30, "zoom": 2, "center": [3, 4], "dockWidth": 300}));
+        assert_eq!(r["ok"], true, "{r}");
+        let dock = |ctx: &egui::Context| ctx.data(|d| d.get_temp::<f32>(crate::panels::dock_width_id()));
+        let (rotation, zoom, center) = (app.ui.views[0].rotation, app.ui.views[0].zoom, app.ui.views[0].center);
+        // Finite in f64 but infinite as f32: an error, not a silent reset to 0°, 100% or the minimum dock width.
+        for params in
+            [json!({"rotation": 1e39}), json!({"zoom": 1e39}), json!({"center": [1e39, 0]}), json!({"center": [0, -1e39]}), json!({"dockWidth": 1e39})]
+        {
+            let r = call(&mut app, &ctx, "ui.set", params.clone());
+            assert_eq!(r["ok"], false, "{params}: {r}");
+            assert_eq!(app.ui.views[0].rotation, rotation, "{params}");
+            assert_eq!(app.ui.views[0].zoom, zoom, "{params}");
+            assert_eq!(app.ui.views[0].center, center, "{params}");
+            assert_eq!(dock(&ctx), Some(300.0), "{params}");
+        }
+        // Huge but representable still clamps to the top zoom level.
+        assert_eq!(call(&mut app, &ctx, "ui.set", json!({"zoom": 1e38}))["ok"], true);
+        assert!(app.ui.views[0].zoom.is_finite() && app.ui.views[0].zoom > zoom, "{}", app.ui.views[0].zoom);
+    }
+
+    #[test]
     fn ui_set_theme_keeps_explicit_dock_tab_indices() {
         let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
         let ctx = egui::Context::default();
@@ -2281,6 +2335,20 @@ mod tests {
         assert!(app.ui.color_panel.background);
         assert_eq!(call(&mut app, &ctx, "ui.set", json!({"colorPanel": {"background": "yes"}}))["ok"], false);
         assert!(app.ui.color_panel.background, "a bad value changes nothing");
+    }
+
+    #[test]
+    fn ui_set_color_panel_slider_mode() {
+        use crate::state::ColorPanelSliderMode;
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+        let ctx = egui::Context::default();
+        assert_eq!(app.ui.color_panel.slider_mode, ColorPanelSliderMode::Hsb);
+        assert_eq!(call(&mut app, &ctx, "ui.set", json!({"colorPanel": {"slider_mode": "rgb"}}))["ok"], true);
+        assert_eq!(app.ui.color_panel.slider_mode, ColorPanelSliderMode::Rgb);
+        assert_eq!(call(&mut app, &ctx, "ui.set", json!({"colorPanel": {"slider_mode": "hsb"}}))["ok"], true);
+        assert_eq!(app.ui.color_panel.slider_mode, ColorPanelSliderMode::Hsb);
+        assert_eq!(call(&mut app, &ctx, "ui.set", json!({"colorPanel": {"slider_mode": "cmyk"}}))["ok"], false);
+        assert_eq!(app.ui.color_panel.slider_mode, ColorPanelSliderMode::Hsb);
     }
 
     #[test]
@@ -2441,6 +2509,54 @@ mod tests {
         assert_eq!(written.borrow().len(), 3, "a bad tgaBits writes nothing");
     }
 
+    /// `app.save` takes JPEG Options (`quality` 0–12, `jpegFormat`) and never stops at the prompt;
+    /// a value it can't read is an error that writes nothing.
+    #[test]
+    fn automation_save_passes_jpeg_options_without_asking() {
+        use photocraft_codecs::JpegFormat;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        // The JPEG quality (1–100) and format each export was asked for.
+        type Asked = Rc<RefCell<Vec<(Option<u8>, JpegFormat)>>>;
+        let asked: Asked = Rc::default();
+        let written: Rc<RefCell<Vec<String>>> = Rc::default();
+        let (a, w) = (asked.clone(), written.clone());
+        let services = crate::Services {
+            export: Some(Box::new(move |_d: &photocraft_doc::Document, _p: &str, s: &crate::ExportSettings| {
+                a.borrow_mut().push((s.jpeg_quality, s.jpeg_format));
+                Ok((b"out".to_vec(), Vec::new()))
+            })),
+            automation_write: Some(Box::new(move |path: &str, _b: &[u8]| {
+                w.borrow_mut().push(path.to_string());
+                Ok(())
+            })),
+            ..Default::default()
+        };
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), services);
+        let ctx = egui::Context::default();
+        app.run("file.new", json!({"width": 8, "height": 8})).unwrap();
+        for params in [
+            json!({"path": "a.jpg"}),
+            json!({"path": "b.jpg", "quality": 12, "jpegFormat": "progressive"}),
+            json!({"path": "c.jpg", "jpegFormat": "optimized"}),
+        ] {
+            let r = call(&mut app, &ctx, "app.save", params.clone());
+            assert_eq!(r["result"]["path"], params["path"], "{r}");
+            assert!(app.jpeg_options.is_none(), "automation saves never prompt");
+        }
+        assert_eq!(*asked.borrow(), [(None, JpegFormat::Baseline), (Some(100), JpegFormat::Progressive), (None, JpegFormat::Optimized)]);
+        for bad in [
+            json!({"path": "d.jpg", "quality": 13}),
+            json!({"path": "d.jpg", "quality": "high"}),
+            json!({"path": "d.jpg", "jpegFormat": "fast"}),
+            json!({"path": "d.jpg", "jpegFormat": 2}),
+        ] {
+            let r = call(&mut app, &ctx, "app.save", bad.clone());
+            assert!(r["error"].is_string(), "{bad}: {r}");
+        }
+        assert_eq!(written.borrow().len(), 3, "a bad JPEG option writes nothing");
+    }
+
     /// `app.save` takes the DDS options (`ddsCompression`, `ddsMipmaps`) and never stops at DDS
     /// Options.
     #[test]
@@ -2497,7 +2613,7 @@ mod tests {
         let written: Rc<RefCell<Vec<String>>> = Rc::default();
         let w = written.clone();
         let services = crate::Services {
-            import: Some(Box::new(|name: &str, _b: &[u8], _depth: usize| {
+            import: Some(Box::new(|name: &str, _b: &[u8], _opts: &photocraft_io::ImportOptions| {
                 Ok((Document::new(name, Size::new(4, 4), ColorMode::Rgb, SampleType::U8), vec!["Adjustment layer flattened".to_string()]))
             })),
             export: Some(Box::new(|_d: &Document, _p: &str, _s: &crate::ExportSettings| Ok((b"out".to_vec(), vec!["Layers were flattened".to_string()])))),
@@ -2561,7 +2677,7 @@ mod tests {
                     Err(format!("corrupt bundle: {path}"))
                 }
             })),
-            import: Some(Box::new(|name: &str, _b: &[u8], _depth: usize| {
+            import: Some(Box::new(|name: &str, _b: &[u8], _opts: &photocraft_io::ImportOptions| {
                 Ok((Document::new(name, photocraft_doc::Size::new(4, 4), photocraft_doc::ColorMode::Rgb, photocraft_doc::SampleType::U8), Vec::new()))
             })),
             automation_read: Some(Box::new(|path: &str| {

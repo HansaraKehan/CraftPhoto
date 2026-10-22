@@ -478,6 +478,10 @@ pub struct Compositor {
     staged: u64,
     /// Copies and render passes recorded since the last submit.
     recorded: u32,
+    /// Why a layer page texture couldn't be created this refresh (it then ends on the CPU).
+    layer_alloc: Option<String>,
+    /// Bytes of pages dropped to admit new ones, not yet counted towards an intermediate submit.
+    admit_freed: u64,
     acc_format: wgpu::TextureFormat,
     /// Whether the effect-map pipelines could be built (else documents with layer effects are
     /// [`Unsupported`] and use the CPU compositor).
@@ -587,6 +591,25 @@ fn field_reaches(progs: &[fx::MapProgram]) -> HashMap<FieldKind, i32> {
         *w = (*w).max(*r);
     }
     want
+}
+
+/// Why a refresh whose layer pages don't fit GPU memory is drawn on the CPU.
+pub const OVER_BUDGET: &str = "layers exceed the GPU memory budget; full refresh on the CPU";
+
+/// Which of `pages` (LRU clock, key, bytes) to drop, least recently used first, so `incoming`
+/// more bytes fit `budget` on top of the `total` held now. Callers leave out pages that must stay.
+fn lru_victims<K>(mut pages: Vec<(u64, K, u64)>, total: u64, incoming: u64, budget: u64) -> Vec<K> {
+    pages.sort_unstable_by_key(|p| p.0);
+    let mut total = total;
+    let mut out = Vec::new();
+    for (_, k, bytes) in pages {
+        if total.saturating_add(incoming) <= budget {
+            break;
+        }
+        total = total.saturating_sub(bytes);
+        out.push(k);
+    }
+    out
 }
 
 /// Runs `f` inside GPU error scopes and returns the first error raised.
@@ -720,6 +743,8 @@ impl Compositor {
             stamp: 0,
             staged: 0,
             recorded: 0,
+            layer_alloc: None,
+            admit_freed: 0,
             acc_format,
             effect_maps: map_error.is_none(),
             cmyk: 0,
@@ -1162,6 +1187,8 @@ impl Compositor {
         self.stamp += 1;
         self.staged = 0;
         self.recorded = 0;
+        self.layer_alloc = None;
+        self.admit_freed = 0;
 
         // Only render owns submission. A caller may discard encode's command buffer, so it
         // cannot establish (or consume) a checkpoint whose GPU copy might never execute.
@@ -1225,9 +1252,45 @@ impl Compositor {
             if let Some(f) = self.fault() {
                 return Err(Unsupported(f.to_string()));
             }
+            // Out of memory although every page this cell doesn't use was dropped: the work recorded
+            // since the last submit can still hold those pages. Submit it, wait until the GPU is done
+            // with it so their memory is released, and run the cell once more. `encode` can't
+            // submit, so there the refresh goes to the CPU straight away.
+            if flush && self.layer_alloc.as_deref() == Some(OVER_BUDGET) {
+                self.layer_alloc = None;
+                submit_batch(device, queue, encoder, self.health.as_ref(), self.timer.as_mut(), &mut last_submit);
+                #[cfg(not(target_arch = "wasm32"))]
+                match self.health.as_ref() {
+                    Some(h) => {
+                        h.wait(device, last_submit.clone());
+                    }
+                    None => {
+                        let _ = device.poll(wgpu::PollType::Wait { submission_index: last_submit.clone(), timeout: None });
+                    }
+                }
+                self.staged = 0;
+                self.recorded = 0;
+                work = 0;
+                freed = 0;
+                self.admit_freed = 0;
+                stats.flushes += 1;
+                if let Some(f) = self.fault() {
+                    return Err(Unsupported(f.to_string()));
+                }
+                let mut batch = Some(&mut last_submit);
+                self.run_cell(device, queue, encoder, doc.id, &plan, &runs, &paged, cell, &fr, &chunks, checkpoint, &mut stats, sink, &mut batch);
+                if let Some(f) = self.fault() {
+                    return Err(Unsupported(f.to_string()));
+                }
+            }
+            // A page didn't fit even after evicting: this refresh goes to the CPU, the next one
+            // tries the GPU again (#6563).
+            if let Some(e) = self.layer_alloc.take() {
+                return Err(Unsupported(e));
+            }
             let (evicted, bytes) = self.evict();
             stats.evicted += evicted;
-            freed += bytes;
+            freed = freed.saturating_add(bytes.saturating_add(std::mem::take(&mut self.admit_freed)));
             if flush && (self.staged >= flush_bytes || work >= FLUSH_WORK || freed >= flush_bytes || self.recorded >= FLUSH_OPS) {
                 submit_batch(device, queue, encoder, self.health.as_ref(), self.timer.as_mut(), &mut last_submit);
                 self.staged = 0;
@@ -1280,22 +1343,7 @@ impl Compositor {
     /// whole-region effect maps drawn this frame. Returns how many textures were dropped and
     /// their bytes.
     fn evict(&mut self) -> (usize, u64) {
-        let (mut n, mut freed) = (0, 0u64);
-        let mut total = self.resident_bytes();
-        if total > self.resident_budget {
-            let mut lru: Vec<(u64, ResKey, u64)> =
-                self.residents.iter().filter(|(_, r)| r.stamp != self.stamp).map(|(k, r)| (r.stamp, *k, r.bytes())).collect();
-            lru.sort_unstable_by_key(|c| c.0);
-            for (_, k, bytes) in lru {
-                if total <= self.resident_budget {
-                    break;
-                }
-                self.residents.remove(&k);
-                total = total.saturating_sub(bytes);
-                n += 1;
-                freed += bytes;
-            }
-        }
+        let (mut n, mut freed) = self.evict_residents(self.resident_budget, 0, None);
         let mut total = self.fx_cache_bytes();
         let fx_budget = usize::try_from(self.fx_budget).unwrap_or(usize::MAX);
         if total > fx_budget {
@@ -1319,6 +1367,67 @@ impl Compositor {
             }
         }
         (n, freed)
+    }
+
+    /// Drop least recently used resident pages until `incoming` more bytes fit in `budget`.
+    /// Never drops what the current cell uses, nor `keep`. Returns how many pages were dropped
+    /// and their bytes.
+    fn evict_residents(&mut self, budget: u64, incoming: u64, keep: Option<ResKey>) -> (usize, u64) {
+        let stamp = self.stamp;
+        let pages: Vec<(u64, ResKey, u64)> =
+            self.residents.iter().filter(|(k, r)| r.stamp != stamp && Some(**k) != keep).map(|(k, r)| (r.stamp, *k, r.bytes())).collect();
+        let (mut n, mut freed) = (0, 0u64);
+        for k in lru_victims(pages, self.resident_bytes(), incoming, budget) {
+            if let Some(r) = self.residents.remove(&k) {
+                n += 1;
+                freed += r.bytes();
+            }
+        }
+        (n, freed)
+    }
+
+    /// Create the page texture for `key`, `bytes` large. Least recently used pages make room in
+    /// the budget first; when the device is still out of memory, every page the current cell
+    /// doesn't use is dropped and creation is tried once more (#6563). `None` (with
+    /// `layer_alloc` set) when it still fails: `render` submits the recorded work, which can still
+    /// hold the dropped pages, and runs the cell once more; after that the CPU draws the refresh.
+    fn create_layer_texture(
+        &mut self,
+        device: &wgpu::Device,
+        desc: &wgpu::TextureDescriptor<'_>,
+        key: ResKey,
+        bytes: u64,
+        stats: &mut Stats,
+    ) -> Option<wgpu::Texture> {
+        let replaced = self.residents.get(&key).map_or(0, Resident::bytes);
+        let (n, dropped) = self.evict_residents(self.resident_budget, bytes.saturating_sub(replaced), Some(key));
+        stats.evicted += n;
+        self.admit_freed = self.admit_freed.saturating_add(dropped);
+        // WebGPU reports errors asynchronously: its failures reach the health callbacks.
+        if cfg!(target_arch = "wasm32") {
+            return Some(device.create_texture(desc));
+        }
+        for retry in [false, true] {
+            let (texture, error) = first_error(device, || device.create_texture(desc));
+            match error {
+                None => return Some(texture),
+                Some(wgpu::Error::OutOfMemory { .. }) if !retry => {
+                    let (n, dropped) = self.evict_residents(0, 0, Some(key));
+                    stats.evicted += n;
+                    self.admit_freed = self.admit_freed.saturating_add(dropped);
+                }
+                Some(wgpu::Error::OutOfMemory { .. }) => {
+                    self.layer_alloc = Some(OVER_BUDGET.into());
+                    return None;
+                }
+                Some(e) => {
+                    self.layer_alloc = Some(format!("GPU layer texture failed: {e}"));
+                    return None;
+                }
+            }
+        }
+        self.layer_alloc = Some(OVER_BUDGET.into());
+        None
     }
 
     /// Per-frame resources of `plan`: the tile area of each pass's surfaces, its LUT and pattern.
@@ -1420,6 +1529,10 @@ impl Compositor {
             .and_then(|_| chunks.iter().map(|c| self.prefix.restore_point(*c).map(|r| r.pass_end)).try_fold(usize::MAX, |m, p| Some(m.min(p?))))
             .unwrap_or(0);
         let bound = self.bind_cell(device, queue, encoder, doc, plan, paged, cell, fr, first_pass, stats);
+        // A page couldn't be created: draw nothing with the pages missing (the caller ends the refresh).
+        if self.layer_alloc.is_some() {
+            return;
+        }
 
         // Chunk pool.
         while self.pool.len() < plan.slots as usize {
@@ -1638,7 +1751,8 @@ impl Compositor {
         region: Rect,
         stats: &mut Stats,
     ) -> Option<(ResKey, [i32; 4])> {
-        if region.is_empty() {
+        // An earlier page of this cell didn't fit: the refresh ends after the cell anyway.
+        if region.is_empty() || self.layer_alloc.is_some() {
             return None;
         }
         let format = surface.format();
@@ -1651,7 +1765,7 @@ impl Compositor {
             .get(&key)
             .is_none_or(|r| r.region != region || r.kind != kind || r.format != format || r.cmyk != cmyk || r.default_bits != default_bits);
         if stale {
-            let texture = device.create_texture(&wgpu::TextureDescriptor {
+            let desc = wgpu::TextureDescriptor {
                 label: Some("pc_compose_layer"),
                 size: wgpu::Extent3d { width: region.width(), height: region.height(), depth_or_array_layers: 1 },
                 mip_level_count: 1,
@@ -1660,7 +1774,9 @@ impl Compositor {
                 format: kind.format(),
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
                 view_formats: &[],
-            });
+            };
+            let bytes = region.width() as u64 * region.height() as u64 * kind.bytes_per_pixel() as u64;
+            let texture = self.create_layer_texture(device, &desc, key, bytes, stats)?;
             let view = texture.create_view(&Default::default());
             let default_nonzero = default_pixel.iter().any(|v| *v != 0.0);
             let mut r = Resident {
@@ -2423,15 +2539,43 @@ fn convert_tiles(surface: &Surface, tiles: Vec<(TileCoord, Arc<Tile>)>, kind: Te
             }
         }
     }
+    // CMYK and Lab tiles convert pixel by pixel through a colour transform (a CMYK tile took
+    // ~5 ms on one thread, the whole of a brush dab's refresh on an A4 CMYK page, #5108): those
+    // go in bands of rows, so even the one tile a dab touches spreads over the threads. Workers
+    // don't inherit this thread's CMYK profile scope, so each band enters it.
+    let bands = if colour_managed(&surface.format(), kind) { TILE_SIZE / MANAGED_BAND_ROWS } else { 1 };
+    let space = photocraft_color::convert::active_cmyk_space();
     for batch in groups.chunks(CONVERT_BATCH) {
         // A tile's content is the same at every coordinate sharing it: convert it at the first.
-        let jobs: Vec<_> = batch.iter().filter_map(|(t, cs)| cs.first().map(|c| (t, *c))).collect();
-        let converted = fx::par_map(jobs, |(t, c)| convert_tile(surface, Some(t), kind, c));
-        for ((t, cs), bytes) in batch.iter().zip(&converted) {
-            put(t, cs, bytes);
+        let jobs: Vec<_> = batch.iter().filter_map(|(t, cs)| cs.first().map(|c| (t, *c))).flat_map(|(t, c)| (0..bands).map(move |b| (t, c, b))).collect();
+        let parts = fx::par_map(jobs, |(t, c, b)| {
+            photocraft_color::convert::with_cmyk_space(space.as_ref(), || {
+                if bands == 1 {
+                    return convert_tile(surface, Some(t), kind, c);
+                }
+                let r = c.rect();
+                let y0 = r.y0 + b * MANAGED_BAND_ROWS;
+                convert_rows(surface, Some(t), kind, Rect::new(r.x0, y0, r.x1, y0 + MANAGED_BAND_ROWS))
+            })
+        });
+        for ((t, cs), bytes) in batch.iter().zip(parts.chunks(bands as usize)) {
+            // One part (every format but CMYK and Lab) goes through as is: no copy per tile.
+            match bytes {
+                [one] => put(t, cs, one),
+                _ => put(t, cs, &bytes.concat()),
+            }
         }
     }
     groups.len()
+}
+
+/// Rows per parallel band of a colour-managed (CMYK, Lab) tile conversion.
+const MANAGED_BAND_ROWS: i32 = 16;
+
+/// Whether `fmt` pixels reach `kind` texels through a per-pixel colour transform (CMYK, Lab).
+fn colour_managed(fmt: &PixelFormat, kind: TexKind) -> bool {
+    use photocraft_color::ColorMode;
+    matches!(kind, TexKind::Rgba8 | TexKind::Rgba16F) && matches!(fmt.mode, ColorMode::Cmyk | ColorMode::Lab)
 }
 
 /// Tile pixels in the texture's format. `tile = None` gives the default pixel everywhere.
@@ -2439,27 +2583,47 @@ fn convert_tile(surface: &Surface, tile: Option<&Arc<Tile>>, kind: TexKind, c: T
     if let (Some(t), TexKind::Rgba8Direct | TexKind::R8Direct) = (tile, kind) {
         return t.bytes().to_vec();
     }
-    let n = (TILE_SIZE * TILE_SIZE) as usize;
     let fmt = surface.format();
-    let ch = fmt.channels();
     if let (Some(t), TexKind::Rgba16F) = (tile, kind)
         && let Some(out) = rgb_gray16_to_f16(&fmt, t.bytes()).or_else(|| rgb_gray32_to_f16(&fmt, t.bytes()))
     {
         return out;
     }
+    convert_rows(surface, tile, kind, c.rect())
+}
+
+/// [`convert_tile`]'s general path for `rect` (rows of one tile): each pixel through
+/// `photocraft_raster::to_rgba`. A run of identical pixels (the transparent or flat areas around a
+/// brush dab) is converted once: the same samples give the same texels.
+fn convert_rows(surface: &Surface, tile: Option<&Arc<Tile>>, kind: TexKind, rect: Rect) -> Vec<u8> {
+    let n = rect.width() as usize * rect.height() as usize;
+    let fmt = surface.format();
+    let ch = fmt.channels();
     let raw: Vec<f32> = match tile {
-        Some(_) => surface.read_region(c.rect()),
+        Some(_) => surface.read_region(rect),
         None => surface.default_pixel().repeat(n),
     };
     let mut out = Vec::with_capacity(n * kind.bytes_per_pixel());
-    for px in raw.chunks_exact(ch) {
+    // The previous pixel and its colour.
+    let mut last: Option<(usize, [f32; 4])> = None;
+    for (i, px) in raw.chunks_exact(ch).enumerate() {
+        let mut rgba = || -> [f32; 4] {
+            if let Some((j, v)) = last
+                && raw.get(j * ch..j * ch + ch).is_some_and(|p| p.iter().zip(px).all(|(a, b)| a.to_bits() == b.to_bits()))
+            {
+                return v;
+            }
+            let v = photocraft_raster::to_rgba(&fmt, px);
+            last = Some((i, v));
+            v
+        };
         match kind {
             TexKind::Rgba8Direct | TexKind::Rgba8 => {
-                let v = photocraft_raster::to_rgba(&fmt, px);
+                let v = rgba();
                 out.extend(v.map(|x| (x.clamp(0.0, 1.0) * 255.0 + 0.5) as u8));
             }
             TexKind::Rgba16F => {
-                let v = photocraft_raster::to_rgba(&fmt, px);
+                let v = rgba();
                 for x in v {
                     out.extend(f32_to_f16(x).to_le_bytes());
                 }
@@ -2803,6 +2967,21 @@ mod tests {
     }
 
     #[test]
+    fn layer_pages_are_admitted_by_evicting_least_recently_used_first() {
+        let pages = || vec![(5, 'c', 40), (1, 'a', 30), (3, 'b', 20)];
+        // Fits already: nothing dropped.
+        assert!(lru_victims(pages(), 90, 10, 100).is_empty());
+        // 90 held + 40 incoming over 100: the oldest page goes first, then the next.
+        assert_eq!(lru_victims(pages(), 90, 40, 100), vec!['a']);
+        assert_eq!(lru_victims(pages(), 90, 60, 100), vec!['a', 'b']);
+        // Out of memory: a zero budget drops every candidate, and an impossible request stops
+        // when none are left instead of looping or overflowing.
+        assert_eq!(lru_victims(pages(), 90, 0, 0), vec!['a', 'b', 'c']);
+        assert_eq!(lru_victims(pages(), u64::MAX, u64::MAX, 1), vec!['a', 'b', 'c']);
+        assert!(lru_victims(Vec::<(u64, char, u64)>::new(), 90, 40, 100).is_empty());
+    }
+
+    #[test]
     fn uniform_buffer_sizes_are_checked_before_allocation() {
         assert_eq!(uniform_buffer_len(1, 255, 65_536).unwrap(), 65_536);
         assert!(uniform_buffer_len(1, 255, 65_535).is_err());
@@ -3003,6 +3182,78 @@ mod tests {
         assert!(rgb_gray16_to_f16(&PixelFormat { sample: SampleType::U16, ..PixelFormat::CMYKA8 }, &[]).is_none());
         assert!(rgb_gray32_to_f16(&PixelFormat::RGBA16, &[]).is_none());
         assert!(rgb_gray32_to_f16(&PixelFormat { sample: SampleType::F32, ..PixelFormat::CMYKA8 }, &[]).is_none());
+    }
+
+    /// CMYK and Lab tiles convert in parallel bands of rows, each run of equal pixels once
+    /// (#5108): the texels are still exactly the per-pixel conversion's, at 8 and 16 bits, with
+    /// the built-in CMYK profile and with a document's own (which the worker threads enter).
+    #[test]
+    fn colour_managed_tiles_match_the_per_pixel_conversion() {
+        use photocraft_cms::synth::{CmykParams, cmyk_profile};
+        use photocraft_color::ColorMode;
+        use photocraft_color::convert::{CmykSpace, with_cmyk_space};
+        let icc = Arc::new(
+            cmyk_profile(&CmykParams { description: "GPU test CMYK".into(), tvi: [0.26, 0.26, 0.26, 0.3], grid_a2b: 5, grid_b2a: 9, ..Default::default() })
+                .to_bytes(),
+        );
+        let own = CmykSpace::for_profile(Some(&icc));
+        assert!(own.is_some(), "the synthetic profile is not the built-in one");
+        let area = Rect::new(0, 0, TILE_SIZE * 3, TILE_SIZE);
+        for (mode, sample, space) in [
+            (ColorMode::Cmyk, SampleType::U8, None),
+            (ColorMode::Cmyk, SampleType::U16, None),
+            (ColorMode::Cmyk, SampleType::U8, own.clone()),
+            (ColorMode::Cmyk, SampleType::U16, own.clone()),
+            (ColorMode::Lab, SampleType::U8, None),
+            (ColorMode::Lab, SampleType::U16, None),
+        ] {
+            let fmt = PixelFormat { mode, sample, alpha: true };
+            let kind = TexKind::for_surface(Role::Content, fmt);
+            assert!(colour_managed(&fmt, kind), "{fmt:?}");
+            let ch = fmt.channels();
+            let mut s = Surface::new(fmt);
+            // Tile 0: noise. Tile 1: transparent with a soft dab (runs of equal pixels). Tile 2:
+            // a flat colour with a few lines of noise.
+            let n = (TILE_SIZE * TILE_SIZE) as usize * ch;
+            let noise: Vec<f32> = (0..n).map(|i| (i as u32).wrapping_mul(2_654_435_761) as f32 / u32::MAX as f32).collect();
+            s.write_region(Rect::new(0, 0, TILE_SIZE, TILE_SIZE), &noise);
+            let mut dab = [0.8, 0.6, 0.1, 0.05, 0.0];
+            for r in (1..30).rev() {
+                dab[ch - 1] = 1.0 - r as f32 / 30.0;
+                s.fill_rect(Rect::new(TILE_SIZE + 100 - r, 90 - r, TILE_SIZE + 100 + r, 90 + r), &dab[..ch]);
+            }
+            s.fill_rect(Rect::new(TILE_SIZE * 2, 0, TILE_SIZE * 3, TILE_SIZE), &[0.3, 0.2, 0.7, 0.1, 1.0][..ch]);
+            s.write_region(Rect::new(TILE_SIZE * 2, 40, TILE_SIZE * 3, 43), &noise[..TILE_SIZE as usize * 3 * ch]);
+            let tiles: Vec<_> = area.tiles().filter_map(|c| s.tile(c).map(|t| (c, t.clone()))).collect();
+            assert_eq!(tiles.len(), 3, "{fmt:?}");
+            let mut seen = 0;
+            with_cmyk_space(space.as_ref(), || {
+                convert_tiles(&s, tiles, kind, |_, cs, bytes| {
+                    for &c in cs {
+                        // The old path: every pixel through `to_rgba` on this thread, in this scope.
+                        let want: Vec<u8> = s
+                            .read_region(c.rect())
+                            .chunks_exact(ch)
+                            .flat_map(|px| {
+                                let v = photocraft_raster::to_rgba(&fmt, px);
+                                match kind {
+                                    TexKind::Rgba16F => v.iter().flat_map(|x| f32_to_f16(*x).to_le_bytes()).collect::<Vec<u8>>(),
+                                    _ => v.map(|x| (x.clamp(0.0, 1.0) * 255.0 + 0.5) as u8).to_vec(),
+                                }
+                            })
+                            .collect();
+                        assert!(
+                            bytes == want.as_slice(),
+                            "{fmt:?} {c:?} with {}",
+                            if space.is_some() { "the document's profile" } else { "the built-in profile" }
+                        );
+                        assert_eq!(convert_tile(&s, s.tile(c), kind, c), want, "{fmt:?} {c:?}");
+                        seen += 1;
+                    }
+                });
+            });
+            assert_eq!(seen, 3, "{fmt:?}");
+        }
     }
 
     #[test]

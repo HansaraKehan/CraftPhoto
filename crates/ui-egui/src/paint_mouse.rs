@@ -30,7 +30,13 @@ pub fn sync_tool_brush(app: &mut PhotocraftApp) {
     let current = app.session.tools.brush.clone();
     save_brush(app, app.ui.brush_tool, current.clone());
     app.session.tools.brush = match app.ui.tool_brushes.iter().find(|(t, _)| *t == tool) {
-        Some((_, b)) => session_fields(&current, b),
+        Some((_, b)) => {
+            // A brush remembered from the previous run holds its stored tips as references:
+            // load their full bitmaps (a missing one keeps painting with its preview).
+            let mut b = session_fields(&current, b);
+            let _ = app.session.load_brush_tips(&mut b);
+            b
+        }
         // A tool seen for the first time takes what the brush has, at Photoshop's smoothing.
         None => BrushSettings { smoothing: first_smoothing(), ..current },
     };
@@ -86,9 +92,15 @@ pub struct Buttons {
     pub clicked: bool,
 }
 
-/// Tools whose right-click opens the Brush Preset picker (those with the options-bar brush chip).
+/// Tools with the options-bar brush chip, which opens the Brush Preset picker.
 pub fn has_brush_picker(tool: Tool) -> bool {
     tool.is_brushlike() || tool == Tool::QuickSelection
+}
+
+/// Tools whose canvas right-click opens the Brush Preset picker: the painting tools. The Quick
+/// Selection tool has the picker too, but its right-click opens the selection menu (#7268).
+pub fn right_click_picker(tool: Tool) -> bool {
+    has_brush_picker(tool) && !crate::canvas_tool_menu::applies(tool)
 }
 
 /// Does a right-button drag with `tool` erase (rather than open the picker)?
@@ -130,7 +142,7 @@ pub fn canvas_buttons(app: &mut PhotocraftApp, response: &Response, tool: Tool) 
     if right_click
         && !erase
         && !layer_menu
-        && has_brush_picker(tool)
+        && right_click_picker(tool)
         && let Some(p) = response.interact_pointer_pos()
     {
         crate::brush_picker::open(&mut app.ui, &response.ctx, [p.x, p.y]);
@@ -160,7 +172,7 @@ pub fn pointer_secondary(app: &mut PhotocraftApp, ctx: &egui::Context, down: boo
         app.secondary_erase = down;
         return true;
     }
-    if down && has_brush_picker(tool) {
+    if down && right_click_picker(tool) {
         crate::brush_picker::open(&mut app.ui, ctx, at);
     }
     false

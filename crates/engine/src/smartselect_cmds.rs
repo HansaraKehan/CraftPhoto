@@ -221,12 +221,20 @@ impl ObjectFinderCache {
 /// `area`, say so instead of quietly finding nothing (#5246; scripts often add an empty layer
 /// above the photo first).
 fn check_sampled_pixels(doc: &Document, layer: Option<LayerId>, all_layers: bool, area: Rect) -> Result<()> {
-    let Some(surf) = sampled_target(doc, layer, all_layers).and_then(|id| doc.layer(id)).and_then(Layer::surface) else { return Ok(()) };
-    if surf.content_bounds().intersect(&area).is_empty() {
-        let msg = if surf.content_bounds().is_empty() { "the active layer is empty" } else { "the active layer has no pixels in that area" };
-        return Err(bad("select.object", &format!("{msg}; set \"sampleAllLayers\": true or select a layer with pixels")));
+    match empty_sampled_area(doc, layer, all_layers, area) {
+        Some(msg) => Err(bad("select.object", &format!("{msg}; set \"sampleAllLayers\": true or select a layer with pixels"))),
+        None => Ok(()),
     }
-    Ok(())
+}
+
+/// Why sampling `layer` (unless `all_layers`) can find nothing in `area`: the layer is empty, or has no pixels there.
+/// `None` = there is something to sample. The click path reports it as an error, the Object Finder hover as a hint.
+pub fn empty_sampled_area(doc: &Document, layer: Option<LayerId>, all_layers: bool, area: Rect) -> Option<&'static str> {
+    let surf = sampled_target(doc, layer, all_layers).and_then(|id| doc.layer(id)).and_then(Layer::surface)?;
+    if !surf.content_bounds().intersect(&area).is_empty() {
+        return None;
+    }
+    Some(if surf.content_bounds().is_empty() { "the active layer is empty" } else { "the active layer has no pixels in that area" })
 }
 
 /// `select.object` with `"point"`: the Object Finder's object under the point (cached).
@@ -694,6 +702,22 @@ mod tests {
         assert_eq!(r["changed"], false);
         assert!(s.active().unwrap().doc.selection.is_none());
         assert!(s.execute("select.object", json!({"point": ["a", 1]})).is_err());
+    }
+
+    #[test]
+    fn object_selection_finds_a_large_foreground_at_each_depth_and_undoes() {
+        for depth in [8, 16, 32] {
+            let inside = |x: i32, y: i32| (10..190).contains(&x) && (8..152).contains(&y);
+            let mut s = session_with(200, 160, depth, |x, y| if inside(x as i32, y as i32) { [0.8, 0.2, 0.1] } else { [0.1, 0.2, 0.8] });
+            let r = s.execute("select.object", json!({"point": [100, 80]})).unwrap();
+            assert_eq!(r["changed"], true, "depth {depth}");
+            assert!(sel_iou(&s, 200, 160, inside) > 0.95, "depth {depth}");
+            s.execute("edit.undo", json!({})).unwrap();
+            assert!(s.active().unwrap().doc.selection.is_none());
+            let r = s.execute("select.object", json!({"point": [1, 1]})).unwrap();
+            assert_eq!(r["changed"], false, "background at depth {depth}");
+            assert!(s.active().unwrap().doc.selection.is_none());
+        }
     }
 
     #[test]

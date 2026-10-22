@@ -223,6 +223,7 @@ pub(crate) fn export_layered(doc: &Document, opts: &ExportOptions, ctl: &photocr
     let plain;
     let doc = if matches!(doc.mode, ColorMode::Indexed | ColorMode::Bitmap | ColorMode::Duotone) {
         plain = Document { mode: doc.pixel_format().mode, ..doc.clone() };
+        warnings.push(format!("{:?} document written as {:?}", doc.mode, plain.mode));
         &plain
     } else {
         doc

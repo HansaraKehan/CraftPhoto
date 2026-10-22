@@ -22,18 +22,18 @@ const USAGE: &str = "\
 usage: cargo xtask <command>
 
 commands:
-  layers          enforce the crate dependency layering (plan/architecture.md §3)
+  layers          enforce the crate dependency layering (docs/architecture.md §3)
   wasm            cargo check --target wasm32-unknown-unknown for the wasm-safe crates
   ci              fmt --check, clippy -D warnings, test, layers, wasm (stops at first failure)
-  corpus [--all | --pngsuite | --psd | --psd-tools | --pixls | --photoshop] [--local] [--update-manifest]
+  corpus [--all | --pngsuite | --psd | --psd-tools | --pixls | --atn | --photoshop | --gimp] [--local] [--update-manifest]
                   show where test corpora live and their pins (xtask/src/corpus_pins.rs), or fetch
                   them into corpus/ (pinned commits, sha256-verified; --all = every corpus but pixls,
-                  --photoshop --local copies from ../photocraft-corpus or $PHOTOCRAFT_CORPUS_REPO)
+                  --photoshop/--gimp --local copy from ../photocraft-corpus or $PHOTOCRAFT_CORPUS_REPO)
   test-corpus [-p <crate>]... [--changed] [--pixls] [--local] [-- <test args>]
                   fetch every corpus, then cargo test --release --features corpus on the corpus
                   crates; --changed runs only if psd/io/codecs/compose/gpu/text/format/raw changed;
                   --pixls (or -p raw) also fetches corpus/pixls and runs the raw corpus tests;
-                  --local takes corpus/photoshop from the photocraft-corpus authoring clone
+                  --local takes corpus/photoshop and corpus/gimp from the photocraft-corpus authoring clone
   stats [--exact] count tests and lines per crate (--exact: ask the test harness via `-- --list`)
   parity          Photoshop menu parity; rewrites docs/parity-checklist.md
   i18n-coverage   report stable UI translation coverage for registered languages
@@ -106,7 +106,7 @@ pub fn metadata() -> Result<serde_json::Value, String> {
 
 fn cmd_layers() -> Result<(), String> {
     let crates = layers::from_metadata(&metadata()?)?;
-    println!("Dependency layering (plan/architecture.md §3)\n");
+    println!("Dependency layering (docs/architecture.md §3)\n");
     println!("{:<28} {:<14} workspace deps", "crate", "layer");
     for c in &crates {
         let ws: Vec<String> = c

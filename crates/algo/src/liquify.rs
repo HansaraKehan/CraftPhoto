@@ -19,6 +19,7 @@
 //! copied untouched. [`ProxyImage::render`] is the cheap preview path: bilinear field and
 //! bilinear source on a downsampled RGBA copy, re-rendered only where a dab changed things.
 
+use crate::par;
 use photocraft_geom::Rect;
 use photocraft_raster::Surface;
 use serde::{Deserialize, Serialize};
@@ -185,6 +186,10 @@ struct StrokeCursor {
     last_dab: [f64; 2],
     carry: f64,
 }
+
+/// Dabs over this many field nodes compute their rows in parallel (an 800 px brush has about
+/// 125,000); smaller ones are not worth the hand-off.
+const PARALLEL_DAB_NODES: usize = 16_384;
 
 /// Distance between dabs along a stroke for brush radius `r`: a twentieth of the radius, so a
 /// drag is many small pushes and its edge stays smooth.
@@ -487,9 +492,11 @@ impl LiquifyField {
                 bilinear(&self.d, self.w, self.h, gx, gy)
             }
         };
-        let mut writes: Vec<(usize, [f32; 2], f32)> = Vec::with_capacity((i1 - i0 + 1) * (j1 - j0 + 1));
+        // Every node reads only the snapshot and the field as it was before this dab (the writes
+        // land after), so rows are independent: a large brush computes them in parallel.
         let inv_cell = 1.0 / self.cell;
-        for j in j0..=j1 {
+        let node_row = |j: usize| -> Vec<(usize, [f32; 2], f32)> {
+            let mut row = Vec::with_capacity(i1 - i0 + 1);
             for i in i0..=i1 {
                 let p = self.node_pos(i, j);
                 let (dx, dy) = (p[0] - c[0], p[1] - c[1]);
@@ -503,7 +510,7 @@ impl LiquifyField {
                 if s.tool == LiquifyTool::Freeze || s.tool == LiquifyTool::Thaw {
                     let f = self.freeze[idx];
                     let v = if s.tool == LiquifyTool::Freeze { (f as f64 + k_raw).min(1.0) } else { (f as f64 - k_raw).max(0.0) };
-                    writes.push((idx, self.d[idx], v as f32));
+                    row.push((idx, self.d[idx], v as f32));
                     continue;
                 }
                 let k = k_raw * (1.0 - f64::from(self.freeze[idx]));
@@ -553,10 +560,13 @@ impl LiquifyField {
                         [(q[0] + dq[0] - p[0]) as f32, (q[1] + dq[1] - p[1]) as f32]
                     }
                 };
-                writes.push((idx, new, self.freeze[idx]));
+                row.push((idx, new, self.freeze[idx]));
             }
-        }
-        for (idx, d, f) in writes {
+            row
+        };
+        let rows = j1 - j0 + 1;
+        let writes = par::map(rows, rows * (i1 - i0 + 1) > PARALLEL_DAB_NODES, |row| node_row(j0 + row));
+        for (idx, d, f) in writes.into_iter().flatten() {
             self.d[idx] = d;
             self.freeze[idx] = f;
         }
@@ -653,7 +663,10 @@ pub fn apply_liquify(src: &Surface, field: &LiquifyField) -> Surface {
     if field.is_identity() || b.is_empty() {
         return out;
     }
-    let maxd = f64::from(field.max_displacement()).ceil() as i32 + 3;
+    // A 1D Catmull-Rom stencil's absolute weights sum to at most 5/4, so the 2D
+    // interpolated displacement can reach 25/16 of the largest nodal displacement.
+    let maxd = ((f64::from(field.max_displacement()) * (25.0 / 16.0)).ceil() as i32).saturating_add(3);
+    let has_freeze = field.freeze.iter().any(|&f| f > 0.0);
     let tiles: Vec<Rect> = b.tiles().map(|t| t.rect().intersect(&b)).filter(|r| !r.is_empty() && field.touches(*r)).collect();
     let work = |t: &Rect| -> Option<(Rect, Vec<f32>)> {
         let w = t.width() as usize;
@@ -670,7 +683,15 @@ pub fn apply_liquify(src: &Surface, field: &LiquifyField) -> Surface {
                 let px = f64::from(t.x0) + x as f64 + 0.5;
                 let gx = (px - f64::from(b.x0) - 0.5) / field.cell;
                 let wx = catmull_rom(gx - gx.floor());
-                let d = field.sample_cubic(gx, gy, &wx, &wy);
+                let mut d = field.sample_cubic(gx, gy, &wx, &wy);
+                if has_freeze {
+                    let mask = f64::from(field.freeze_at(px, py)).clamp(0.0, 1.0);
+                    if mask > 0.0 {
+                        let linear = field.sample(px, py);
+                        d[0] = d[0] * (1.0 - mask) + linear[0] * mask;
+                        d[1] = d[1] * (1.0 - mask) + linear[1] * mask;
+                    }
+                }
                 if d[0] != 0.0 || d[1] != 0.0 {
                     moved = true;
                 }
@@ -920,18 +941,23 @@ impl ProxyImage {
             return false;
         }
         source_scratch.resize(source_len, [0.0; 4]);
-        src.read_rgba_into(src_rect, source_scratch);
-        if !src.format().alpha {
-            for pixel in source_scratch.iter_mut() {
-                pixel[3] = 1.0;
+        // Read and premultiply the source in one pass per band of rows, the bands in parallel: at
+        // an 800 px brush it is about a million pixels (P30).
+        let opaque = !src.format().alpha;
+        const BAND_ROWS: usize = 32;
+        par::chunks_mut(source_scratch, sw * BAND_ROWS, true, |band_index, band| {
+            let y = src_rect.y0 + (band_index * BAND_ROWS) as i32;
+            src.read_rgba_into(Rect::new(src_rect.x0, y, src_rect.x1, y + (band.len() / sw) as i32), band);
+            for pixel in band.iter_mut() {
+                if opaque {
+                    pixel[3] = 1.0;
+                }
+                let alpha = pixel[3];
+                pixel[0] *= alpha;
+                pixel[1] *= alpha;
+                pixel[2] *= alpha;
             }
-        }
-        for pixel in source_scratch.iter_mut() {
-            let alpha = pixel[3];
-            pixel[0] *= alpha;
-            pixel[1] *= alpha;
-            pixel[2] *= alpha;
-        }
+        });
 
         let x0 = (region.x0 - bounds.x0) as usize;
         let x1 = (region.x1 - bounds.x0) as usize;
@@ -1374,6 +1400,42 @@ mod tests {
         assert!(g.freeze_at(40.0, 32.0) < 0.01 && g.freeze_at(5.0, 5.0) > 0.99);
         g.apply_stroke(&LiquifyStroke::new(LiquifyTool::ThawAll, 1.0));
         assert!(g.freeze.iter().all(|f| *f == 0.0));
+    }
+
+    #[test]
+    fn fully_frozen_pixels_keep_their_mapping_when_an_adjacent_area_is_warped() {
+        let bounds = bounds();
+        let mut src = Surface::new(PixelFormat::new(ColorMode::Rgb, SampleType::F32, true));
+        for y in 0..bounds.height() {
+            for x in 0..bounds.width() {
+                src.write_pixel(x as i32, y as i32, &[x as f32 / bounds.width() as f32, y as f32 / bounds.height() as f32, 0.0, 1.0]);
+            }
+        }
+
+        let mut mask_only = LiquifyField::new(bounds, 2.0);
+        mask_only.apply_stroke(&lasso(&[[0.0, 0.0], [40.0, 0.0], [40.0, 64.0], [0.0, 64.0]], None));
+        assert_eq!(apply_liquify(&src, &mask_only), src);
+
+        let mut field = LiquifyField::new(bounds, 2.0);
+        let mut first_warp = LiquifyStroke::new(LiquifyTool::ForwardWarp, 40.0);
+        first_warp.points = vec![vec![22.0, 32.0], vec![34.0, 32.0]];
+        field.apply_stroke(&first_warp);
+
+        field.apply_stroke(&lasso(&[[0.0, 0.0], [40.0, 0.0], [40.0, 64.0], [0.0, 64.0]], None));
+        let frozen_pixel = (37, 32);
+        assert!(field.freeze_at(f64::from(frozen_pixel.0) + 0.5, f64::from(frozen_pixel.1) + 0.5) > 0.999);
+        let before = apply_liquify(&src, &field).pixel(frozen_pixel.0, frozen_pixel.1);
+        assert_ne!(before, src.pixel(frozen_pixel.0, frozen_pixel.1), "freezing must retain the earlier warp");
+        let neighbor_before = apply_liquify(&src, &field).pixel(43, 32);
+
+        let mut adjacent_warp = LiquifyStroke::new(LiquifyTool::ForwardWarp, 24.0);
+        adjacent_warp.points = vec![vec![44.0, 32.0], vec![52.0, 32.0]];
+        field.apply_stroke(&adjacent_warp);
+
+        let after = apply_liquify(&src, &field).pixel(frozen_pixel.0, frozen_pixel.1);
+        let neighbor_after = apply_liquify(&src, &field).pixel(43, 32);
+        assert_eq!(before, after, "a fully frozen pixel must keep its pre-neighbor-warp mapping");
+        assert_ne!(neighbor_before, neighbor_after, "an adjacent unfrozen pixel must still move");
     }
 
     #[test]

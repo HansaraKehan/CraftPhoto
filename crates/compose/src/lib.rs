@@ -399,6 +399,7 @@ pub fn render_layer(layer: &Layer, rect: Rect) -> Buffer {
             vector_masks: RenderVectorMasks::default(),
             fx_maps: Default::default(),
             fx_clip: Default::default(),
+            fx_over_budget: false,
             tone_luts: prepare_tones(std::slice::from_ref(layer), 0),
             doc: None,
             layer_keys: Default::default(),
@@ -689,11 +690,33 @@ fn render_reduced_with(doc: &Document, b: Rect, w: u32, h: u32, damage: Option<R
         });
         debug_assert!(ok.is_ok());
     }
-    for (i, p) in acc.iter_mut().enumerate() {
-        let ((x0, x1), (y0, y1)) = (span(ox0 + i % ow, fw, w), span(oy0 + i / ow, fh, h));
-        let n = ((y1 - y0) * (x1 - x0)).max(1) as f32;
-        let a = p[3];
-        *p = if a > 0.0 { [p[0] / a, p[1] / a, p[2] / a, a / n] } else { [0.0; 4] };
+    let col_w: Vec<usize> = (0..ow)
+        .map(|x| {
+            let (x0, x1) = span(ox0 + x, fw, w);
+            (x1 - x0).max(1)
+        })
+        .collect();
+    let norm_row = |row: usize, out: &mut [[f32; 4]]| {
+        let (y0, y1) = span(oy0 + row, fh, h);
+        let rh = (y1 - y0).max(1);
+        for (p, &cw) in out.iter_mut().zip(&col_w) {
+            let a = p[3];
+            if a > 0.0 {
+                let n = (rh * cw) as f32;
+                *p = [p[0] / a, p[1] / a, p[2] / a, a / n];
+            } else {
+                *p = [0.0; 4];
+            }
+        }
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use rayon::prelude::*;
+        acc.par_chunks_mut(ow).enumerate().for_each(|(row, out)| norm_row(row, out));
+    }
+    #[cfg(target_arch = "wasm32")]
+    for (row, out) in acc.chunks_mut(ow).enumerate() {
+        norm_row(row, out);
     }
     Buffer { rect: out, px: acc }
 }
@@ -749,6 +772,9 @@ struct Ctx<'a> {
     fx_maps: std::sync::Mutex<std::collections::HashMap<u64, (std::sync::Arc<effects::FxMaps>, bool)>>,
     /// The rectangle being rendered (a band of [`render_bands`]); see [`effect_region`].
     fx_clip: std::sync::Mutex<Option<Rect>>,
+    /// The whole-region effect maps of this render's layers wouldn't fit in the effect cache
+    /// together ([`fx_over_budget`]), so local ones are clipped to the render rect (#8330).
+    fx_over_budget: bool,
     /// The document being rendered (deep knockouts reveal its Background); `None` for a lone layer.
     doc: Option<&'a Document>,
     /// Effect-map identities of this render's document layers (see [`LayerKeys`]).
@@ -820,6 +846,7 @@ impl<'a> Ctx<'a> {
             vector_masks: RenderVectorMasks::default(),
             fx_maps: Default::default(),
             fx_clip: Default::default(),
+            fx_over_budget: fx_over_budget(&doc.layers, doc.bounds()),
             layer_keys: Default::default(),
             tone_luts: prepare_tones(&doc.layers, 0),
         }
@@ -962,8 +989,38 @@ pub fn adjustment_quantum(depth: photocraft_color::SampleType) -> Option<f32> {
 fn quantize(b: &mut Buffer, q: f32) {
     for p in &mut b.px {
         for v in p.iter_mut() {
-            *v = (*v * q + 0.5).floor() / q;
+            *v = branchless_floor(*v * q + 0.5) / q;
         }
+    }
+}
+
+/// `x.floor()`, bit for bit (signed zeros, infinities and NaNs included), without a call: baseline
+/// x86-64 has no SSE4.1 `roundss`, so `floor` is a software routine there, called once per sample
+/// of the backdrop under every adjustment layer ([`quantize`]). This form has no branch, so the
+/// loop vectorizes.
+#[inline]
+fn branchless_floor(x: f32) -> f32 {
+    // From 2^23 on every f32 is whole. Below it, adding and taking away 2^23 rounds to the
+    // nearest whole number; where that went up, step down.
+    const WHOLE: f32 = 8_388_608.0;
+    let a = x.abs();
+    let r = ((a + WHOLE) - WHOLE).copysign(x);
+    let r = if r > x { r - 1.0 } else { r };
+    if a < WHOLE { r } else { x }
+}
+
+/// Blend an adjustment layer's result (`adjusted`) back into the backdrop it was made from, each
+/// pixel by its coverage `ks` (opacity × mask) in blend mode `mode`.
+fn blend_back(backdrop: &mut [[f32; 4]], adjusted: &[[f32; 4]], ks: impl Iterator<Item = f32>, mode: BlendMode) {
+    for ((b, a), k) in backdrop.iter_mut().zip(adjusted).zip(ks) {
+        if k <= 0.0 {
+            continue;
+        }
+        let s = [a[0], a[1], a[2]];
+        // Normal is the source as it is (`blend_rgb` gives exactly that), and most adjustment
+        // layers are Normal: no per-pixel mode dispatch for them.
+        let blended = if mode == BlendMode::Normal { s } else { blend::blend_rgb(mode, [b[0], b[1], b[2]], s) };
+        *b = [b[0] + (blended[0] - b[0]) * k, b[1] + (blended[1] - b[1]) * k, b[2] + (blended[2] - b[2]) * k, b[3]];
     }
 }
 
@@ -1047,11 +1104,13 @@ pub fn effect_source_bounds(layer: &Layer, canvas: Rect) -> Rect {
 /// shape's layer effects from its vector outline, not from its pixels: a stroke runs along the
 /// whole path even where a gradient fill fades out (psd-tools stroke-effects). `None` for other
 /// layers, shapes without fill, empty and inverted paths, and shapes whose vector stroke reaches
-/// past the path (their pixels give the outline: psd-tools double-stroke-effects).
+/// past the path (their pixels give the outline: psd-tools double-stroke-effects), and shapes
+/// with a density or feather.
 pub fn effect_outline(layer: &Layer) -> Option<&photocraft_doc::vector::Path> {
     let LayerContent::Shape(sh) = &layer.content else { return None };
     let stroke_inside = sh.stroke.as_ref().is_none_or(|s| s.width <= 0.0 || s.align == photocraft_doc::vector::StrokeAlign::Inside);
-    (sh.fill.is_some() && stroke_inside && !sh.path.is_empty() && !sh.path.inverted).then_some(&sh.path)
+    // A soft (feathered or less dense) fill's own alpha is its outline.
+    (sh.fill.is_some() && stroke_inside && !sh.path.is_empty() && !sh.path.inverted && !sh.has_soft_mask()).then_some(&sh.path)
 }
 
 /// The shape a layer's effects are built from over `rect` (row-major): its content's alpha
@@ -1141,8 +1200,9 @@ pub fn relayout_damage(a: &Document, b: &Document) -> Rect {
     out
 }
 
-/// The bounding box of a shape layer's vector content: its path control bounds plus stroke width.
-pub fn shape_bounds(sh: &photocraft_doc::ShapeLayer) -> Option<Rect> {
+/// The bounding box of a shape layer's path and stroke, ignoring its Density and Feather: its
+/// path control bounds plus stroke width (a conservative reach for any alignment, cap and join).
+pub fn hard_shape_bounds(sh: &photocraft_doc::ShapeLayer) -> Option<Rect> {
     if sh.fill.is_none() && sh.stroke.as_ref().is_none_or(|s| s.width <= 0.0 || s.opacity <= 0.0) {
         return None;
     }
@@ -1150,6 +1210,89 @@ pub fn shape_bounds(sh: &photocraft_doc::ShapeLayer) -> Option<Rect> {
     let stroke_margin = sh.stroke.as_ref().filter(|s| s.opacity > 0.0).map_or(0.0, |s| s.width.ceil()) as i32;
     let r = Rect::new(x0.floor() as i32, y0.floor() as i32, x1.ceil() as i32, y1.ceil() as i32).inflate(stroke_margin);
     (!r.is_empty()).then_some(r)
+}
+
+/// The frame Free Transform, the Move tool's transform controls, snapping and Properties show for
+/// a soft shape (Density below 100 % or a Feather), whose rendering reaches past its path: the
+/// pixels the same shape renders in `format` over `canvas` at full Density without Feather, so
+/// the frame is exactly the hard shape's whatever the stroke's alignment, cap and join (in
+/// Photoshop a shape's transform frame follows its path and stroke whatever its mask Density and
+/// Feather, #5846). An inverted path's frame is its own outline, not the whole canvas. Renders
+/// only the strips along the edges of the rasterizers' (1 px conservative) bounds.
+pub fn soft_shape_frame(sh: &photocraft_doc::ShapeLayer, format: photocraft_color::PixelFormat, canvas: Rect) -> Option<Rect> {
+    let mut path = sh.path.clone();
+    path.inverted = false;
+    let hard = photocraft_doc::ShapeLayer { density: 1.0, feather: 0.0, path, fill: sh.fill.clone(), stroke: sh.stroke.clone(), ..Default::default() };
+    let shape = photocraft_vector::CompiledShape::new(&hard, photocraft_vector::DEFAULT_TOLERANCE, canvas);
+    let r = shape.bounds()?.intersect(&canvas);
+    trim_to_painted(r, |strip| shape.render(format, strip).content_bounds())
+}
+
+/// `r` shrunk to the pixels `painted` reports (the painted bounds within a strip of `r`, empty if
+/// none), looking in from each edge through strips that double in thickness: a few renders per
+/// edge however wide the empty margin (a subtracted or intersected subpath can leave most of the
+/// rasterizers' bounds empty), and none of `r`'s inside rendered at once.
+fn trim_to_painted(mut r: Rect, mut painted: impl FnMut(Rect) -> Rect) -> Option<Rect> {
+    // Top: the first strip holding paint gives the first painted row.
+    let mut t = 1;
+    while !r.is_empty() {
+        let strip = Rect::new(r.x0, r.y0, r.x1, r.y0.saturating_add(t).min(r.y1));
+        let p = painted(strip).intersect(&strip);
+        if !p.is_empty() {
+            r.y0 = p.y0;
+            break;
+        }
+        r.y0 = strip.y1;
+        t = t.saturating_mul(2);
+    }
+    let mut t = 1;
+    while !r.is_empty() {
+        let strip = Rect::new(r.x0, r.y1.saturating_sub(t).max(r.y0), r.x1, r.y1);
+        let p = painted(strip).intersect(&strip);
+        if !p.is_empty() {
+            r.y1 = p.y1;
+            break;
+        }
+        r.y1 = strip.y0;
+        t = t.saturating_mul(2);
+    }
+    let mut t = 1;
+    while !r.is_empty() {
+        let strip = Rect::new(r.x0, r.y0, r.x0.saturating_add(t).min(r.x1), r.y1);
+        let p = painted(strip).intersect(&strip);
+        if !p.is_empty() {
+            r.x0 = p.x0;
+            break;
+        }
+        r.x0 = strip.x1;
+        t = t.saturating_mul(2);
+    }
+    let mut t = 1;
+    while !r.is_empty() {
+        let strip = Rect::new(r.x1.saturating_sub(t).max(r.x0), r.y0, r.x1, r.y1);
+        let p = painted(strip).intersect(&strip);
+        if !p.is_empty() {
+            r.x1 = p.x1;
+            break;
+        }
+        r.x1 = strip.x0;
+        t = t.saturating_mul(2);
+    }
+    (!r.is_empty()).then_some(r)
+}
+
+/// The bounding box of a shape layer's vector content: its path control bounds plus stroke width
+/// (and the reach of a soft fill).
+pub fn shape_bounds(sh: &photocraft_doc::ShapeLayer) -> Option<Rect> {
+    let r = hard_shape_bounds(sh)?;
+    // A soft fill reaches past the path: by its feather, or everywhere below 100 % density.
+    if sh.fill.is_some() && sh.has_soft_mask() {
+        if sh.density.is_finite() && sh.density < 1.0 {
+            return Some(Rect::new(i32::MIN / 4, i32::MIN / 4, i32::MAX / 4, i32::MAX / 4));
+        }
+        return Some(r.union(&photocraft_vector::feather::path_area(&sh.path, masks::feather_sigma(sh.feather))));
+    }
+    Some(r)
 }
 
 /// The layer's effective mask over `rect` (row-major), read once per tile: the pixel mask
@@ -1438,9 +1581,14 @@ pub fn composite_bounds(layer: &Layer, canvas: Rect) -> Option<Rect> {
 pub fn change_bounds(layer: &Layer, canvas: Rect) -> Option<Rect> {
     fn reaches_below(l: &Layer) -> bool {
         match &l.content {
-            // Clipped, it changes only its base's pixels.
             LayerContent::Adjustment(_) => !l.clipped,
-            LayerContent::Group(g) if l.blend == BlendMode::PassThrough => g.children.iter().any(reaches_below),
+            // Clipped to a base, an adjustment changes only the base's pixels; one with no base
+            // beneath it in its list composites as an ordinary adjustment (#6535).
+            LayerContent::Group(g) if l.blend == BlendMode::PassThrough => g.children.iter().enumerate().any(|(k, c)| {
+                let orphan =
+                    c.clipped && matches!(c.content, LayerContent::Adjustment(_)) && g.children.get(..k).is_none_or(|below| below.iter().all(|b| b.clipped));
+                orphan || reaches_below(c)
+            }),
             _ => false,
         }
     }
@@ -1448,6 +1596,35 @@ pub fn change_bounds(layer: &Layer, canvas: Rect) -> Option<Rect> {
         return None;
     }
     composite_bounds(layer, canvas)
+}
+
+/// [`change_bounds`] of `layers[k]` in its sibling list (bottom→top), which also bounds a clipped
+/// adjustment layer: it changes only its clip base's pixels, so it reaches as far as showing,
+/// hiding or restyling that base does (#6535). Still `None` when there is no base below it (the
+/// compositor then draws it as an ordinary adjustment) or the base is an adjustment itself
+/// (layers clipped to one composite atop the adjusted backdrop, everywhere). `outer` is the list
+/// holding the group whose children `layers` are, and that group's index there (`None` at the
+/// top level): a pass-through group that is a clip base renders isolated while it holds a visible
+/// adjustment, so showing or hiding one inside can change the whole group.
+pub fn change_bounds_in(layers: &[Layer], k: usize, outer: Option<(&[Layer], usize)>, canvas: Rect) -> Option<Rect> {
+    let layer = layers.get(k)?;
+    if layer.clipped && matches!(layer.content, LayerContent::Adjustment(_)) {
+        let base = layers.get(..k)?.iter().rev().find(|l| !l.clipped)?;
+        if matches!(base.content, LayerContent::Adjustment(_)) {
+            return None;
+        }
+        if let Some((outer, g)) = outer
+            && let Some(group) = outer.get(g)
+            && group.blend == BlendMode::PassThrough
+            && !group.clipped
+            && outer.get(g + 1).is_some_and(|above| above.clipped)
+        {
+            // The group bounds its base too.
+            return change_bounds(group, canvas);
+        }
+        return change_bounds(base, canvas);
+    }
+    change_bounds(layer, canvas)
 }
 
 /// Whether the layer's content is transparent outside its bounds (every surface it draws from
@@ -1748,18 +1925,23 @@ fn composite_layer_plain(layer: &Layer, clipped: &[Layer], backdrop: &mut Buffer
         cx.apply_adjustment(adj, &mut adjusted);
         // Clipped layers onto an adjustment are uncommon; they composite atop the adjusted result.
         advanced::composite_clipped(clipped, &mut adjusted, cx);
-        for y in rect.y0..rect.y1 {
-            for x in rect.x0..rect.x1 {
-                let i = ((y - rect.y0) as usize) * rect.width() as usize + (x - rect.x0) as usize;
-                let k = opacity * mask_k(&mv, i);
-                if k <= 0.0 {
-                    continue;
+        if layer.blend == BlendMode::Dissolve {
+            // An adjustment has no standalone source alpha. Its effective coverage comes from its
+            // own opacity and mask, not a continuous RGB mix (#3050).
+            for y in rect.y0..rect.y1 {
+                for x in rect.x0..rect.x1 {
+                    let i = ((y - rect.y0) as usize) * rect.width() as usize + (x - rect.x0) as usize;
+                    let k = opacity * mask_k(&mv, i);
+                    if k > 0.0 && dissolve_noise(x, y) < k {
+                        let a = adjusted.px[i];
+                        backdrop.px[i] = [a[0], a[1], a[2], backdrop.px[i][3]];
+                    }
                 }
-                // Only `adjusted` has changed; this pixel's original backdrop is still in place.
-                let b = backdrop.px[i];
-                let a = adjusted.px[i];
-                let blended = blend::blend_rgb(layer.blend, [b[0], b[1], b[2]], [a[0], a[1], a[2]]);
-                backdrop.px[i] = [b[0] + (blended[0] - b[0]) * k, b[1] + (blended[1] - b[1]) * k, b[2] + (blended[2] - b[2]) * k, b[3]];
+            }
+        } else {
+            match &mv {
+                Some(m) => blend_back(&mut backdrop.px, &adjusted.px, m.iter().map(|v| opacity * v), layer.blend),
+                None => blend_back(&mut backdrop.px, &adjusted.px, std::iter::repeat(opacity), layer.blend),
             }
         }
         recycle_buffer(adjusted);
@@ -1785,6 +1967,27 @@ fn composite_layer_plain(layer: &Layer, clipped: &[Layer], backdrop: &mut Buffer
             p[3] *= mask_k(&mask, i);
         }
         blend_into_fill(backdrop, &content, layer.blend, layer.opacity, layer.fill_opacity, 1.0);
+        return;
+    }
+    if !matches!(layer.content, LayerContent::Group(_) | LayerContent::Fill(_) | LayerContent::Adjustment(_))
+        && let Some(s) = layer.surface()
+        && layer.blend == BlendMode::Normal
+        && opacity >= 1.0
+        && !clipped.iter().any(|c| c.visible)
+        && layer.mask.is_none()
+        && layer.vector_mask.is_none()
+        && text_gamma(layer) == 1.0
+        && !psblend::LAB_MIX.with(|l| l.get())
+        && backdrop.px.iter().all(|p| p[3] <= 0.0)
+    {
+        s.read_rgba_into(rect, &mut backdrop.px);
+        for p in &mut backdrop.px {
+            if p[3] <= 0.0 {
+                *p = [0.0; 4];
+            } else if p[3] < 1.0 {
+                *p = psblend::composite_normal_rgb([0.0; 4], *p, 1.0);
+            }
+        }
         return;
     }
     if clipped.is_empty()
@@ -1973,7 +2176,9 @@ fn fx_cache() -> &'static std::sync::Mutex<FxCache> {
 /// 1920 × 103675 webtoon page each such layer's maps took about 2.4 GB, and a render held them for
 /// every layer at once (60 GB with 25 stroked type layers, #1909). When its effects are local
 /// ([`effects::maps_are_local`]), such a layer's maps are built over the render rectangle padded
-/// by twice the effect reach instead, which gives the same pixels there. Only when `rect`, what
+/// by twice the effect reach instead, which gives the same pixels there. So are any layer's local
+/// maps when the render's whole-region maps wouldn't fit in the effect cache ([`fx_over_budget`]).
+/// Only when `rect`, what
 /// the caller composites the layer over, lies within the render rectangle: a group's effect shape
 /// (or anything else rendering children over a wider area) gets the whole region.
 fn effect_region(layer: &Layer, rect: Rect, cx: &Ctx) -> (Rect, bool) {
@@ -1981,12 +2186,44 @@ fn effect_region(layer: &Layer, rect: Rect, cx: &Ctx) -> (Rect, bool) {
     let region = effect_source_bounds(layer, cx.canvas).inflate(m).intersect(&cx.canvas.inflate(m));
     let clip = *cx.fx_clip.lock().unwrap_or_else(|e| e.into_inner());
     match clip {
-        Some(c) if c.contains_rect(&rect) && advanced::shapeless(layer) && effects::maps_are_local(layer) => {
+        Some(c) if c.contains_rect(&rect) && (advanced::shapeless(layer) || cx.fx_over_budget) && effects::maps_are_local(layer) => {
             let part = region.intersect(&c.inflate(m.saturating_mul(2)));
             (part, part != region)
         }
         _ => (region, false),
     }
+}
+
+/// Whether the effect maps of the visible layers of `layers` (groups included), each over its
+/// whole region, would take more than the effect cache budget together. A render needs all of
+/// them, so when they don't fit, building one evicts the next one needed and every render builds
+/// them all again, seconds even for a small rect (#8330). Counted as [`effects::FxMaps::bytes`]
+/// counts the built maps ([`effects::map_count`] arrays over each region).
+fn fx_over_budget(layers: &[Layer], canvas: Rect) -> bool {
+    fx_region_bytes(layers, canvas) > effect_cache_budget() as u64
+}
+
+/// The bytes [`fx_over_budget`] compares with the budget.
+fn fx_region_bytes(layers: &[Layer], canvas: Rect) -> u64 {
+    fn bytes(layers: &[Layer], canvas: Rect, depth: u32) -> u64 {
+        let mut total = 0u64;
+        for l in layers.iter().filter(|l| l.visible) {
+            if effects::has_effects(l) {
+                let m = effects::margin(l);
+                let region = effect_source_bounds(l, canvas).inflate(m).intersect(&canvas.inflate(m));
+                let maps = effects::map_count(l) as u64;
+                let px = u64::from(region.width()) * u64::from(region.height());
+                total = total.saturating_add(maps.saturating_mul(px).saturating_mul(4));
+            }
+            if let LayerContent::Group(g) = &l.content
+                && depth < PREPARE_DEPTH
+            {
+                total = total.saturating_add(bytes(&g.children, canvas, depth + 1));
+            }
+        }
+        total
+    }
+    bytes(layers, canvas, 0)
 }
 
 /// The layer's effect maps over its region (layer bounds grown by the effect reach, within the
@@ -2102,6 +2339,14 @@ fn composite_atop_any(layer: &Layer, base: &mut Buffer, cx: &Ctx) {
         for (i, p) in base.px.iter_mut().enumerate() {
             let k = layer.opacity * layer.fill_opacity * mask_k(&mv, i);
             let a = adjusted.px[i];
+            if layer.blend == BlendMode::Dissolve {
+                let x = rect.x0 + (i % rect.width() as usize) as i32;
+                let y = rect.y0 + (i / rect.width() as usize) as i32;
+                if dissolve_noise(x, y) < k {
+                    *p = [a[0], a[1], a[2], p[3]];
+                }
+                continue;
+            }
             let bl = blend::blend_rgb(layer.blend, [p[0], p[1], p[2]], [a[0], a[1], a[2]]);
             for c in 0..3 {
                 p[c] += (bl[c] - p[c]) * k;
@@ -2148,6 +2393,16 @@ fn composite_atop_any(layer: &Layer, base: &mut Buffer, cx: &Ctx) {
             continue;
         }
         let s = content.px[i];
+        if layer.blend == BlendMode::Dissolve {
+            // Clipping preserves the opaque base's alpha. Dissolve still selects source
+            // pixels by spatial coverage instead of continuously mixing the colours (#3052).
+            let x = rect.x0 + (i as i32 % rect.width() as i32);
+            let y = rect.y0 + (i as i32 / rect.width() as i32);
+            if dissolve_noise(x, y) < s[3] * opacity {
+                *p = [s[0], s[1], s[2], alpha];
+            }
+            continue;
+        }
         // Blend as if the base were opaque, then keep the base's alpha.
         let r = blend::composite_gamma(layer.blend, [p[0], p[1], p[2], 1.0], s, opacity, gamma);
         *p = [r[0], r[1], r[2], alpha];
@@ -2213,6 +2468,8 @@ fn blend_span_g(dst: &mut [[f32; 4]], src: &[[f32; 4]], x0: i32, y: i32, mode: B
     }
 }
 
+#[cfg(test)]
+mod soft_shape_tests;
 #[cfg(test)]
 mod stroke_tests;
 #[cfg(test)]

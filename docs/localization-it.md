@@ -44,8 +44,17 @@ command names joined by a slash, which keep both capitals (*Luminosità/Contrast
 | HDR Toning | Mappatura tonale HDR | tone mapping; *Viraggio* stays for colour toning (*Viraggio separato*) |
 | Bevel & Emboss | Smusso e rilievo | pairs with *Rilievo* (Emboss) |
 | Linked (smart object) | Oggetto collegato | *Inserisci oggetto collegato*, *Converti in oggetto collegato* |
+| Screen (blend mode) | Scherma | the blend mode; *Schermo* stays for the display (*Modalità schermo*, *Risoluzione schermo*) |
+| Dodge / Burn / Sponge (tools) | Scherma / Brucia / Spugna | the *tools*, one family. *Scherma* is also the `Screen` blend mode (Adobe's own collision). *Schiarisci* is the `Lighten` blend mode and is never the Dodge tool |
 
 ## Native review
+
+2026-10-13: `Screen` was *Schermo* — the display, not the blend mode — and is now *Scherma*, the
+word Adobe uses. The Dodge/Burn/Sponge tools were left as they were (*Scherma*, *Brucia*, *Spugna*):
+a first pass also wanted to rename the Dodge tool to *Schiarisci*, but that is the `Lighten` blend
+mode and would have given two different things the same name. The wording is pinned by a test
+(`i18n::tests::italian_names_the_dodge_tools_and_the_screen_blend_mode_as_photoshop_does`), which
+also keeps the tool family together.
 
 2026-10-12: a native Italian speaker read the catalog and fixed mistranslations (Trap, HDR
 Toning, Display Text, Vine Color, Override Action "Save" Commands) and unnatural phrasing (Bevel &

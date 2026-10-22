@@ -32,12 +32,21 @@ pub struct TySh {
     pub bounds: [f32; 4],
 }
 
+/// Whether a type transform can reach rendering or egui. Pixel coordinates use i32 throughout
+/// the document, so non-finite and unrepresentable affine terms are rejected (#4758).
+pub fn transform_is_safe(t: &Affine) -> bool {
+    t.m.iter().all(|v| v.is_finite() && v.abs() <= f64::from(i32::MAX))
+}
+
 /// Parses a `TySh` block.
 pub fn parse_tysh(data: &[u8]) -> Option<TySh> {
     let f = |at: usize| data.get(at..at + 8).map(|b| f64::from_be_bytes(b.try_into().unwrap_or([0; 8])));
     let mut m = [0.0; 6];
     for (i, v) in m.iter_mut().enumerate() {
         *v = f(2 + i * 8)?;
+    }
+    if !transform_is_safe(&Affine { m }) {
+        return None;
     }
     let (text, used) = VersionedDescriptor::parse_prefix(data.get(52..)?).ok()?;
     let rest = data.get(52 + used..).unwrap_or(&[]);
@@ -1104,6 +1113,14 @@ pub fn build_txt2_at(objects: &[(i32, &TextLayer)], previous: Option<&[u8]>, dpi
     let prev = previous.and_then(parse_txt2);
     let prev_objects: &[E] = prev.as_ref().and_then(|p| p.path(&["1", "1"]).and_then(E::as_array)).unwrap_or(&[]);
     let mut slots: Vec<E> = prev_objects.to_vec();
+    // The older Photoshop's objects (#6971): named keys at `/DocumentObjects /TextObjects`
+    // instead of the numbered `/1 /1`, one entry per layer by `TextIndex` position (the same
+    // numbering the slots take), its text under `Model /Text` and its run lengths under `/Length`.
+    // Photoshop re-renders a type layer from this copy when the file has one, so an edit that
+    // left the old text here showed the old text back on reopen. The entries are only ever edited
+    // in place, never grown: a layer the block has no entry for has no stale copy to fix.
+    let mut td: Option<Vec<E>> = prev.as_ref().and_then(|p| p.path(&["DocumentObjects", "TextObjects"])).and_then(E::as_array).map(<[E]>::to_vec);
+    let mut td_changed = false;
     let mut fonts: Vec<E> = prev.as_ref().and_then(|p| p.path(&["0", "1", "0"]).and_then(E::as_array)).map(<[E]>::to_vec).unwrap_or_default();
     let fonts_before = fonts.len();
     // Looked up once per save, not per layer: a crafted block with many objects must not cost
@@ -1118,6 +1135,21 @@ pub fn build_txt2_at(objects: &[(i32, &TextLayer)], previous: Option<&[u8]>, dpi
         let text = format!("{}\r", layer.text.replace('\n', "\r"));
         let modes = txt2_mode_runs(layer);
         let at = *index as usize;
+        // The older Photoshop's copy of this object (#6971), refitted like the numbered one
+        // below. The entry's own text is the check, so a file a previous save left with a stale
+        // copy beside a current `/1 /1` object is repaired here too.
+        if let Some(entries) = td.as_mut() {
+            let fixed = match entries.get(at) {
+                Some(entry) if entry.path(&["Model", "Text"]).and_then(E::as_str) != Some(text.as_str()) => td_edited_object(entry, &text),
+                _ => None,
+            };
+            if let Some(fixed) = fixed
+                && let Some(slot) = entries.get_mut(at)
+            {
+                *slot = fixed;
+                td_changed = true;
+            }
+        }
         // A stub an earlier save wrote beside Photoshop's objects counts as no object at all, so
         // it is replaced like a missing one (below) and re-saving such a file repairs it, whether
         // or not the layer's text changed.
@@ -1182,6 +1214,14 @@ pub fn build_txt2_at(objects: &[(i32, &TextLayer)], previous: Option<&[u8]>, dpi
         Some(objs @ E::Dict(_)) => objs.set("1", E::Array(slots)),
         _ => outer.set("1", E::Dict(vec![("1".into(), E::Array(slots))])),
     }
+    // The older Photoshop's objects, whatever the loop fixed in them (an untouched list is left
+    // exactly as the file has it, so the byte-for-byte return below still holds).
+    if td_changed
+        && let Some(entries) = td
+        && let Some(objects @ E::Dict(_)) = outer.get_mut("DocumentObjects")
+    {
+        objects.set("TextObjects", E::Array(entries));
+    }
     // Nothing changed: the file's own bytes (writing them back would re-encode strings and numbers).
     if let (Some(bytes), Some(p)) = (previous, &prev)
         && *p == outer
@@ -1237,7 +1277,7 @@ fn new_object(template: &E, at: usize, text: &str) -> Option<E> {
         }
     }
     if let Some(runs) = view.path(&["1", "0"]).and_then(E::as_array) {
-        let fitted = runs_per(runs, &paragraphs)?;
+        let fitted = runs_per(runs, &paragraphs, "1")?;
         view.get_mut("1")?.set("0", E::Array(fitted));
     }
     Some(object)
@@ -1290,34 +1330,82 @@ fn edited_object(object: &E, text: &str) -> Option<E> {
         let Some(runs) = value.get("0").and_then(E::as_array).filter(|r| r.iter().all(|x| matches!(x, E::Dict(_)) && x.get("1").is_some())) else {
             continue;
         };
-        let fitted = if key.as_str() == "5" { runs_per(runs, &paragraphs)? } else { runs_to_length(runs, total)? };
+        let fitted = if key.as_str() == "5" { runs_per(runs, &paragraphs, "1")? } else { runs_to_length(runs, total, "1")? };
         value.set("0", E::Array(fitted));
     }
     Some(object)
 }
 
-/// `runs` (`<< … /1 length >>`) remade with the lengths `lens`: run i keeps the content of the
-/// file's run i, else of its last one. `None` for an empty `runs`.
-fn runs_per(runs: &[E], lens: &[usize]) -> Option<Vec<E>> {
+/// The older Photoshop's `Txt2` text object `object` (`<< /Model << /Text … /ParagraphRun … >>
+/// /View … >>`) for the changed engine text `text` (`\r` breaks, trailing `\r`): the model's text
+/// replaced and every run array of the model refitted the way [`edited_object`] refits the
+/// numbered objects' — the paragraph runs (`/ParagraphRun`) one per paragraph of the new text, the
+/// others (`/StyleRun`, `/KernRun`, …) cut or extended to the new total. The model's other keys,
+/// the view and the rest are kept: these blocks (the objects at `/DocumentObjects /TextObjects`
+/// that older Photoshop versions write and re-render from, #6971) name their keys and number
+/// their runs with `/Length` in UTF-16 units instead of `/1`. `None` when the object or one of
+/// its run arrays isn't shaped as Photoshop writes it: the caller then leaves the entry as the
+/// file has it, rather than write text its runs don't cover (#6968).
+fn td_edited_object(object: &E, text: &str) -> Option<E> {
+    let mut object = object.clone();
+    let model = object.get_mut("Model").filter(|m| matches!(m, E::Dict(_)))?;
+    let E::Dict(entries) = model else { return None };
+    // The text must be there to replace: refitted runs over a text the model doesn't hold would
+    // be a half-edited object.
+    if !entries.iter().any(|(k, v)| k == "Text" && matches!(v, E::String(_))) {
+        return None;
+    }
+    let total = utf16_len(text) as usize;
+    let paragraphs: Vec<usize> = text.split_inclusive('\r').map(|p| p.encode_utf16().count()).collect();
+    for (key, value) in entries.iter_mut() {
+        if key.as_str() == "Text" {
+            *value = E::String(text.to_string());
+            continue;
+        }
+        if !matches!(value, E::Dict(_)) {
+            continue;
+        }
+        // A model dict without `RunArray` isn't a run array (the view's keys live elsewhere), so
+        // it is skipped; a named `RunArray` is unambiguous — malformed, the whole entry is left to
+        // the file rather than half-updated.
+        let Some(runs) = value.get("RunArray") else { continue };
+        let fitted = match runs {
+            E::Array(runs) if runs.iter().all(|x| matches!(x, E::Dict(_)) && x.get("Length").is_some()) => {
+                if key.as_str() == "ParagraphRun" {
+                    runs_per(runs, &paragraphs, "Length")?
+                } else {
+                    runs_to_length(runs, total, "Length")?
+                }
+            }
+            _ => return None,
+        };
+        value.set("RunArray", E::Array(fitted));
+    }
+    Some(object)
+}
+
+/// `runs` (`<< … /1 length >>`, the length key named `len_key`) remade with the lengths `lens`:
+/// run i keeps the content of the file's run i, else of its last one. `None` for an empty `runs`.
+fn runs_per(runs: &[E], lens: &[usize], len_key: &str) -> Option<Vec<E>> {
     let last = runs.last()?;
     lens.iter()
         .enumerate()
         .map(|(i, &len)| {
             let mut r = runs.get(i).unwrap_or(last).clone();
-            r.set("1", E::Int(i64::try_from(len).ok()?));
+            r.set(len_key, E::Int(i64::try_from(len).ok()?));
             Some(r)
         })
         .collect()
 }
 
-/// `runs` (`<< … /1 length >>`) covering `total` UTF-16 units: the leading runs as they were, cut
-/// where `total` ends, the last kept run extended when `total` is longer. Empty runs are dropped.
-/// `None` when `runs` is empty or a length isn't a count.
-fn runs_to_length(runs: &[E], total: usize) -> Option<Vec<E>> {
+/// `runs` (`<< … /1 length >>`, the length key named `len_key`) covering `total` UTF-16 units:
+/// the leading runs as they were, cut where `total` ends, the last kept run extended when `total`
+/// is longer. Empty runs are dropped. `None` when `runs` is empty or a length isn't a count.
+fn runs_to_length(runs: &[E], total: usize, len_key: &str) -> Option<Vec<E>> {
     let mut out: Vec<(E, usize)> = Vec::new();
     let mut left = total;
     for r in runs {
-        let len = r.get("1").and_then(E::as_i64).and_then(|l| usize::try_from(l).ok())?;
+        let len = r.get(len_key).and_then(E::as_i64).and_then(|l| usize::try_from(l).ok())?;
         let take = len.min(left);
         if take > 0 {
             out.push((r.clone(), take));
@@ -1332,7 +1420,7 @@ fn runs_to_length(runs: &[E], total: usize) -> Option<Vec<E>> {
     }
     out.into_iter()
         .map(|(mut r, len)| {
-            r.set("1", E::Int(i64::try_from(len).ok()?));
+            r.set(len_key, E::Int(i64::try_from(len).ok()?));
             Some(r)
         })
         .collect()
@@ -1660,6 +1748,25 @@ pub fn build_tysh(layer: &TextLayer, dpi: f32, ink: Option<[f32; 4]>) -> Vec<u8>
     let warped = warp.as_ref().is_some_and(|w| enum_value(w, "warpStyle").is_some_and(|s| s != "warpNone"));
     let bounds = if warped { [l, t, r, b] } else { [0.0; 4] };
     write_tysh(&TySh { transform: layer.transform, text, warp, bounds })
+}
+
+#[cfg(test)]
+mod transform_safety_tests {
+    use super::*;
+
+    #[test]
+    fn unsafe_affine_terms_are_not_editable_type() {
+        let mut t = TySh { transform: Affine::IDENTITY, text: Descriptor::new("TxLr"), warp: None, bounds: [0.0; 4] };
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1.315776645269349e62, 1.4759871577491642e307] {
+            for i in 0..6 {
+                t.transform = Affine::IDENTITY;
+                t.transform.m[i] = bad;
+                assert!(parse_tysh(&write_tysh(&t)).is_none(), "term {i}: {bad}");
+            }
+        }
+        t.transform = Affine { m: [0.0, -2.01242653341062, 2.286521576443544, 0.0, 586.63, 2452.60] };
+        assert_eq!(parse_tysh(&write_tysh(&t)).unwrap().transform, t.transform);
+    }
 }
 
 #[cfg(test)]

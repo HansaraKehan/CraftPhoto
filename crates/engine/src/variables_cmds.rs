@@ -165,7 +165,7 @@ fn apply_to_doc(doc: &mut Document, vars: &Variables, set: &DataSet) -> Result<(
                 }
             }
             (VarKind::TextReplacement, VarValue::Text(text)) => {
-                let snapshot = doc.clone();
+                let (dpi, format) = (doc.resolution_dpi, doc.pixel_format());
                 if let Some(l) = doc.layer_mut(def.layer)
                     && let LayerContent::Text(t) = &mut l.content
                 {
@@ -180,7 +180,7 @@ fn apply_to_doc(doc: &mut Document, vars: &Variables, set: &DataSet) -> Result<(
                     t.sync_summary();
                     // The compositor draws a type layer from its cache: clearing it left the
                     // layer blank until some other edit re-rendered it (#990).
-                    crate::type_cmds::refresh(&snapshot, t);
+                    crate::type_cmds::refresh_at(dpi, format, t);
                 }
             }
             (VarKind::PixelReplacement { method, align, clip }, VarValue::Pixels(path)) => {

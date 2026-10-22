@@ -133,6 +133,18 @@ pub fn merge_brush(base: &BrushSettings, patch: &Value, cmd: &str) -> Result<Bru
     let pattern = (!touches(&["texture", "pattern"])).then(|| std::mem::take(&mut light.texture.pattern));
     let mut v = serde_json::to_value(&light).map_err(|e| bad(cmd, e.to_string()))?;
     merge(&mut v, patch);
+    // A legacy command sets both axes. The base JSON already has the new keys,
+    // so copy the alias into axes the patch didn't set before deserialising it.
+    if let Some(pose_patch) = patch.get("pose").and_then(Value::as_object)
+        && let Some(legacy) = pose_patch.get("overrideTilt")
+        && let Some(pose) = v.get_mut("pose").and_then(Value::as_object_mut)
+    {
+        for axis in ["overrideTiltX", "overrideTiltY"] {
+            if !pose_patch.contains_key(axis) {
+                pose.insert(axis.to_string(), legacy.clone());
+            }
+        }
+    }
     let mut out: BrushSettings = serde_json::from_value(v).map_err(|e| bad(cmd, format!("invalid brush: {e}")))?;
     if let Some(t) = tip {
         out.tip = t;
@@ -1036,23 +1048,43 @@ pub fn remember_brush(s: &mut Session) {
 /// bitmap. `None` while a sampled bitmap too big to embed is current (only before the store
 /// externalizes it; see [`ref_tip`]), so the previous remembered brush stands.
 fn remembered_brush(s: &Session) -> Option<Value> {
-    let b = &s.tools.brush;
+    Some(json!({ "preset": s.tools.current_preset.clone(), "brush": remembered_settings(&s.tools.brush)? }))
+}
+
+/// A brush as JSON for the preferences (the last brush, each painting tool's own brush): its
+/// settings with stored tips as references, never their full bitmaps. `None` while a sampled
+/// bitmap too big to embed is in it (only before the preset store externalizes it).
+pub fn remembered_settings(b: &BrushSettings) -> Option<Value> {
     let (tip, dual, pattern) = (ref_tip(&b.tip)?, ref_tip(&b.dual_brush.tip)?, ref_pattern(&b.texture.pattern)?);
     let mut c = b.clone();
     (c.tip, c.dual_brush.tip, c.texture.pattern) = (tip, dual, pattern);
-    Some(json!({ "preset": s.tools.current_preset.clone(), "brush": serde_json::to_value(&c).ok()? }))
+    serde_json::to_value(&c).ok()
+}
+
+/// A brush remembered by [`remembered_settings`], read back at launch: `None` when the value is
+/// not a brush or fails the checks `tools.setBrush` makes (a size or scatter out of range). The
+/// options-bar values are clamped to the ranges their controls allow (size 1..max px; hardness,
+/// opacity, flow and smoothing 0..100 %), and stored tips load when the store is attached (else
+/// they paint with their previews until `Session::attach_preset_store`).
+pub fn restored_settings(s: &Session, v: &Value) -> Option<BrushSettings> {
+    if !v.is_object() {
+        return None;
+    }
+    let mut b = merge_brush(&BrushSettings::default(), v, "brush.restore").ok()?;
+    validate_brush(&b, "brush.restore").ok()?;
+    b.size = b.size.clamp(1.0, photocraft_paint::MAX_BRUSH_SIZE);
+    for f in [&mut b.hardness, &mut b.opacity, &mut b.flow, &mut b.smoothing.amount] {
+        *f = if f.is_nan() { 1.0 } else { f.clamp(0.0, 1.0) };
+    }
+    let _ = s.load_brush_tips(&mut b);
+    Some(b)
 }
 
 /// Restore `Preferences::last_brush` into the session at launch (a missing or malformed value
 /// keeps the default brush). Stored tips load when the preset store attaches.
 pub fn restore_brush(s: &mut Session) {
     let v = s.prefs().last_brush.clone();
-    let Some(patch) = v.get("brush").filter(|b| b.is_object()) else { return };
-    let Ok(mut b) = merge_brush(&BrushSettings::default(), patch, "brush.restore") else { return };
-    if validate_brush(&b, "brush.restore").is_err() {
-        return;
-    }
-    let _ = s.load_brush_tips(&mut b);
+    let Some(b) = v.get("brush").and_then(|b| restored_settings(s, b)) else { return };
     s.tools.brush = b;
     s.tools.current_preset = v.get("preset").and_then(Value::as_str).map(str::to_string);
     // What was just restored is exactly what the preferences hold: nothing new to write.
@@ -1119,7 +1151,13 @@ pub fn brush_patch(old: &BrushSettings, new: &BrushSettings) -> Value {
             _ => (a != b).then(|| b.clone()),
         }
     }
-    diff(&light_json(old, skip), &light_json(new, skip)).unwrap_or_else(|| json!({}))
+    let mut patch = diff(&light_json(old, skip), &light_json(new, skip)).unwrap_or_else(|| json!({}));
+    // This readback is derived from the axis flags. Sending it alongside a
+    // one-axis delta would also overwrite the other axis through the legacy alias.
+    if let Some(pose) = patch.get_mut("pose").and_then(Value::as_object_mut) {
+        pose.remove("overrideTilt");
+    }
+    patch
 }
 
 /// Journal hook ([`Session::execute`]): consecutive `tools.setBrush` calls with the same
@@ -1201,7 +1239,14 @@ pub fn specs() -> Vec<CommandSpec> {
         spec!("brush.presets.setCurrent", "Set Current Brush Preset", r##"{"name":string}"##, always, presets_set_current, true),
         spec!("brush.defineFromSelection", "Define Brush Preset…", r##"{"name":string}"##, has_selection_and_pixels, define_from_selection, true),
         spec!("brush.get", "Get Brush", "{}", always, |s, _| Ok(brush_json(&s.tools.brush)), false),
-        spec!("tools.setBrush", "Set Brush", r##"{"preset":name?,"reset":bool?,…BrushSettings fields (camelCase, deep-merged)}"##, always, set_brush, true),
+        spec!(
+            "tools.setBrush",
+            "Set Brush",
+            r##"{"preset":name?,"reset":bool?,…BrushSettings fields (camelCase, deep-merged; pose.overrideTiltX/Y:bool; pose.overrideTilt:legacy combined alias)}"##,
+            always,
+            set_brush,
+            true
+        ),
     ]
 }
 

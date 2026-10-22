@@ -93,7 +93,7 @@ impl CameraRawDialog {
             Target::SmartFilter(index) => Some(index),
             Target::NewFilter | Target::OpenRaw => None,
         });
-        result["openingRaw"] = json!(self.raw_open.as_ref().map(|r| json!({"name": r.name, "path": r.path})));
+        result["openingRaw"] = json!(self.raw_open.as_ref().map(|r| json!({"name": r.name, "path": r.path, "demosaic": r.demosaic.id()})));
         result["view"] = json!(navigation);
         result["sourceSize"] = json!([self.full_w, self.full_h]);
         result["previewPending"] = json!(self.render_pending());
@@ -240,6 +240,20 @@ impl CameraRawDialog {
     pub(crate) fn render_pending(&self) -> bool {
         self.pending.is_some()
     }
+
+    /// A newer frame means the worker failure is over: takes its message down, unless something
+    /// else has reported since.
+    fn clear_recovered_error(&mut self, ui: &mut crate::UiState) {
+        let Some((e, revision)) = &self.preview_error else { return };
+        if *revision == self.preview_revision {
+            return;
+        }
+        if ui.status_error && ui.status == *e {
+            ui.status.clear();
+            ui.status_error = false;
+        }
+        self.preview_error = None;
+    }
 }
 
 /// Everything one develop of the proxy reads, owned, so it can run off the UI thread.
@@ -305,10 +319,10 @@ enum Target {
 
 /// A raw file opened interactively, shown in Camera Raw before it is kept (as Photoshop opens
 /// raws in Adobe Camera Raw first). The document is already developed with the defaults; Open
-/// re-develops it when Temperature, Tint, Exposure, Shadows, Highlights, Clarity, Texture or
-/// Dehaze changed (those act on the sensor data, see [`photocraft_io::raw::import_raw_tuned`])
-/// and applies the other settings as one Camera Raw step, then marks the document unmodified.
-/// Cancel closes it.
+/// re-develops it when Temperature, Tint, Exposure, Shadows, Highlights, Clarity, Texture,
+/// Dehaze or the demosaic method changed (those act on the sensor data, see
+/// [`photocraft_io::raw::import_raw_tuned`]) and applies the other settings as one Camera Raw
+/// step, then marks the document unmodified. Cancel closes it.
 #[derive(Clone, Debug)]
 pub struct RawOpen {
     pub document: photocraft_doc::DocId,
@@ -316,6 +330,10 @@ pub struct RawOpen {
     pub path: Option<String>,
     /// The file, when it was opened from bytes (no path to read it again from).
     pub bytes: Option<std::sync::Arc<Vec<u8>>>,
+    /// The demosaic method the open developed it with.
+    pub developed_with: photocraft_io::raw::Demosaic,
+    /// The method chosen in the dialog: Open re-develops when it differs from `developed_with`.
+    pub demosaic: photocraft_io::raw::Demosaic,
 }
 
 /// Should an interactive open of `name` show the open-time Camera Raw dialog? `warnings` are
@@ -330,16 +348,32 @@ pub fn without_develop_note(warnings: &[String]) -> Vec<String> {
     warnings.iter().filter(|w| !w.contains(photocraft_io::raw::DEVELOPED_NOTE)).cloned().collect()
 }
 
-/// Queues the open-time dialog for the active document (shown on the next frame).
-pub fn queue_open_dialog(app: &mut PhotocraftApp, name: &str, path: Option<&str>, bytes: Option<&[u8]>) {
-    if let Some(st) = app.session.active() {
-        app.pending_raw_open = Some(RawOpen {
-            document: st.doc.id,
-            name: name.to_string(),
-            path: path.map(str::to_string),
-            bytes: bytes.map(|b| std::sync::Arc::new(b.to_vec())),
-        });
+/// Queues the open-time dialog for the document whose import completed, independent of the
+/// active tab. A delayed completion for a closed document must not review another photograph.
+/// `warnings` are the import's: its note says which demosaic method the open developed with.
+pub fn queue_open_dialog(
+    app: &mut PhotocraftApp,
+    document: photocraft_doc::DocId,
+    name: &str,
+    path: Option<&str>,
+    bytes: Option<&[u8]>,
+    warnings: &[String],
+) -> Result<(), String> {
+    if document_index(app, document).is_none() {
+        return Err("the imported raw document is missing".into());
     }
+    // The method the open actually used (`jobs::import_options` at the job's start), from its
+    // note: the preference may have changed while a background open ran.
+    let method = photocraft_io::raw::developed_demosaic(warnings).unwrap_or_else(|| app.session.prefs().raw_defaults.demosaic.method());
+    app.pending_raw_open = Some(RawOpen {
+        document,
+        name: name.to_string(),
+        path: path.map(str::to_string),
+        bytes: bytes.map(|b| std::sync::Arc::new(b.to_vec())),
+        developed_with: method,
+        demosaic: method,
+    });
+    Ok(())
 }
 
 /// Opens the queued open-time dialog on its document's (only) layer.
@@ -356,7 +390,10 @@ fn open_raw(app: &mut PhotocraftApp, ctx: &egui::Context, raw: RawOpen) -> Resul
     };
     if let Some(d) = app.camera_raw.as_mut() {
         d.layer_name = raw.name.clone();
-        d.raw_curve = curve.map(std::sync::Arc::new);
+        // The full-size preview retones the whole frame with it, as Open will.
+        let curve = curve.map(std::sync::Arc::new);
+        d.detail.raw_curve = curve.clone();
+        d.raw_curve = curve;
         d.raw_open = Some(raw);
     }
     Ok(())
@@ -412,12 +449,15 @@ fn commit_open_raw(app: &mut PhotocraftApp, params: &CameraRaw, raw: &RawOpen) -
         temperature: params.temperature,
         tint: params.tint,
         exposure: params.exposure,
+        demosaic: raw.demosaic,
         shadows: params.shadows,
         highlights: params.highlights,
         clarity: params.clarity,
         texture: params.texture,
         dehaze: params.dehaze,
     };
+    // The open itself: the default settings, developed with the method it was opened with.
+    let as_opened = photocraft_io::raw::RawTuning { demosaic: raw.developed_with, ..Default::default() };
     // Without the file the raw-stage settings stay RGB adjustments, like the filter's.
     let source = match (&raw.bytes, &raw.path) {
         (Some(b), _) => Some(photocraft_engine::jobs::OpenSource::Bytes(b.clone())),
@@ -425,7 +465,7 @@ fn commit_open_raw(app: &mut PhotocraftApp, params: &CameraRaw, raw: &RawOpen) -
         (None, Some(p)) => Some(photocraft_engine::jobs::OpenSource::Path(p.clone())),
         _ => None,
     };
-    let Some(source) = source.filter(|_| tuning != photocraft_io::raw::RawTuning::default()) else {
+    let Some(source) = source.filter(|_| tuning != as_opened) else {
         return finish_open_raw(app, index, params.clone(), None, Some(raw));
     };
     app.session.set_active(index);
@@ -465,34 +505,41 @@ fn commit_open_raw(app: &mut PhotocraftApp, params: &CameraRaw, raw: &RawOpen) -
 }
 
 /// Swap the default-developed document `doc_id` for the re-developed one, at the same tab
-/// position and with the same path. Returns `{document, previous, warnings, wb}`.
+/// position and with the same path. Returns `{document, docId, previous, warnings, wb}`:
+/// `document` is the tab index at apply time, `docId` is the replacement's stable identity.
 fn replace_raw_document(
     s: &mut photocraft_engine::Session,
     doc_id: photocraft_doc::DocId,
-    r: photocraft_io::ImportResult,
+    mut r: photocraft_io::ImportResult,
     wb: bool,
 ) -> photocraft_engine::Result<Value> {
     let index =
         s.documents().iter().position(|st| st.doc.id == doc_id).ok_or_else(|| photocraft_engine::EngineError::Other("the raw document was closed".into()))?;
     let path = s.documents().get(index).and_then(|st| st.path.clone());
+    // The resolution it opened with (Preferences › Raw Defaults), which re-developing keeps.
+    if let Some(st) = s.documents().get(index) {
+        r.document.resolution_dpi = st.doc.resolution_dpi;
+    }
     s.close(index);
     let (opened, _) = s.open_document(r.document, path);
+    let replacement = s.documents().get(opened).ok_or(photocraft_engine::EngineError::NoDocument)?.doc.id;
     let index = match s.execute("document.move", json!({"document": opened, "to": index})) {
         Ok(moved) => moved.get("document").and_then(Value::as_u64).map_or(opened, |i| i as usize),
         Err(_) => opened,
     };
     s.set_active(index);
-    Ok(json!({"document": index, "previous": doc_id.0, "warnings": r.warnings, "wb": wb}))
+    Ok(json!({"document": index, "docId": replacement.0, "previous": doc_id.0, "warnings": r.warnings, "wb": wb}))
 }
 
 /// After the re-develop: keep the old document's view (zoom, scroll) on the new one, report
 /// the import's notes, then apply the remaining settings.
 fn finish_redevelop(app: &mut PhotocraftApp, params: &CameraRaw, raw: &RawOpen, v: &Value) -> Result<Value, String> {
-    let index = v.get("document").and_then(Value::as_u64).ok_or("the re-develop returned no document")? as usize;
-    if let Some(new_id) = app.session.documents().get(index).map(|st| st.doc.id) {
-        for id in app.view_docs.iter_mut().filter(|id| **id == raw.document) {
-            *id = new_id;
-        }
+    // A preceding completion (for example Save and Close) may have shifted the tab indices.
+    // Validate identity before remapping views, filtering or marking any document unmodified.
+    let replacement = v.get("docId").and_then(Value::as_u64).map(photocraft_doc::DocId).ok_or("the re-develop returned no document identity")?;
+    let index = document_index(app, replacement).ok_or("the re-developed document was closed")?;
+    for id in app.view_docs.iter_mut().filter(|id| **id == raw.document) {
+        *id = replacement;
     }
     let warnings: Vec<String> =
         v.get("warnings").and_then(Value::as_array).map(|a| a.iter().filter_map(|w| w.as_str().map(str::to_string)).collect()).unwrap_or_default();
@@ -796,7 +843,7 @@ pub fn menu(app: &mut PhotocraftApp, ctx: &egui::Context, id: &str, params: &Val
     };
     for (key, value) in fields {
         match key.as_str() {
-            "set" | "scope" | "view" => {}
+            "set" | "scope" | "view" | "demosaic" => {}
             "before" | "commit" | "cancel" | "saveSettings" | "loadSettings" | "undo" | "redo" if value.is_boolean() => {}
             "before" | "commit" | "cancel" | "saveSettings" | "loadSettings" | "undo" | "redo" => {
                 return Some(Err(format!("Camera Raw {key} must be a boolean")));
@@ -870,7 +917,18 @@ fn menu_update(app: &mut PhotocraftApp, ctx: &egui::Context, ui: &Value) -> Opti
         },
         None => None,
     };
+    let demosaic = match ui.get("demosaic") {
+        None => None,
+        Some(_) if d.raw_open.is_none() => return Some(Err("demosaic applies only while a raw file opens".into())),
+        Some(v) => match v.as_str().and_then(photocraft_io::raw::Demosaic::from_id) {
+            Some(m) => Some(m),
+            None => return Some(Err("demosaic must be ahd, mhc or bilinear".into())),
+        },
+    };
     let d = app.camera_raw.as_mut()?;
+    if let (Some(m), Some(raw)) = (demosaic, d.raw_open.as_mut()) {
+        raw.demosaic = m;
+    }
     if let Some(view) = navigation {
         app.ui.camera_raw_preview = view;
     }
@@ -897,6 +955,8 @@ fn menu_update(app: &mut PhotocraftApp, ctx: &egui::Context, ui: &Value) -> Opti
     if d.dirty {
         d.render(ctx);
     }
+    // The control channel can read the status before the next frame draws.
+    d.clear_recovered_error(&mut app.ui);
     if app.ui.camera_raw_scope.vectorscope
         && let Some(d) = app.camera_raw.as_mut()
     {
@@ -1031,6 +1091,25 @@ fn commit(app: &mut PhotocraftApp) -> Result<Value, String> {
     };
     app.camera_raw = None;
     Ok(result)
+}
+
+/// The open-time demosaic choice (at the top of Detail). Photoshop's Camera Raw picks one method
+/// for every file; here it is the user's. Open re-develops with it; the preview keeps the method
+/// the file was opened with (the differences are finer than the preview's pixels).
+fn demosaic_row(ui: &mut egui::Ui, m: &mut photocraft_io::raw::Demosaic) {
+    use photocraft_io::raw::Demosaic;
+    ui.horizontal(|ui| {
+        ui.label(crate::i18n::tr_ctx(crate::i18n::current(), "cameraRaw", "Demosaic")).on_hover_text(tl!(
+            "How the camera's colour filter mosaic is filled in. It is applied when the file opens; the preview shows the method it was opened with."
+        ));
+        let options = [
+            (Demosaic::Ahd, "AHD (adaptive homogeneity)", "Hirakawa–Parks: the cleanest edges and the least colour fringing, the slowest."),
+            (Demosaic::Mhc, "Malvar–He–Cutler", "Gradient-corrected interpolation: sharp and fast, with some colour fringing on fine detail."),
+            (Demosaic::Bilinear, "Bilinear", "The fastest and the softest, with colour fringing on fine detail."),
+        ];
+        widgets::dropdown_with_tooltips(ui, "camera-raw-demosaic", m, &options, 180.0);
+    });
+    ui.add_space(4.0);
 }
 
 fn temp_stops() -> Vec<Color32> {
@@ -1192,17 +1271,7 @@ fn draw(app: &mut PhotocraftApp, ctx: &egui::Context, own_window: bool) {
             app.ui.status_error = true;
         }
         d.request_render(ctx);
-        // A newer frame means the failure is over: take its message down, unless something else
-        // has reported since.
-        if let Some((e, revision)) = &d.preview_error
-            && *revision != d.preview_revision
-        {
-            if app.ui.status_error && app.ui.status == *e {
-                app.ui.status.clear();
-                app.ui.status_error = false;
-            }
-            d.preview_error = None;
-        }
+        d.clear_recovered_error(&mut app.ui);
         let (full, _) = ui.allocate_exact_size(screen.size(), Sense::click());
         let painter = ui.painter().clone();
         painter.rect_filled(full, 0.0, t.chrome);
@@ -1342,7 +1411,7 @@ fn draw(app: &mut PhotocraftApp, ctx: &egui::Context, own_window: bool) {
                 };
                 for (k, name) in BANDS.iter().enumerate() {
                     let c = photocraft_algo::camera_raw::HSL_BANDS[k];
-                    let base = hue_color(c);
+                    let base = widgets::hue_color(c);
                     let grad = [Color32::from_gray(128), base];
                     row(ui, &mut dirty, name, &mut arr[k], -100.0..=100.0, Some(&grad));
                 }
@@ -1356,6 +1425,9 @@ fn draw(app: &mut PhotocraftApp, ctx: &egui::Context, own_window: bool) {
                 row(ui, &mut dirty, "Balance", &mut p.grade_balance, -100.0..=100.0, None);
             });
             section(ui, "Detail", false, |ui| {
+                if let Some(raw) = d.raw_open.as_mut() {
+                    demosaic_row(ui, &mut raw.demosaic);
+                }
                 widgets::section_label(ui, tl!("Sharpening"));
                 row(ui, &mut dirty, "Amount", &mut p.sharpen_amount, 0.0..=150.0, None);
                 row(ui, &mut dirty, "Radius", &mut p.sharpen_radius, 0.5..=3.0, None);
@@ -1437,20 +1509,6 @@ fn draw(app: &mut PhotocraftApp, ctx: &egui::Context, own_window: bool) {
         }
         _ => {}
     }
-}
-
-fn hue_color(h: f32) -> Color32 {
-    let h6 = (h.rem_euclid(360.0)) / 60.0;
-    let x = 1.0 - ((h6 % 2.0) - 1.0).abs();
-    let (r, g, b) = match h6 as u32 {
-        0 => (1.0, x, 0.0),
-        1 => (x, 1.0, 0.0),
-        2 => (0.0, 1.0, x),
-        3 => (0.0, x, 1.0),
-        4 => (x, 0.0, 1.0),
-        _ => (1.0, 0.0, x),
-    };
-    Color32::from_rgb((r * 220.0) as u8, (g * 220.0) as u8, (b * 220.0) as u8)
 }
 
 #[cfg(test)]
@@ -1669,6 +1727,14 @@ mod tests {
         finish_worker(app.camera_raw.as_mut().unwrap(), &ctx);
         frame(&mut app);
         assert!(app.ui.status_error && app.ui.status == "something else failed", "{}", app.ui.status);
+
+        // A control-channel edit renders on its own thread; the status is clear before any frame.
+        fail(&mut app);
+        frame(&mut app);
+        assert!(app.ui.status_error);
+        menu(&mut app, &ctx, "filter.cameraRaw", &json!({"ui": {"set": {"exposure": -0.5}}})).unwrap().unwrap();
+        assert!(!app.ui.status_error && app.ui.status.is_empty(), "{}", app.ui.status);
+        assert_eq!(crate::control::inspect(&app, &ctx)["statusError"], false);
     }
 
     #[test]
@@ -1763,8 +1829,8 @@ mod tests {
     fn raw_app() -> (PhotocraftApp, Vec<u8>) {
         use photocraft_raw::testgen::{DngSpec, mosaic, scene};
         let services = crate::Services {
-            import: Some(Box::new(|name: &str, b: &[u8], depth: usize| {
-                photocraft_io::import_with_svg_group_depth(name, b, depth).map(|r| (r.document, r.warnings)).map_err(|e| e.to_string())
+            import: Some(Box::new(|name: &str, b: &[u8], opts: &photocraft_io::ImportOptions| {
+                photocraft_io::import_with_options(name, b, opts).map(|r| (r.document, r.warnings)).map_err(|e| e.to_string())
             })),
             ..Default::default()
         };
@@ -1805,6 +1871,58 @@ mod tests {
         assert_eq!(st.saved_revision, st.revision, "Open leaves the document unmodified");
         assert_eq!(st.doc.depth, photocraft_color::SampleType::U16);
         assert!(mean_red(&app) > before + 0.05, "{before} → {}", mean_red(&app));
+    }
+
+    fn pixels(app: &PhotocraftApp) -> Vec<f32> {
+        let st = app.session.active().unwrap();
+        let s = st.doc.layer(st.active_layer.unwrap()).unwrap().surface().unwrap();
+        (0..32).flat_map(|y| (0..48).map(move |x| (x, y))).flat_map(|(x, y)| s.rgba(x, y)).collect()
+    }
+
+    #[test]
+    fn the_demosaic_method_is_chosen_at_open() {
+        let (mut app, dng) = raw_app();
+        let ctx = egui::Context::default();
+        app.open_bytes("IMG_0002.dng", &dng).unwrap();
+        let ahd = pixels(&app);
+        let raw = app.pending_raw_open.take().unwrap();
+        open_raw(&mut app, &ctx, raw).unwrap();
+        let d = menu(&mut app, &ctx, "filter.cameraRaw", &json!({"ui": {"demosaic": "bilinear"}})).unwrap().unwrap();
+        assert_eq!(d["openingRaw"]["demosaic"], "bilinear");
+        assert!(menu(&mut app, &ctx, "filter.cameraRaw", &json!({"ui": {"demosaic": "amaze"}})).unwrap().is_err());
+        let r = menu(&mut app, &ctx, "filter.cameraRaw", &json!({"ui": {"commit": true}})).unwrap().unwrap();
+        assert_eq!(r["redeveloped"], true, "another method re-develops: {r}");
+        assert!(r.get("filter").is_none(), "nothing else to apply: {r}");
+        let bilinear = pixels(&app);
+        assert!(ahd.iter().zip(&bilinear).any(|(a, b)| (a - b).abs() > 1e-3), "bilinear differs from AHD");
+        let st = app.session.active().unwrap();
+        assert_eq!(st.saved_revision, st.revision);
+
+        // The preference sets the method of the open itself; Open with it changes nothing.
+        app.run("prefs.set", json!({"path": "rawDefaults.demosaic", "value": "bilinear"})).unwrap();
+        app.open_bytes("IMG_0003.dng", &dng).unwrap();
+        assert_eq!(pixels(&app), bilinear, "developed with the preference's method");
+        let raw = app.pending_raw_open.take().unwrap();
+        open_raw(&mut app, &ctx, raw).unwrap();
+        let d = app.camera_raw.as_ref().unwrap().describe(&app.ui.camera_raw_scope, &app.ui.camera_raw_preview);
+        assert_eq!(d["openingRaw"]["demosaic"], "bilinear");
+        let r = menu(&mut app, &ctx, "filter.cameraRaw", &json!({"ui": {"commit": true}})).unwrap().unwrap();
+        assert_eq!(r["redeveloped"], false, "{r}");
+
+        // Only the open-time dialog has the choice.
+        menu(&mut app, &ctx, "filter.cameraRaw", &json!({})).unwrap().unwrap();
+        assert!(menu(&mut app, &ctx, "filter.cameraRaw", &json!({"ui": {"demosaic": "ahd"}})).unwrap().is_err());
+
+        // The preference may change while a background open runs: the dialog starts from the
+        // method the open developed with (its note), not from the newer preference.
+        let warnings = app.open_bytes("IMG_0004.dng", &dng).unwrap();
+        app.pending_raw_open.take();
+        app.run("prefs.set", json!({"path": "rawDefaults.demosaic", "value": "ahd"})).unwrap();
+        let document = app.session.active().unwrap().doc.id;
+        queue_open_dialog(&mut app, document, "IMG_0004.dng", None, Some(&dng), &warnings).unwrap();
+        let raw = app.pending_raw_open.take().unwrap();
+        use photocraft_io::raw::Demosaic;
+        assert_eq!((raw.developed_with, raw.demosaic), (Demosaic::Bilinear, Demosaic::Bilinear));
     }
 
     #[test]
@@ -1886,6 +2004,25 @@ mod tests {
         assert!(mean_red(&app) > before + 0.05, "{before} → {}", mean_red(&app));
     }
 
+    /// #7789: Preferences › Raw Defaults › Resolution sets a raw's ppi when the app opens it
+    /// itself (no background job) and from automation, and a Camera Raw re-develop keeps it.
+    #[test]
+    fn a_raw_opens_and_redevelops_at_the_raw_defaults_resolution() {
+        let (mut app, dng) = raw_app();
+        let ctx = egui::Context::default();
+        app.run("prefs.set", json!({"path": "rawDefaults.resolution", "value": 240})).unwrap();
+        app.open_bytes("IMG_0004.dng", &dng).unwrap();
+        assert_eq!(app.session.active().unwrap().doc.resolution_dpi, 240.0);
+        let raw = app.pending_raw_open.take().unwrap();
+        open_raw(&mut app, &ctx, raw).unwrap();
+        menu(&mut app, &ctx, "filter.cameraRaw", &json!({"ui": {"set": {"exposure": 1.0}}})).unwrap().unwrap();
+        let r = menu(&mut app, &ctx, "filter.cameraRaw", &json!({"ui": {"commit": true}})).unwrap().unwrap();
+        assert_eq!(r["redeveloped"], true, "{r}");
+        assert_eq!(app.session.active().unwrap().doc.resolution_dpi, 240.0, "kept by the re-develop");
+        app.open_automation_bytes("IMG_0005.dng", &dng).unwrap();
+        assert_eq!(app.session.active().unwrap().doc.resolution_dpi, 240.0, "automation open");
+    }
+
     #[test]
     fn cancel_closes_the_raw_and_the_preference_skips_the_dialog() {
         let (mut app, dng) = raw_app();
@@ -1907,7 +2044,21 @@ mod tests {
         app.open_bytes("c.dng", &dng).unwrap();
         assert!(app.pending_raw_open.is_none());
         // A non-raw never queues the dialog; a closed document is an error, not a panic.
-        assert!(open_raw(&mut app, &ctx, RawOpen { document: photocraft_doc::DocId(u64::MAX), name: "x".into(), path: None, bytes: None }).is_err());
+        assert!(
+            open_raw(
+                &mut app,
+                &ctx,
+                RawOpen {
+                    document: photocraft_doc::DocId(u64::MAX),
+                    name: "x".into(),
+                    path: None,
+                    bytes: None,
+                    developed_with: Default::default(),
+                    demosaic: Default::default()
+                }
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1974,3 +2125,7 @@ mod tests {
         assert_eq!(app.camera_raw.as_ref().unwrap().params.clarity, 25.0);
     }
 }
+
+#[cfg(test)]
+#[path = "camera_raw_identity_tests.rs"]
+mod identity_tests;

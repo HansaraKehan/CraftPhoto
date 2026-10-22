@@ -555,7 +555,7 @@ impl BezierMesh {
     /// Exact when the patches came from an unedited split; otherwise the outer control points are
     /// kept and the inner handles extrapolated.
     pub fn remove_split_u(&mut self, k: usize) -> bool {
-        if k == 0 || k + 1 >= self.us.len() {
+        if k == 0 || k >= self.us.len().saturating_sub(1) {
             return false;
         }
         let a = (self.us[k] - self.us[k - 1]) / (self.us[k + 1] - self.us[k - 1]);
@@ -1272,6 +1272,26 @@ mod tests {
             let p = m.eval(s, t);
             let e = f(s, t);
             assert!((p[0] - e[0]).abs() < 1e-9 && (p[1] - e[1]).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn remove_split_u_rejects_out_of_range_indices() {
+        let original = BezierMesh::identity(B, 2, 3);
+        for k in [0, original.us.len() - 1, original.us.len(), usize::MAX - 1, usize::MAX] {
+            let mut mesh = original.clone();
+            assert!(!mesh.remove_split_u(k), "index {k}");
+            assert_eq!(mesh, original, "index {k} must leave the mesh unchanged");
+        }
+    }
+
+    #[test]
+    fn remove_split_v_rejects_out_of_range_indices() {
+        let original = BezierMesh::identity(B, 2, 3);
+        for k in [0, original.vs.len() - 1, original.vs.len(), usize::MAX - 1, usize::MAX] {
+            let mut mesh = original.clone();
+            assert!(!mesh.remove_split_v(k), "index {k}");
+            assert_eq!(mesh, original, "index {k} must leave the mesh unchanged");
         }
     }
 

@@ -92,7 +92,8 @@ fn import_abr(s: &mut Session, p: &Value) -> Result<Value> {
     // A background job when started with `Session::start` (#210): reading and decoding the
     // file run on a worker, cancellable before each brush; the library changes on apply.
     let params = p.clone();
-    let params_apply = p.clone();
+    // Only the keys the apply step reads: `data` can be a ~1.3 GiB base64 string.
+    let params_apply = json!({ "replace": p.get("replace"), "select": p.get("select") });
     crate::jobs::run(
         s,
         label,

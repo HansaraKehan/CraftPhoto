@@ -1085,6 +1085,202 @@ fn txt2_keeps_a_kept_objects_extras_and_drops_them_with_its_text() {
     assert!(object.path(&["0", "keep"]).is_none(), "model extras of another text are dropped");
 }
 
+/// The `DocumentObjects` value older Photoshop writes beside the numbered objects
+/// (`/DocumentObjects /TextObjects`, named keys, run lengths under `/Length` in UTF-16 units,
+/// #6971): one entry per layer, its `\r`-terminated text in `Model /Text`, one paragraph run per
+/// paragraph, one style and kern run covering the whole text.
+fn photoshop_era_objects(texts: &[&str]) -> crate::engine_data::Value {
+    use crate::engine_data::Value as E;
+    let run = |len: i64| E::Dict(vec![("RunData".into(), E::Dict(vec![("0".into(), E::String(String::new()))])), ("Length".into(), E::Int(len))]);
+    let entries = texts
+        .iter()
+        .map(|t| {
+            let text = format!("{t}\r");
+            let paragraphs: Vec<i64> = text.split_inclusive('\r').map(|p| p.encode_utf16().count() as i64).collect();
+            let total = text.encode_utf16().count() as i64;
+            E::Dict(vec![
+                (
+                    "Model".into(),
+                    E::Dict(vec![
+                        ("Text".into(), E::String(text)),
+                        ("ParagraphRun".into(), E::Dict(vec![("RunArray".into(), E::Array(paragraphs.iter().map(|&n| run(n)).collect()))])),
+                        ("StyleRun".into(), E::Dict(vec![("RunArray".into(), E::Array(vec![run(total)]))])),
+                        ("KernRun".into(), E::Dict(vec![("RunArray".into(), E::Array(vec![run(total)]))])),
+                    ]),
+                ),
+                ("View".into(), E::Dict(vec![("0".into(), E::Array(vec![E::Dict(vec![("0".into(), E::Int(0))])]))])),
+            ])
+        })
+        .collect();
+    E::Dict(vec![("TextObjects".into(), E::Array(entries))])
+}
+
+/// A whole `Txt2` block shaped like the older Photoshop's: document resources and the objects at
+/// `/DocumentObjects /TextObjects`, no numbered `/1 /1` list at all.
+fn photoshop_era_txt2(texts: &[&str]) -> Vec<u8> {
+    use crate::engine_data::Value as E;
+    crate::engine_data::write_bare(&[
+        ("98".into(), E::Dict(vec![("0".into(), E::Int(14))])),
+        ("0".into(), E::dict()),
+        ("DocumentObjects".into(), photoshop_era_objects(texts)),
+    ])
+}
+
+/// #6971: Photoshop re-renders a type layer from the objects older Photoshop keeps at
+/// `/DocumentObjects /TextObjects` when the file has them, so an edit that left the old text
+/// there showed the old text back on reopen. The save refits that copy the way it refits the
+/// numbered ones — the new text, one paragraph run per paragraph of it, the other runs to its
+/// total — and keeps the entries' view and the rest.
+#[test]
+fn edited_text_updates_the_photoshop_era_objects() {
+    use crate::engine_data::Value as E;
+    use photocraft_doc::text::Kerning;
+    let prev = photoshop_era_txt2(&["Line 1\rLine 2"]);
+    let before = crate::psd::parse_txt2(&prev).unwrap();
+    let t = styled("Hi\nBye", CharStyle { kerning: Kerning::Optical, ..Default::default() });
+    let out = crate::psd::parse_txt2(&crate::psd::build_txt2(&[(0, &t)], Some(&prev))).unwrap();
+    let entries = out.path(&["DocumentObjects", "TextObjects"]).and_then(E::as_array).expect("the objects");
+    assert_eq!(entries.len(), 1, "no entry is added");
+    let entry = entries.first().expect("the entry");
+    let model = entry.get("Model").expect("the model");
+    assert_eq!(model.get("Text").and_then(E::as_str), Some("Hi\rBye\r"), "the stale text is replaced");
+    let lens = |key: &str| -> Vec<i64> {
+        model
+            .path(&[key, "RunArray"])
+            .and_then(E::as_array)
+            .map(|rs| rs.iter().map(|r| r.get("Length").and_then(E::as_i64).unwrap_or(-1)).collect())
+            .unwrap_or_default()
+    };
+    assert_eq!(lens("ParagraphRun"), vec![3, 4], "one paragraph run per paragraph of the new text");
+    assert_eq!(lens("StyleRun"), vec![7], "the style runs cover the new text's UTF-16 units");
+    assert_eq!(lens("KernRun"), vec![7]);
+    assert_eq!(
+        entry.get("View"),
+        before.path(&["DocumentObjects", "TextObjects"]).and_then(E::as_array).and_then(|e| e.first()).and_then(|e| e.get("View")),
+        "the view is kept"
+    );
+    // The numbered list is written alongside, as it was before this fix.
+    let slots = out.path(&["1", "1"]).and_then(E::as_array).expect("the numbered objects");
+    assert_eq!(slots.len(), 1);
+    assert_eq!(slots.first().and_then(|o| o.path(&["0", "0"])).and_then(E::as_str), Some("Hi\rBye\r"));
+}
+
+/// Only the entries of layers the save holds change: another layer's object — one no layer names
+/// — is written back as the file has it.
+#[test]
+fn only_the_edited_photoshop_era_object_changes() {
+    use crate::engine_data::Value as E;
+    use photocraft_doc::text::Kerning;
+    let prev = photoshop_era_txt2(&["One", "Two"]);
+    let before = crate::psd::parse_txt2(&prev).unwrap();
+    let style = |kerning: Kerning| CharStyle { kerning, ..Default::default() };
+    let t0 = runs_of("One", &[(3, style(Kerning::Metrics))]);
+    let t1 = runs_of("Changed", &[(7, style(Kerning::Optical))]);
+    let out = crate::psd::parse_txt2(&crate::psd::build_txt2(&[(0, &t0), (1, &t1)], Some(&prev))).unwrap();
+    let entries = out.path(&["DocumentObjects", "TextObjects"]).and_then(E::as_array).expect("the objects");
+    let was = before.path(&["DocumentObjects", "TextObjects"]).and_then(E::as_array).expect("the objects before");
+    assert_eq!(entries.len(), 2, "no entry is added");
+    assert_eq!(entries.first(), was.first(), "the unchanged entry is written back as it was");
+    assert_eq!(entries.get(1).and_then(|e| e.path(&["Model", "Text"])).and_then(E::as_str), Some("Changed\r"), "the edited entry takes the new text");
+}
+
+/// Files saved by the old code have both lists: the numbered object current, the older copy still
+/// holding the text of an earlier edit. Re-saving repairs the stale copy even when the numbered
+/// object's text matches the layer (nothing else about the file changes).
+#[test]
+fn legacy_file_with_both_object_lists_repairs_the_stale_one() {
+    use crate::engine_data::Value as E;
+    use photocraft_doc::text::Kerning;
+    let mut prev = photoshop_txt2(&[(4, 1)]);
+    prev.extend_from_slice(&crate::engine_data::write_bare(&[("DocumentObjects".into(), photoshop_era_objects(&["Old stuff"]))]));
+    let before = crate::psd::parse_txt2(&prev).unwrap();
+    let t = styled("AVA", CharStyle { kerning: Kerning::Metrics, ..Default::default() });
+    let out = crate::psd::parse_txt2(&crate::psd::build_txt2(&[(0, &t)], Some(&prev))).unwrap();
+    let entries = out.path(&["DocumentObjects", "TextObjects"]).and_then(E::as_array).expect("the objects");
+    assert_eq!(entries.len(), 1);
+    let model = entries.first().expect("the entry").get("Model").expect("the model");
+    assert_eq!(model.get("Text").and_then(E::as_str), Some("AVA\r"), "the stale copy is repaired");
+    let lens = model
+        .path(&["StyleRun", "RunArray"])
+        .and_then(E::as_array)
+        .map(|rs| rs.iter().map(|r| r.get("Length").and_then(E::as_i64).unwrap_or(-1)).collect::<Vec<_>>());
+    assert_eq!(lens, Some(vec![4]), "its runs cover the layer's text");
+    let slots = out.path(&["1", "1"]).and_then(E::as_array).expect("the numbered objects");
+    assert_eq!(slots.first().and_then(|o| o.path(&["0", "0"])).and_then(E::as_str), Some("AVA\r"), "the numbered object is kept as it was");
+    assert_eq!(before.path(&["1", "1"]).and_then(E::as_array).and_then(|s| s.first()), slots.first(), "the numbered object changes not at all");
+}
+
+/// When both lists hold the layer's text, the block is written back byte for byte — #2374 holds
+/// for the older objects too: re-encoding them would only risk Photoshop refusing the file.
+#[test]
+fn unchanged_block_with_both_object_lists_is_byte_identical() {
+    use photocraft_doc::text::Kerning;
+    let mut prev = photoshop_txt2(&[(4, 1)]);
+    prev.extend_from_slice(&crate::engine_data::write_bare(&[("DocumentObjects".into(), photoshop_era_objects(&["AVA"]))]));
+    let t = styled("AVA", CharStyle { kerning: Kerning::Metrics, ..Default::default() });
+    assert_eq!(crate::psd::build_txt2(&[(0, &t)], Some(&prev)), prev);
+}
+
+/// An entry shaped unlike Photoshop writes it — a run without its `/Length`, a `RunArray` that
+/// isn't an array, an empty one, an object with no text to replace — is left exactly as the file
+/// has it: a half-refitted object (new text over old runs) is what made Photoshop quit (#6968),
+/// so the save never writes one.
+#[test]
+fn odd_photoshop_era_entries_are_left_as_the_file_has_them() {
+    use crate::engine_data::Value as E;
+    use photocraft_doc::text::Kerning;
+    let run = |len: i64| E::Dict(vec![("RunData".into(), E::dict()), ("Length".into(), E::Int(len))]);
+    let entry = |model: Vec<(&str, E)>| {
+        E::Dict(vec![("Model".into(), E::Dict(model.into_iter().map(|(k, v)| (k.to_string(), v)).collect())), ("View".into(), E::dict())])
+    };
+    let with_text = |text: E, style: E| {
+        entry(vec![
+            ("Text", text),
+            ("ParagraphRun", E::Dict(vec![("RunArray".into(), E::Array(vec![run(4)]))])),
+            ("StyleRun", E::Dict(vec![("RunArray".into(), style)])),
+        ])
+    };
+    let odd = [
+        with_text(E::String("Old\r".into()), E::Array(vec![E::Dict(vec![("RunData".into(), E::dict())])])),
+        with_text(E::String("Old\r".into()), E::Int(3)),
+        with_text(E::String("Old\r".into()), E::Array(vec![])),
+        E::Int(3),
+        entry(vec![("ParagraphRun", E::Dict(vec![("RunArray".into(), E::Array(vec![run(4)]))]))]),
+        with_text(E::Int(9), E::Array(vec![run(4)])),
+    ];
+    for (i, object) in odd.iter().enumerate() {
+        let prev = crate::engine_data::write_bare(&[
+            ("98".into(), E::Dict(vec![("0".into(), E::Int(14))])),
+            ("0".into(), E::dict()),
+            ("DocumentObjects".into(), E::Dict(vec![("TextObjects".into(), E::Array(vec![object.clone()]))])),
+        ]);
+        let was = crate::psd::parse_txt2(&prev).unwrap();
+        let t = styled("New", CharStyle { kerning: Kerning::Optical, ..Default::default() });
+        let out = crate::psd::parse_txt2(&crate::psd::build_txt2(&[(0, &t)], Some(&prev))).unwrap();
+        let entries = out.path(&["DocumentObjects", "TextObjects"]).and_then(E::as_array).expect("the objects");
+        assert_eq!(
+            entries.first(),
+            was.path(&["DocumentObjects", "TextObjects"]).and_then(E::as_array).and_then(|e| e.first()),
+            "entry {i} is left as the file has it"
+        );
+    }
+}
+
+/// A `TextIndex` past the entries the block holds has no stale copy to fix: nothing is grown to
+/// the layer's number (the slot list grows as it always did), and the entries stay the file's.
+#[test]
+fn a_text_index_beyond_the_photoshop_era_entries_grows_nothing() {
+    use crate::engine_data::Value as E;
+    use photocraft_doc::text::Kerning;
+    let prev = photoshop_era_txt2(&["Only one"]);
+    let was = crate::psd::parse_txt2(&prev).unwrap();
+    let t = styled("Whatever", CharStyle { kerning: Kerning::Optical, ..Default::default() });
+    let out = crate::psd::parse_txt2(&crate::psd::build_txt2(&[(crate::psd::MAX_TEXT_INDEX, &t)], Some(&prev))).unwrap();
+    let entries = out.path(&["DocumentObjects", "TextObjects"]).and_then(E::as_array).expect("the objects");
+    assert_eq!(entries.len(), 1, "no entry is grown to the layer's number");
+    assert_eq!(entries.first(), was.path(&["DocumentObjects", "TextObjects"]).and_then(E::as_array).and_then(|e| e.first()));
+}
+
 /// A `Txt2` shaped like Photoshop's: document resources and settings beside the text objects
 /// (`/0`, `/1 /0`, `/1 /2`), style runs carrying a full style (font, size, leading) besides the
 /// auto-kern mode, a Latin-1 string without a byte-order mark, reals, and a second object no
@@ -1728,10 +1924,17 @@ fn craft_fonts_cover_japanese_without_system_fonts() {
     let l = e.layout(&point(text, 24.0), 72.0);
     assert_eq!(l.glyphs.len(), text.chars().count());
     assert!(l.glyphs.iter().all(|g| g.id != 0), "no .notdef with craft-fonts");
-    // Sans (Inter) runs fall back to the Gothic UI family.
-    assert_eq!(craft_family_of(&l), vec![crate::craft_fonts::UI_JAPANESE_FAMILY]);
-    // Serif runs fall back to a Mincho face when the build has one (not the web build).
-    if crate::CRAFT_FONTS.iter().any(|f| f.is_mincho()) {
+    // Sans (Inter) runs fall back to the first CJK craft family in the UI locale's script order:
+    // the Gothic UI family when Japanese leads that order or the build has no other CJK craft font.
+    let cjk = |f: &crate::CraftFont| f.scripts.iter().any(|s| matches!(*s, "Jpan" | "Hans" | "Hant" | "Kore"));
+    let first = e.fonts.fallback_stack().find_map(|fam| crate::CRAFT_FONTS.iter().find(|f| f.family == fam && cjk(f))).map(|f| f.family);
+    if !crate::CRAFT_FONTS.iter().any(|f| cjk(f) && !f.is_japanese()) || crate::cjk::ui_script_order()[0] == crate::cjk::CjkScript::Japanese {
+        assert_eq!(first, Some(crate::craft_fonts::UI_JAPANESE_FAMILY));
+    }
+    assert_eq!(craft_family_of(&l), first.into_iter().collect::<Vec<_>>());
+    // Serif runs fall back to a Mincho face when the build has one (not the web build) and the
+    // Japanese craft fonts come first.
+    if first == Some(crate::craft_fonts::UI_JAPANESE_FAMILY) && crate::CRAFT_FONTS.iter().any(|f| f.is_mincho()) {
         let mut t = point(text, 24.0);
         t.font_family = "Times New Roman".into();
         let l = e.layout(&t, 72.0);
@@ -1742,6 +1945,23 @@ fn craft_fonts_cover_japanese_without_system_fonts() {
     // Latin keeps Inter.
     let l = e.layout(&point("Layer 1", 24.0), 72.0);
     assert!(craft_family_of(&l).is_empty());
+}
+
+/// Chinese, Arabic and Thai set in Inter fall back to the craft font for their script when the
+/// build has one (Noto Sans CJK SC, Noto Sans Arabic and Noto Sans Thai in newer craft-fonts).
+#[test]
+fn craft_fonts_cover_their_other_scripts_without_system_fonts() {
+    let mut e = TextEngine::new();
+    for (script, text) in [("Hans", "中文图层"), ("Arab", "مرحبا"), ("Thai", "ภาษาไทย")] {
+        if !crate::CRAFT_FONTS.iter().any(|f| f.scripts.contains(&script)) {
+            eprintln!("skipping {script}: built without a craft font for it (set CRAFT_FONTS_DIR to a craft-fonts checkout)");
+            continue;
+        }
+        let l = e.layout(&point(text, 24.0), 72.0);
+        assert!(!l.glyphs.is_empty() && l.glyphs.iter().all(|g| g.id != 0), "{script}: no .notdef with craft-fonts");
+        let fams = craft_family_of(&l);
+        assert!(fams.iter().any(|fam| crate::CRAFT_FONTS.iter().any(|f| f.family == *fam && f.scripts.contains(&script))), "{script}: drawn with {fams:?}");
+    }
 }
 
 #[test]
@@ -2178,6 +2398,30 @@ fn engine_data_antialias_numbers_match_photoshop() {
         let back = crate::psd::text_layer_from_tysh(&crate::psd::write_tysh(&tysh), 72.0).unwrap();
         assert_eq!(back.antialias, mode, "{n}");
     }
+}
+
+/// Anti-alias modes must change edge coverage (storytold/photocraft#5902).
+#[test]
+fn antialias_modes_change_edge_fringe() {
+    use photocraft_doc::text::AntiAlias;
+
+    let fringe_mass = |mode: AntiAlias| {
+        let mut e = TextEngine::new();
+        let layer = TextLayer { antialias: mode, ..point("O", 48.0) };
+        let (_, r) = e.render(&layer, 72.0, PixelFormat::RGBA8);
+        let n = r.surface.channels();
+        r.surface.read_region(r.rect).chunks_exact(n).map(|p| f64::from(p[n - 1])).filter(|&a| a > 0.02 && a < 0.98).sum::<f64>()
+    };
+
+    let none = fringe_mass(AntiAlias::None);
+    let sharp = fringe_mass(AntiAlias::Sharp);
+    let smooth = fringe_mass(AntiAlias::Smooth);
+    let strong = fringe_mass(AntiAlias::Strong);
+
+    assert_eq!(none, 0.0, "aliased-off edges are hard");
+    assert!(strong > smooth + 1.0, "strong smooths more than smooth: {strong} vs {smooth}");
+    assert!(smooth > sharp + 0.5, "sharp thins the fringe vs smooth: {sharp} vs {smooth}");
+    assert!(sharp > 0.0);
 }
 
 /// Type on a path (#218): along a vertical line the type runs top to bottom with its glyphs

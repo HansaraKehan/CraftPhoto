@@ -555,7 +555,7 @@ codegen-units = 1
 opt-level = 2          # image code is unusable at opt-level 0
 ```
 
-Versions get pinned when we scaffold, using the numbers in `rust-framework-options.md`.
+Dependency requirements are centralized in the workspace `Cargo.toml` (`[workspace.dependencies]`); `Cargo.lock` records the exact resolved versions.
 
 ---
 
@@ -578,17 +578,16 @@ Each phase ends with a demoable build and green CI on all targets. Phases 8–10
 
 ## 16. Open decisions
 
-1. **UI toolkit.** The leading option is egui on winit + wgpu. Bevy, Slint and Qt are the alternatives (see `rust-framework-options.md`). This plan works with any of them.
-2. **License.** MIT/Apache-2.0 is maximally reusable. GPL-3.0 is the Krita/GIMP model and protects against proprietary forks. Note that some candidate deps are LGPL (rawler) or GPL-or-commercial (Slint), and MIT/Apache would constrain which of them we can use.
-3. **Project name.** `photocraft` (the repo name) is assumed.
-4. **PSD crate.** Build our own, or adopt or fork `ag-psd`/`psd`. Decide after the week-1 spike.
-5. **Default working depth and blending.** 8-bit + gamma-space blending matches Photoshop. 16-bit/float + linear is the modern default. The proposal is to follow Photoshop by default and make the other a per-document option.
-6. **Scope of Photoshop plugin compatibility.** Decided: no native `.8BF` hosting; a sandboxed WebAssembly plug-in API instead (see [`plugins.md`](plugins.md)).
+1. **License.** MIT/Apache-2.0 is maximally reusable. GPL-3.0 is the Krita/GIMP model and protects against proprietary forks. Note that some candidate deps are LGPL (rawler) or GPL-or-commercial (Slint), and MIT/Apache would constrain which of them we can use.
+2. **Project name.** `photocraft` (the repo name) is assumed.
+3. **PSD crate.** Build our own, or adopt or fork `ag-psd`/`psd`. Decide after the week-1 spike.
+4. **Default working depth and blending.** 8-bit + gamma-space blending matches Photoshop. 16-bit/float + linear is the modern default. The proposal is to follow Photoshop by default and make the other a per-document option.
 
 ## Revision history
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-21 | minor | Removed references to the deleted `rust-framework-options.md`; dropped the UI toolkit and plug-in items from Open decisions, both recorded as decided |
 | 2026-10-20 | minor | GPU display matrix/shaper path preserves near-black ICC values; complex transforms retain the 3D LUT fallback (#7958) |
 | 2026-10-13 | minor | Workspace size and `#[test]` counts recounted (393k → 539k lines, 5,460 → 8,040 tests); other current-state figures unchanged |
 | 2026-10-10 | minor | Current-state summary and deviations from the plan; status line; broken link to `photoshop-parity.md` repointed to `target-app-parity.md` |

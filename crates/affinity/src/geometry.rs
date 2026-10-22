@@ -210,7 +210,16 @@ fn anchors(records: &[Value]) -> Option<Vec<Anchor>> {
 fn subpath(anchors: &[Anchor], closed: bool, radii: Option<&Vec<(usize, f64)>>) -> Option<SubPath> {
     let first = anchors.first()?;
     if let Some(radii) = radii.filter(|r| !r.is_empty()) {
-        let corner = |a: &Anchor| radii.iter().filter(|(rec, _)| *rec == a.record).map(|(_, r)| *r).fold(0.0, f64::max);
+        // Index each record's maximum radius once. Scanning the whole radius list per anchor
+        // was O(anchors * radii), which a file with large anchor and radius arrays could drive
+        // into quadratic work. Duplicate record indices keep the maximum, matching the prior
+        // fold(0.0, f64::max) behavior.
+        let mut radius_by_record: std::collections::HashMap<usize, f64> = std::collections::HashMap::with_capacity(radii.len());
+        for &(rec, r) in radii {
+            let slot = radius_by_record.entry(rec).or_insert(0.0);
+            *slot = slot.max(r);
+        }
+        let corner = |a: &Anchor| radius_by_record.get(&a.record).copied().unwrap_or(0.0);
         let polyline = anchors.iter().all(|a| a.inh.is_none_or(|h| h == a.p) && a.out.is_none_or(|h| h == a.p));
         if polyline {
             let mut pts: Vec<(Point, f64)> = anchors.iter().map(|a| (a.p, corner(a))).collect();

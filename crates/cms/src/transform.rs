@@ -133,12 +133,11 @@ impl Transform {
             let tables = cs
                 .iter()
                 .map(|c| {
-                    (0..OUT_TABLE)
-                        .map(|i| {
-                            let u = i as f64 / (OUT_TABLE - 1) as f64;
-                            c.eval_inverse64(u * u * u * u).clamp(0.0, 1.0) as f32
-                        })
-                        .collect()
+                    let ys = (0..OUT_TABLE).map(|i| {
+                        let u = i as f64 / (OUT_TABLE - 1) as f64;
+                        u * u * u * u
+                    });
+                    c.inverse_table(ys).into_iter().map(|v| v.clamp(0.0, 1.0)).collect()
                 })
                 .collect();
             post = Some(Post { tables });

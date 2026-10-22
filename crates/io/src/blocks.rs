@@ -170,6 +170,11 @@ pub fn color_from_desc(d: &Descriptor) -> Option<Color> {
         b"Grsc" => Color::gray(1.0 - g("Gry ")? / 100.0),
         // CIE L*a*b*: L 0..100, a / b −128..127 (stored like Lab pixels: offset by 128).
         b"LbCl" => Color { mode: ColorMode::Lab, c: [g("Lmnc")? / 100.0, (g("A   ")? + 128.0) / 255.0, (g("B   ")? + 128.0) / 255.0, 0.0], alpha: 1.0 },
+        // HSB: hue an angle in degrees, saturation / brightness 0..100.
+        b"HSBC" => {
+            let [r, gr, b] = crate::channel_map::hsb_to_rgb(g("H   ")?, g("Strt")? / 100.0, g("Brgh")? / 100.0);
+            Color::rgb(r, gr, b)
+        }
         // Newer Photoshop writes 0..1 floats.
         _ if d.get("redFloat").is_some() => Color::rgb(g("redFloat")?, g("greenFloat")?, g("blueFloat")?),
         _ => {
@@ -252,7 +257,8 @@ pub(crate) fn gradient_style_value(s: GradientStyle) -> Value {
 pub(crate) type Stops = (Vec<(f32, Color)>, Vec<(f32, f32)>);
 
 /// Stops of a `Grdn` descriptor, baked to Photoshop's interpolation (smoothness `Intr`, stop
-/// midpoints, and the parent's interpolation method when given, see [`gradient_method`]).
+/// midpoints, and the parent's interpolation method when given, see [`gradient_method`]); the
+/// opacity stops as [`baked_opacity_stops`].
 pub(crate) fn gradient_stops_with(grad: &Descriptor, method: Option<&[u8]>) -> Stops {
     let raw = gradient_stops_raw(grad);
     let stops = if raw.stops.len() >= 2 {
@@ -260,7 +266,7 @@ pub(crate) fn gradient_stops_with(grad: &Descriptor, method: Option<&[u8]>) -> S
     } else {
         raw.stops
     };
-    (stops, raw.opacity)
+    (stops, baked_opacity_stops(grad, method))
 }
 
 /// A `Grdn` descriptor's stops as stored: colour stops (sorted), the midpoint of each segment
@@ -399,26 +405,27 @@ pub(crate) fn gradient_desc_with(stops: &[(f32, Color)], opacity: &[(f32, f32)],
         .with("Trns", Value::List(trns))
 }
 
-/// Opacity stops of a `Grdn` descriptor with Photoshop's smoothness and midpoints applied (the
-/// same curve as the colour stops, Classic interpolation), densely sampled.
-fn smoothed_opacity_stops(grad: &Descriptor) -> Vec<(f32, f32)> {
+/// Opacity stops of a `Grdn` descriptor with Photoshop's smoothness, opacity midpoints and
+/// interpolation method applied (densely sampled; as stored when the interpolation is plain).
+/// Gradient fill layers and the gradient layer effects share it: Photoshop renders their
+/// transparency identically.
+fn baked_opacity_stops(grad: &Descriptor, method: Option<&[u8]>) -> Vec<(f32, f32)> {
     let mut stops = Vec::new();
     let mut mids = Vec::new();
     if let Some(Value::List(items)) = grad.get("Trns") {
         for it in items {
             if let Value::Descriptor(s) = it {
-                let a = num(s.get("Opct")).unwrap_or(100.0) as f32 / 100.0;
-                stops.push((num(s.get("Lctn")).unwrap_or(0.0) as f32 / 4096.0, Color::rgba(a, a, a, 1.0)));
+                stops.push((num(s.get("Lctn")).unwrap_or(0.0) as f32 / 4096.0, num(s.get("Opct")).unwrap_or(100.0) as f32 / 100.0));
                 mids.push(num(s.get("Mdpn")).unwrap_or(50.0) as f32 / 100.0);
             }
         }
     }
+    // Midpoint k applies to the segment after stop k (stored on the stop that ends it).
     let mut order: Vec<usize> = (0..stops.len()).collect();
     order.sort_by(|a, b| stops[*a].0.total_cmp(&stops[*b].0));
     let mids: Vec<f32> = order.iter().skip(1).filter_map(|i| mids.get(*i).copied()).collect();
     let smooth = num(grad.get("Intr")).map_or(0.0, |v| (v / 4096.0) as f32);
-    let baked = if stops.len() >= 2 { crate::gradient_bake::bake(stops, &mids, smooth, crate::gradient_bake::Method::Classic) } else { stops };
-    baked.into_iter().map(|(t, c)| (t, c.to_rgb()[0])).collect()
+    crate::gradient_bake::bake_opacity(stops, &mids, smooth, crate::gradient_bake::Method::from_code(method))
 }
 
 /// Parses a fill block (`SoCo`, `GdFl`, `PtFl`).
@@ -439,9 +446,9 @@ pub fn fill_from_desc(key: &[u8; 4], d: &Descriptor) -> Option<Fill> {
             let gradient = get_desc(d, "Grad");
             let raw = gradient.map(|g| gradient_stops_editable(g, gradient_method(d)));
             let (mut stops, midpoints) = raw.map(|r| (r.stops, r.mids)).unwrap_or_default();
-            // Opacity stops with Photoshop's smoothness and opacity midpoints applied (raw when
-            // the interpolation is plain); none when fully opaque.
-            let mut opacity_stops = get_desc(d, "Grad").map(smoothed_opacity_stops).unwrap_or_default();
+            // Opacity stops with Photoshop's smoothness, opacity midpoints and method applied
+            // (raw when the interpolation is plain); none when fully opaque.
+            let mut opacity_stops = get_desc(d, "Grad").map(|g| baked_opacity_stops(g, gradient_method(d))).unwrap_or_default();
             if opacity_stops.iter().all(|o| o.1 >= 1.0 - 1e-4) {
                 opacity_stops.clear();
             }
@@ -958,6 +965,30 @@ mod tests {
         }
         // Missing components are rejected, not defaulted.
         assert!(super::color_from_desc(&Descriptor::new("LbCl").with("Lmnc", Value::Double(50.0))).is_none());
+    }
+
+    /// Colours stored as HSB (`HSBC`: `H   ` an angle in degrees, `Strt`/`Brgh` 0..100), as in
+    /// psd-tools `stroke-color-descriptors-hsb-with-rgb-mode.psd`, used to be dropped (#6774).
+    #[test]
+    fn hsb_descriptor_colours_parse() {
+        use photocraft_doc::Fill;
+        use photocraft_psd::descriptor::{Descriptor, Value};
+        let hsb = |h: f64, s: f64, b: f64| {
+            Descriptor::new("HSBC").with("H   ", Value::UnitFloat { unit: *b"#Ang", value: h }).with("Strt", Value::Double(s)).with("Brgh", Value::Double(b))
+        };
+        let close = |c: [f32; 3], e: [f32; 3]| c.iter().zip(e).all(|(a, b)| (a - b).abs() < 1e-5);
+        let green = super::color_from_desc(&hsb(120.0, 100.0, 100.0)).unwrap().to_rgb();
+        assert!(close(green, [0.0, 1.0, 0.0]), "{green:?}");
+        let white = super::color_from_desc(&hsb(0.0, 0.0, 100.0)).unwrap().to_rgb();
+        assert!(close(white, [1.0, 1.0, 1.0]), "{white:?}");
+        let half = super::color_from_desc(&hsb(240.0, 50.0, 50.0)).unwrap().to_rgb();
+        assert!(close(half, [0.25, 0.25, 0.5]), "{half:?}");
+        // A solid fill (`SoCo`) with an HSB colour is read, not lost.
+        let soco = Descriptor::new("null").with("Clr ", Value::Descriptor(hsb(0.0, 100.0, 100.0)));
+        let Some(Fill::Solid(c)) = super::fill_from_desc(b"SoCo", &soco) else { panic!("solid fill") };
+        assert!(close(c.to_rgb(), [1.0, 0.0, 0.0]), "{:?}", c.to_rgb());
+        // Missing components are rejected, not defaulted.
+        assert!(super::color_from_desc(&Descriptor::new("HSBC").with("Strt", Value::Double(50.0))).is_none());
     }
 
     #[test]

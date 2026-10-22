@@ -158,7 +158,10 @@ fn a_print_job_carries_the_document_and_returns_its_id() {
     assert_eq!(op, OP_PRINT_JOB);
     assert_eq!(doc, pdf);
     let get = |n: &str| attrs.iter().find(|a| a.name == n).cloned().unwrap_or_else(|| panic!("{n}"));
-    assert_eq!(get("printer-uri").values[0], format!("ipp://{}/printers/Office", ep.host()).as_bytes());
+    let uri = String::from_utf8(get("printer-uri").values[0].clone()).unwrap();
+    // Spelled out here rather than echoed back from host(), so the printer-uri the server receives is
+    // pinned down even when the authority is an IP literal.
+    assert!(uri.starts_with("ipp://127.0.0.1:") && uri.ends_with("/printers/Office"), "{uri}");
     assert_eq!(get("job-name").values[0], b"photo.psd");
     assert_eq!(get("requesting-user-name").values[0], b"diego");
     assert_eq!(get("document-format").values[0], b"application/pdf");
@@ -186,9 +189,36 @@ fn error_statuses_and_broken_replies_are_errors() {
     assert!(matches!(printers(&ep), Err(Error::Protocol(_))));
     let (ep, _rx) = fake(b"not ipp at all".to_vec(), false, 200);
     assert!(matches!(printers(&ep), Err(Error::Protocol(_))));
-    // Nobody listening.
-    let e = printers(&Endpoint::Tcp("127.0.0.1".into(), 1)).unwrap_err();
+    // Nobody reachable. A port is never guaranteed to be free, let alone to stay free: that is what
+    // made the old port-1 case fail on a FreeBSD CI VM. A name that can never resolve (RFC 2606)
+    // reaches the same exit without owning or releasing anything.
+    let e = printers(&Endpoint::Tcp("printer.invalid".into(), 631)).unwrap_err();
     assert!(matches!(e, Error::Unreachable(_)), "{e}");
+    assert!(e.to_string().contains("printer.invalid"), "{e} does not name the server it tried");
+}
+
+#[test]
+fn a_refused_connection_is_unreachable_and_keeps_why() {
+    // The refused-connect path, with the machine no longer deciding what is closed: the connect call
+    // is a parameter, so this test cannot race for an ephemeral port with anything.
+    let addr: SocketAddr = "192.0.2.9:631".parse().unwrap();
+    let asked_for = std::cell::RefCell::new(None);
+    let open = |seen: SocketAddr| -> std::io::Result<TcpStream> {
+        *asked_for.borrow_mut() = Some(seen);
+        Err(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "nobody is listening on this port"))
+    };
+    let e = match open_tcp("printserver", 631, addr, open) {
+        Ok(_) => panic!("nothing opens {addr}"),
+        Err(e) => e,
+    };
+    assert_eq!(*asked_for.borrow(), Some(addr), "the connector is handed the resolved address");
+    match &e {
+        Error::Unreachable(m) => {
+            assert!(m.contains("printserver:631"), "{e} does not name the endpoint");
+            assert!(m.contains("nobody is listening on this port"), "{e} loses why the connect failed");
+        }
+        other => panic!("expected Unreachable, got {other}"),
+    }
 }
 
 #[test]
@@ -230,6 +260,54 @@ fn the_unix_socket_endpoint_works_and_detect_honours_cups_server() {
     assert!(!Endpoint::Unix(dir.join("missing.sock")).reachable());
     assert_eq!(ep.to_string(), sock.display().to_string());
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An IPv6 print server is not a `host:port` split: a bare address has more than one ':', and the
+/// brackets of `[address]:port` must not end up inside the host, where no resolver can read them.
+#[test]
+fn an_ipv6_print_server_is_parsed_as_a_host_not_as_host_port() {
+    assert_eq!(Endpoint::parse("::1"), Endpoint::Tcp("::1".into(), 631));
+    assert_eq!(Endpoint::parse("fe80::1"), Endpoint::Tcp("fe80::1".into(), 631));
+    assert_eq!(Endpoint::parse("2001:db8::1"), Endpoint::Tcp("2001:db8::1".into(), 631));
+    assert_eq!(Endpoint::parse("[::1]"), Endpoint::Tcp("::1".into(), 631));
+    assert_eq!(Endpoint::parse("[::1]:631"), Endpoint::Tcp("::1".into(), 631));
+    assert_eq!(Endpoint::parse("[fe80::1]:6310"), Endpoint::Tcp("fe80::1".into(), 6310));
+    // A zone id carries no ':', so a port can still follow it without brackets.
+    assert_eq!(Endpoint::parse("fe80::1%eth0:631"), Endpoint::Tcp("fe80::1%eth0".into(), 631));
+    // What already worked is unchanged.
+    assert_eq!(Endpoint::parse("cups.example"), Endpoint::Tcp("cups.example".into(), 631));
+    assert_eq!(Endpoint::parse("cups.example:6310"), Endpoint::Tcp("cups.example".into(), 6310));
+    assert_eq!(Endpoint::parse("127.0.0.1:6310"), Endpoint::Tcp("127.0.0.1".into(), 6310));
+    assert_eq!(Endpoint::parse("/var/run/cups/cups.sock"), Endpoint::Unix("/var/run/cups/cups.sock".into()));
+    // A mistyped bracketed endpoint is not quietly the default one: the whole string stays the host,
+    // so nothing can resolve it and detect() reports the endpoint unreachable.
+    assert_eq!(Endpoint::parse("[::1]:abc"), Endpoint::Tcp("[::1]:abc".into(), 631));
+    assert_eq!(Endpoint::parse("[::1]:70000"), Endpoint::Tcp("[::1]:70000".into(), 631));
+    assert_eq!(Endpoint::parse("[::1]junk"), Endpoint::Tcp("[::1]junk".into(), 631));
+    assert!(!Endpoint::parse("[::1]:abc").reachable());
+}
+
+/// The authority a request carries (the `Host:` header and the `ipp://` printer-uri) has to bracket an
+/// IPv6 host, or its last colon reads as the port separator and CUPS sees a nonsense host.
+#[test]
+fn an_ipv6_endpoint_writes_its_authority_in_brackets() {
+    assert_eq!(Endpoint::parse("::1").host(), "[::1]:631");
+    assert_eq!(Endpoint::parse("[::1]:631").host(), "[::1]:631");
+    assert_eq!(Endpoint::parse("[fe80::1]:6310").host(), "[fe80::1]:6310");
+    assert_eq!(Endpoint::parse("cups.example").host(), "cups.example:631");
+    assert_eq!(Endpoint::parse("cups.example:6310").host(), "cups.example:6310");
+    assert_eq!(Endpoint::parse("127.0.0.1:6310").host(), "127.0.0.1:6310");
+    // A scoped address keeps its zone id, but the authority writes it "%25"-escaped: a bare "%" is
+    // not valid inside an authority, and the escaped form is what CUPS and curl-style ipp:// URIs
+    // use. The host itself stays raw, because that is what the resolver gets.
+    assert_eq!(Endpoint::parse("fe80::1%3:631").host(), "[fe80::1%253]:631");
+    assert_eq!(Endpoint::parse("[fe80::1%3]:6310").host(), "[fe80::1%253]:6310");
+    assert_eq!(Endpoint::parse("fe80::1%eth0:631").host(), "[fe80::1%25eth0]:631");
+    assert_eq!(Endpoint::parse("fe80::1%3:631"), Endpoint::Tcp("fe80::1%3".into(), 631));
+    // What the user is shown is written the same way, with the zone exactly as it was typed.
+    assert_eq!(Endpoint::parse("::1").to_string(), "[::1]:631");
+    assert_eq!(Endpoint::parse("cups.example:6310").to_string(), "cups.example:6310");
+    assert_eq!(Endpoint::parse("fe80::1%3:631").to_string(), "[fe80::1%3]:631");
 }
 
 #[test]
@@ -392,4 +470,10 @@ fn an_impossible_chunk_size_is_a_protocol_error_not_a_panic() {
             other => panic!("{size_line}: expected a protocol error, got {other:?}"),
         }
     }
+}
+
+#[test]
+fn printer_names_are_encoded_as_one_request_target_segment() {
+    assert_eq!(queue_path("office printer/1", false).unwrap(), "/printers/office%20printer%2F1");
+    assert!(queue_path("printer\r\nX-Injected: yes", false).is_err());
 }

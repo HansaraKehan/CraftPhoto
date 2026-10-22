@@ -13,7 +13,10 @@ use photocraft_doc::{Color, ColorMode, Document, SampleType, Size};
 use photocraft_engine::Session;
 use serde_json::Value;
 
-const USE: &str = "Use the embedded profile (Adobe RGB (1998)-compatible (PhotoCraft))";
+/// The embedded-profile choice uses the current built-in profile's displayed name.
+fn use_embedded() -> String {
+    format!("Use the embedded profile ({})", photocraft_cms::Builtin::AdobeRgbCompat.description())
+}
 const CONVERT: &str = "Convert to the working space (sRGB IEC61966-2.1)";
 const DISCARD: &str = "Discard the embedded profile (don't color manage)";
 
@@ -30,8 +33,8 @@ fn harness(background: bool) -> Harness<'static, PhotocraftApp> {
         PhotocraftApp::new(
             Session::new(),
             Services {
-                import: Some(Box::new(|name, bytes, depth| {
-                    photocraft_io::import_with_svg_group_depth(name, bytes, depth).map(|r| (r.document, r.warnings)).map_err(|e| e.to_string())
+                import: Some(Box::new(|name, bytes, opts| {
+                    photocraft_io::import_with_options(name, bytes, opts).map(|r| (r.document, r.warnings)).map_err(|e| e.to_string())
                 })),
                 ..Default::default()
             },
@@ -125,7 +128,7 @@ fn files_opened_together_ask_one_at_a_time_before_each_opens() {
             assert_eq!(docs(&h), answered, "background {background}: a file opens only after its prompt");
             let name = asked(&h);
             assert!(!answered.contains(&name), "background {background}: {name} asked twice");
-            answer(&mut h, USE);
+            answer(&mut h, &use_embedded());
             answered.push(name);
         }
         in_order(background, &answered);
@@ -168,8 +171,8 @@ fn the_prompt_is_translated_and_still_names_its_file() {
         ),
     ] {
         let services = Services {
-            import: Some(Box::new(|name, bytes, depth| {
-                photocraft_io::import_with_svg_group_depth(name, bytes, depth).map(|r| (r.document, r.warnings)).map_err(|e| e.to_string())
+            import: Some(Box::new(|name, bytes, opts| {
+                photocraft_io::import_with_options(name, bytes, opts).map(|r| (r.document, r.warnings)).map_err(|e| e.to_string())
             })),
             ..Default::default()
         };
@@ -204,7 +207,8 @@ fn a_held_file_still_reports_its_missing_fonts() {
     s.execute("type.create", serde_json::json!({"text": "Hi", "x": 2, "y": 12, "size": 10, "font": MISSING})).unwrap();
     let mut doc = (*s.active().unwrap().doc).clone();
     doc.icc_profile = Some(photocraft_cms::Builtin::from_id("adobe-rgb-compat").unwrap().profile().to_bytes());
-    let services = Services { import: Some(Box::new(move |_: &str, _: &[u8], _: usize| Ok((doc.clone(), Vec::new())))), ..Default::default() };
+    let services =
+        Services { import: Some(Box::new(move |_: &str, _: &[u8], _: &photocraft_io::ImportOptions| Ok((doc.clone(), Vec::new())))), ..Default::default() };
     let mut app = PhotocraftApp::new(Session::new(), services);
     app.run("edit.colorSettings", serde_json::json!({"askOnMismatch": true, "policyRgb": "preserve"})).unwrap();
     assert_eq!(app.open_bytes("poster.psd", b"x").unwrap(), vec![warning.clone()]);
@@ -217,6 +221,7 @@ fn a_held_file_still_reports_its_missing_fonts() {
 
 #[test]
 fn each_answer_applies_to_its_own_file() {
+    let use_embedded = use_embedded();
     for background in [false, true] {
         let mut h = harness(background);
         open_three(&mut h);
@@ -229,7 +234,7 @@ fn each_answer_applies_to_its_own_file() {
                 match name {
                     "a.png" => CONVERT,
                     "b.png" => DISCARD,
-                    _ => USE,
+                    _ => &use_embedded,
                 },
             );
             answered.push(name);
@@ -249,7 +254,7 @@ fn cancel_opens_neither_the_file_nor_the_ones_still_to_come() {
         open_three(&mut h);
         let first = asked(&h);
         in_order(background, &[first]);
-        answer(&mut h, USE);
+        answer(&mut h, &use_embedded());
         click(&mut h, "Cancel");
         settle(&mut h);
         assert!(h.state().ui.dialogs.is_empty(), "background {background}: no prompt left");

@@ -34,7 +34,7 @@ pub(crate) fn looks_like_pcx(b: &[u8]) -> bool {
     stride >= min_stride && stride > 0 && (bits != 8 || matches!(planes, 1 | 3)) && (bits == 8 || u32::from(bits) * u32::from(planes) <= 4)
 }
 
-/// Read one compressed plane's row. RLE packets never cross a scanline.
+/// Read one compressed scanline, including all planes. RLE packets never cross a scanline.
 fn read_row(b: &[u8], pos: &mut usize, out: &mut [u8]) -> Result<(), CodecError> {
     let mut n = 0;
     while n < out.len() {
@@ -77,9 +77,7 @@ pub(crate) fn decode(b: &[u8], limits: &Limits) -> Result<Image, CodecError> {
     let mut p = HEADER;
     let width = w as usize;
     for y in 0..h as usize {
-        for plane in row.chunks_mut(stride) {
-            read_row(&b[..image_end], &mut p, plane)?;
-        }
+        read_row(&b[..image_end], &mut p, &mut row)?;
         for x in 0..width {
             let rgb = if bits == 8 && planes == 3 {
                 [row[x], row[stride + x], row[2 * stride + x]]

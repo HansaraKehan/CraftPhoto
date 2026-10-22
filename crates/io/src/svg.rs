@@ -65,9 +65,73 @@ fn fonts() -> Arc<usvg::fontdb::Database> {
         }
         #[cfg(not(target_arch = "wasm32"))]
         db.load_system_fonts();
+        resolve_generic_families(&mut db, system_generic_family);
         Arc::new(db)
     })
     .clone()
+}
+
+/// Installed families that stand in for each generic one, best first: the metric-compatible
+/// Liberation and Croscore fonts, then common Linux defaults, then the bundled craft fonts.
+const SANS_SERIF: &[&str] = &["Liberation Sans", "Arimo", "Helvetica", "DejaVu Sans", "Noto Sans", photocraft_text::fonts::DEFAULT_FAMILY];
+const SERIF: &[&str] = &["Liberation Serif", "Tinos", "Times", "DejaVu Serif", "Noto Serif"];
+const MONOSPACE: &[&str] = &["Liberation Mono", "Cousine", "Courier", "DejaVu Sans Mono", "Noto Sans Mono", photocraft_text::fonts::MONO_FAMILY];
+
+/// Points the generic families (`sans-serif`, `serif`, `monospace`, `cursive`, `fantasy`) at
+/// fonts the database holds. fontdb names Windows fonts for them (Arial, Times New Roman,
+/// Courier New…): on a system without those, every family of a usual
+/// `font-family="Arial, Helvetica, sans-serif"` misses, and usvg drops the text although
+/// hundreds of fonts are installed, where a browser sets it in a fallback font. A generic whose
+/// font is installed is left alone. Otherwise the system's choice (`system`, Fontconfig on Linux)
+/// wins when the database has it, then the first installed stand-in, then the sans-serif choice,
+/// then any font at all.
+fn resolve_generic_families(db: &mut usvg::fontdb::Database, system: impl Fn(&str) -> Option<String>) {
+    use usvg::fontdb::Family;
+    let has = |db: &usvg::fontdb::Database, name: &str| db.faces().any(|f| f.families.iter().any(|(n, _)| n.eq_ignore_ascii_case(name)));
+    let Some(any) = db.faces().find_map(|f| f.families.first()).map(|(n, _)| n.clone()) else { return };
+    let mut sans = None;
+    for (generic, css, stand_ins) in [
+        (Family::SansSerif, "sans-serif", SANS_SERIF),
+        (Family::Serif, "serif", SERIF),
+        (Family::Monospace, "monospace", MONOSPACE),
+        (Family::Cursive, "cursive", &[][..]),
+        (Family::Fantasy, "fantasy", &[][..]),
+    ] {
+        let current = db.family_name(&generic).to_string();
+        let pick = if has(db, &current) {
+            current
+        } else {
+            system(css)
+                .filter(|n| has(db, n))
+                .or_else(|| stand_ins.iter().find(|n| has(db, n)).map(|n| n.to_string()))
+                .or_else(|| sans.clone())
+                .unwrap_or_else(|| any.clone())
+        };
+        match generic {
+            Family::SansSerif => db.set_sans_serif_family(pick.clone()),
+            Family::Serif => db.set_serif_family(pick.clone()),
+            Family::Monospace => db.set_monospace_family(pick.clone()),
+            Family::Cursive => db.set_cursive_family(pick.clone()),
+            _ => db.set_fantasy_family(pick.clone()),
+        }
+        if generic == Family::SansSerif {
+            sans = Some(pick);
+        }
+    }
+}
+
+/// The family Fontconfig sets a generic family in (`fc-match sans-serif`), as the rest of the
+/// desktop does; `None` without Fontconfig.
+#[cfg(all(target_os = "linux", not(target_arch = "wasm32")))]
+fn system_generic_family(generic: &str) -> Option<String> {
+    let out = std::process::Command::new("fc-match").args(["--format=%{family[0]}", generic]).output().ok()?;
+    let name = String::from_utf8(out.stdout).ok()?;
+    Some(name.trim().to_string()).filter(|n| out.status.success() && !n.is_empty())
+}
+
+#[cfg(not(all(target_os = "linux", not(target_arch = "wasm32"))))]
+fn system_generic_family(_generic: &str) -> Option<String> {
+    None
 }
 
 /// Parse options for an untrusted drawing. `<image href>` resolves only `data:` URLs: a file path
@@ -780,6 +844,64 @@ mod tests {
         assert!(r.warnings.iter().all(|w| !w.contains("font")), "{:?}", r.warnings);
     }
 
+    /// #4806: text placed by a `transform` (Illustrator writes `matrix(1 0 0 1 x y)` on every text
+    /// element), on the text or on a group around it, lands where resvg draws it. usvg leaves the
+    /// glyph outlines' absolute transforms at identity, so reading them dropped the transform: the
+    /// text went off the canvas or kept its untransformed place and size.
+    ///
+    /// Shaped with the bundled Inter alone, never a system font: on a machine without fonts (a
+    /// bare CI image or VM) the test would otherwise have nothing to check, and the drawing and
+    /// its reference come from the same parse, so both use that face.
+    #[test]
+    fn transformed_text_lands_where_resvg_draws_it() {
+        fn inter() -> Arc<usvg::fontdb::Database> {
+            let mut db = usvg::fontdb::Database::new();
+            db.load_font_data(photocraft_text::fonts::INTER_REGULAR.to_vec());
+            Arc::new(db)
+        }
+        assert!(inter().faces().next().is_some(), "the bundled Inter loads");
+        let font = r#"font-size="24" font-family="Inter" fill="black""#;
+        let cases = [
+            format!(r#"<text transform="translate(10 40)" {font}>IHI</text>"#),
+            format!(r#"<text transform="matrix(1 0 0 1 10 40)" {font}>IHI</text>"#),
+            format!(r#"<text transform="translate(10 0)" x="20" y="40" {font}>IHI</text>"#),
+            format!(r#"<text transform="scale(2)" x="5" y="25" {font}>IHI</text>"#),
+            format!(r#"<g transform="translate(10 40)"><text {font}>IHI</text></g>"#),
+            format!(r#"<g transform="translate(60 0)"><g transform="rotate(90)"><text x="5" y="20" {font}>IHI</text></g></g>"#),
+        ];
+        for c in cases {
+            let svg = format!(r#"<svg xmlns="http://www.w3.org/2000/svg" width="120" height="60">{c}</svg>"#);
+            let parsed = parse_with(svg.as_bytes(), inter).unwrap();
+            assert!(!parsed.fontless_text, "{c}");
+            let mut reference = tiny_skia::Pixmap::new(120, 60).unwrap();
+            resvg::render(&parsed.tree, tiny_skia::Transform::default(), &mut reference.as_mut());
+            let r = import_parsed("t", parsed, MAX_GROUP_DEPTH).unwrap();
+            let [layer] = r.document.layers.as_slice() else { panic!("one text layer, got {}: {c}", r.document.layers.len()) };
+            assert!(matches!(layer.content, LayerContent::Group(_)), "text stays outline shapes: {c}");
+            let imported = photocraft_compose::flatten(&r.document);
+            let (mut both, mut either) = (0usize, 0usize);
+            let (mut a_box, mut b_box) = ([i32::MAX, i32::MAX, i32::MIN, i32::MIN], [i32::MAX, i32::MAX, i32::MIN, i32::MIN]);
+            let grow = |bx: &mut [i32; 4], x: i32, y: i32| *bx = [bx[0].min(x), bx[1].min(y), bx[2].max(x), bx[3].max(y)];
+            for (i, px) in reference.pixels().iter().enumerate() {
+                let (x, y) = ((i % 120) as i32, (i / 120) as i32);
+                let (a, b) = (imported.get(x, y)[3] > 0.5, px.alpha() > 127);
+                if a {
+                    grow(&mut a_box, x, y);
+                }
+                if b {
+                    grow(&mut b_box, x, y);
+                }
+                both += usize::from(a && b);
+                either += usize::from(a || b);
+            }
+            assert!(either > 50, "resvg draws the text on the canvas: {c}");
+            // Same place and size to the pixel; the outlines are filled by a different rasteriser,
+            // so the edges of thin stems may differ by half a pixel.
+            assert!(a_box.iter().zip(b_box).all(|(a, b)| (a - b).abs() <= 1), "imported {a_box:?}, resvg {b_box:?}: {c}");
+            assert!(both * 10 >= either * 7, "imported glyphs cover what resvg draws ({both} of {either} px): {c}");
+        }
+    }
+
     /// #4266: a group clipped by one path (the PhotoCraft icon's rounded square) stays editable
     /// shapes with the clip as its vector mask, and looks as resvg draws the drawing; a clip of
     /// two shapes is still rasterised, with the warning.
@@ -826,6 +948,53 @@ mod tests {
             <g clip-path="url(#c)"><rect width="64" height="64"/><rect width="9" height="9" fill="red"/></g></svg>"##;
         let r = import_svg("t", two).unwrap();
         assert!(r.warnings.iter().any(|w| w.contains("clip-path")), "{:?}", r.warnings);
+    }
+
+    /// A database with the bundled Inter alone, generics resolved without Fontconfig: none of
+    /// fontdb's Windows defaults (Arial, Times New Roman, Courier New) is in it.
+    fn inter_only() -> Arc<usvg::fontdb::Database> {
+        let mut db = usvg::fontdb::Database::new();
+        db.load_font_data(include_bytes!("../../../assets/fonts/Inter-Regular.ttf").to_vec());
+        resolve_generic_families(&mut db, |_| None);
+        Arc::new(db)
+    }
+
+    /// Text asking for fonts that aren't installed (`Arial, Helvetica, sans-serif` on a Linux
+    /// without them) is set in an installed font, as a browser does, instead of being dropped.
+    #[test]
+    fn text_in_missing_fonts_falls_back_to_an_installed_one() {
+        for family in ["Arial, Helvetica, sans-serif", "Times New Roman", "Courier New, monospace", "cursive", "fantasy"] {
+            let svg = format!(
+                "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"120\" height=\"60\"><text x=\"5\" y=\"45\" font-size=\"48\" font-family=\"{family}\">II</text></svg>"
+            );
+            let parsed = parse_with(svg.as_bytes(), inter_only).unwrap();
+            assert!(!parsed.fontless_text);
+            let r = import_parsed("t", parsed, MAX_GROUP_DEPTH).unwrap();
+            assert_eq!(r.document.layers.first().map(|l| l.name.as_str()), Some("II"), "{family}: {:?}", r.warnings);
+        }
+    }
+
+    #[test]
+    fn generic_families_point_at_installed_fonts() {
+        use usvg::fontdb::Family;
+        let db = inter_only();
+        for g in [Family::SansSerif, Family::Serif, Family::Monospace, Family::Cursive, Family::Fantasy] {
+            assert_eq!(db.family_name(&g), "Inter", "{g:?}");
+        }
+        // The system's choice wins when installed; a generic whose font is installed stays.
+        let mut db = usvg::fontdb::Database::new();
+        db.load_font_data(include_bytes!("../../../assets/fonts/Inter-Regular.ttf").to_vec());
+        db.load_font_data(include_bytes!("../../../assets/fonts/JetBrainsMono-Regular.ttf").to_vec());
+        db.set_cursive_family("Inter");
+        resolve_generic_families(&mut db, |g| Some(if g == "serif" { "JetBrains Mono" } else { "Not Installed" }.to_string()));
+        assert_eq!(db.family_name(&Family::Serif), "JetBrains Mono");
+        assert_eq!(db.family_name(&Family::Monospace), "JetBrains Mono", "the bundled mono stand-in");
+        assert_eq!(db.family_name(&Family::SansSerif), "Inter");
+        assert_eq!(db.family_name(&Family::Cursive), "Inter");
+        // An empty database is left alone.
+        let mut empty = usvg::fontdb::Database::new();
+        resolve_generic_families(&mut empty, |_| Some("Inter".into()));
+        assert_eq!(empty.family_name(&Family::SansSerif), "Arial");
     }
 
     #[test]
