@@ -67,17 +67,24 @@ jobs:
           VER=$(grep -m1 '^version' src/Cargo.toml | cut -d'"' -f2)
           SHA=$(git -C src rev-parse --short=7 HEAD)
           TAG="android-v${VER}-${SHA}"
+          EXISTS=false
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then EXISTS=true; fi
+          SKIP=false
+          if [ "$EXISTS" = "true" ]; then
+            if [ "$FORCE" = "true" ]; then
+              # Same upstream commit, new Android layer: publish it as a new release.
+              TAG="${TAG}-r${GITHUB_RUN_NUMBER}"
+            else
+              echo "Release $TAG already exists - nothing to do."
+              SKIP=true
+            fi
+          fi
           {
             echo "version=$VER"
             echo "sha=$SHA"
             echo "tag=$TAG"
+            echo "skip=$SKIP"
           } >> "$GITHUB_OUTPUT"
-          if [ "$FORCE" != "true" ] && gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-            echo "Release $TAG already exists - nothing to do."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-          fi
 
       - name: Add the Android layer on top of upstream
         if: steps.ver.outputs.skip != 'true'
@@ -211,14 +218,37 @@ jobs:
           SHA: ${{ steps.ver.outputs.sha }}
           REF: ${{ steps.ref.outputs.ref }}
         run: |
-          cat > notes.md <<NOTES
-          **PhotoCraft ${VERSION} for Android** (English, ARM64)
-
-          Built automatically from upstream \`${UPSTREAM}\` at \`${REF}\` (commit \`${SHA}\`) with the Android layer and English translation applied.
-
-          - Needs an ARM64 phone or tablet running Android 9 or newer.
-          - Download the \`.apk\`, open it, and allow installs from your file manager or browser when Android asks.
-          - Unofficial build, not made or supported by the PhotoCraft team. If an update will not install over an older build, uninstall the old one first.
-          NOTES
+          # Release notes: this edition's own news (WHATS-NEW.md in this repository, newest section),
+          # then what changed upstream since the previous release, then the install notes.
+          PREV_TAG=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 1 --exclude-drafts --json tagName --jq '.[0].tagName' 2>/dev/null || true)
+          PREV_SHA=$(printf '%s' "$PREV_TAG" | sed -nE 's/^android-v[^-]+-([0-9a-f]{7}).*/\1/p')
+          {
+            if [ -f ../fork/WHATS-NEW.md ]; then
+              echo "## What's new in this edition"
+              awk '/^## /{n++} n>=2{exit} n==1 && /^---[[:space:]]*$/{exit} n==1{print}' ../fork/WHATS-NEW.md | sed -E 's/^## /### /'
+              echo
+            fi
+            echo "## Changes from upstream"
+            if [ -z "$PREV_SHA" ] || ! git rev-parse -q --verify "${PREV_SHA}^{commit}" > /dev/null; then
+              echo "First build, or the previous build's upstream commit is no longer available."
+            else
+              COUNT=$(git rev-list --no-merges --count "${PREV_SHA}..HEAD")
+              if [ "$COUNT" = "0" ]; then
+                echo "No upstream changes since the previous build (\`${PREV_SHA}\`): this build only updates the Android edition."
+              else
+                echo "${COUNT} upstream change(s) since the previous build (\`${PREV_SHA}\` → \`${SHA}\`):"
+                echo
+                git log --no-merges --max-count=40 --pretty='- %s' "${PREV_SHA}..HEAD"
+                if [ "$COUNT" -gt 40 ]; then echo "- …and $((COUNT - 40)) more"; fi
+              fi
+            fi
+            echo
+            echo "## About this build"
+            echo "**PhotoCraft ${VERSION} for Android** (English, ARM64), built automatically from upstream \`${UPSTREAM}\` at \`${REF}\` (commit \`${SHA}\`) with the Android edition's layer and English translation applied."
+            echo
+            echo "- Needs an ARM64 phone or tablet running Android 9 or newer."
+            echo "- Download the \`.apk\`, open it, and allow installs from your file manager or browser when Android asks."
+            echo "- Unofficial build, not made or supported by the PhotoCraft team. If an update will not install over an older build, uninstall the old one first."
+          } > notes.md
           gh release create "$TAG" "$APK" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
             --title "PhotoCraft ${VERSION} Android (${SHA})" --notes-file notes.md
