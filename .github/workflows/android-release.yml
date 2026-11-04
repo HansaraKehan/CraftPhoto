@@ -3,6 +3,12 @@ name: Build and release Android APK
 # Builds the newest upstream PhotoCraft (storytold/photocraft) with the Android layer
 # and the English translation applied on top, then publishes the APK as a GitHub Release.
 # It only builds when upstream has something new (or when you run it by hand).
+#
+# Run it by hand with "Publish a release" switched off to only build: the signed APK is kept as a
+# download on the run page (Artifacts) and nothing is released, tagged or committed.
+#
+# Everything about the layer itself (how it is applied, the release notes, the features list)
+# lives inside android-layer/android-layer.tar.gz, so this file rarely needs editing.
 on:
   schedule:
     - cron: "17 3 * * *"
@@ -16,6 +22,10 @@ on:
         description: "Build again even if this upstream version already has a release"
         type: boolean
         default: false
+      publish:
+        description: "Publish a release (switch off to only build the APK and download it from this run)"
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -29,6 +39,7 @@ env:
   TARGET: aarch64-linux-android
   NDK_VERSION: 28.2.13676358
   BT_VERSION: 35.0.0
+  MIN_RUST: "1.95"
   CARGO_TERM_COLOR: always
 
 jobs:
@@ -63,14 +74,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           FORCE: ${{ inputs.force }}
+          INPUT_PUBLISH: ${{ inputs.publish }}
         run: |
+          # Scheduled runs have no inputs: they always publish.
+          PUBLISH="${INPUT_PUBLISH:-true}"
           VER=$(grep -m1 '^version' src/Cargo.toml | cut -d'"' -f2)
           SHA=$(git -C src rev-parse --short=7 HEAD)
           TAG="android-v${VER}-${SHA}"
-          EXISTS=false
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then EXISTS=true; fi
           SKIP=false
-          if [ "$EXISTS" = "true" ]; then
+          if [ "$PUBLISH" = "true" ] && gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
             if [ "$FORCE" = "true" ]; then
               # Same upstream commit, new Android layer: publish it as a new release.
               TAG="${TAG}-r${GITHUB_RUN_NUMBER}"
@@ -84,6 +96,7 @@ jobs:
             echo "sha=$SHA"
             echo "tag=$TAG"
             echo "skip=$SKIP"
+            echo "publish=$PUBLISH"
           } >> "$GITHUB_OUTPUT"
 
       - name: Add the Android layer on top of upstream
@@ -92,16 +105,9 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/layer"
           tar xzf ../fork/android-layer/android-layer.tar.gz -C "$RUNNER_TEMP/layer"
-          git config user.email "ci@example.com"
-          git config user.name "ci"
-          if ! git apply --3way --whitespace=nowarn "$RUNNER_TEMP/layer/android-layer.patch"; then
-            echo "::error::The Android patch no longer applies to upstream ${{ steps.ref.outputs.ref }} (${{ steps.ver.outputs.sha }})."
-            echo "Files with conflicts:"; git diff --name-only --diff-filter=U
-            exit 1
-          fi
-          cp -r "$RUNNER_TEMP/layer/overlay/." .
-          cp "$RUNNER_TEMP/layer/translate_en.py" .
-          python3 translate_en.py
+          # The zip carries its own applier (patch with fallbacks, overlay, translation). It names the
+          # files that conflict if upstream changed something the layer cannot absorb.
+          python3 "$RUNNER_TEMP/layer/apply_layer.py"
 
       - uses: actions/setup-java@v4
         if: steps.ver.outputs.skip != 'true'
@@ -113,8 +119,10 @@ jobs:
         if: steps.ver.outputs.skip != 'true'
         run: |
           RUSTV=$(grep -m1 '^rust-version' src/Cargo.toml | cut -d'"' -f2)
-          rustup toolchain install "${RUSTV:-stable}" --profile minimal --target "$TARGET"
-          rustup default "${RUSTV:-stable}"
+          # Never go below MIN_RUST (the egui family needs it even where the workspace says less).
+          RUSTV=$(printf '%s\n%s\n' "${RUSTV:-$MIN_RUST}" "$MIN_RUST" | sort -V | tail -n1)
+          rustup toolchain install "$RUSTV" --profile minimal --target "$TARGET"
+          rustup default "$RUSTV"
           rustc --version
 
       - uses: Swatinem/rust-cache@v2
@@ -208,8 +216,17 @@ jobs:
           "$BT/apksigner" verify --verbose "$APK"
           echo "APK=$APK" >> "$GITHUB_ENV"
 
+      - name: Keep the APK (build only)
+        if: steps.ver.outputs.skip != 'true' && steps.ver.outputs.publish != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: PhotoCraft-android-apk
+          path: src/dist/*.apk
+          retention-days: 14
+          if-no-files-found: error
+
       - name: Publish the release
-        if: steps.ver.outputs.skip != 'true'
+        if: steps.ver.outputs.skip != 'true' && steps.ver.outputs.publish == 'true'
         working-directory: src
         env:
           GH_TOKEN: ${{ github.token }}
@@ -218,29 +235,55 @@ jobs:
           SHA: ${{ steps.ver.outputs.sha }}
           REF: ${{ steps.ref.outputs.ref }}
         run: |
-          # Release notes: this edition's own news (WHATS-NEW.md in this repository, newest section),
-          # then what changed upstream since the previous release, then the install notes.
-          PREV_TAG=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 1 --exclude-drafts --json tagName --jq '.[0].tagName' 2>/dev/null || true)
+          # Release notes, in this order:
+          #  1. The Android features that are new in this build: the topmost "## ..." section of
+          #     whats-new.md inside the layer zip (written for you with every zip). Left out when it is
+          #     the same section the previous release already showed, so old news never repeats.
+          #  2. What changed upstream since the previous release.
+          #  3. Install notes.
+          NEWS="$RUNNER_TEMP/layer/whats-new.md"
+          PREV_TAG=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 50 --exclude-drafts --json tagName --jq '[.[] | select(.tagName | startswith("android-v"))][0].tagName' 2>/dev/null || true)
           PREV_SHA=$(printf '%s' "$PREV_TAG" | sed -nE 's/^android-v[^-]+-([0-9a-f]{7}).*/\1/p')
+          PREV_BODY=""
+          if [ -n "$PREV_TAG" ]; then
+            PREV_BODY=$(gh release view "$PREV_TAG" --repo "$GITHUB_REPOSITORY" --json body --jq .body 2>/dev/null || true)
+          fi
+          TOP=""
+          if [ -f "$NEWS" ]; then
+            TOP=$(awk '/^## /{ if (seen) exit; seen = 1; next } seen' "$NEWS")
+          fi
+          TOP_ID=$(printf '%s' "$TOP" | sha1sum | cut -c1-12)
           {
-            if [ -f ../fork/WHATS-NEW.md ]; then
-              echo "## What's new in this edition"
-              awk '/^## /{n++} n>=2{exit} n==1 && /^---[[:space:]]*$/{exit} n==1{print}' ../fork/WHATS-NEW.md | sed -E 's/^## /### /'
+            if [ -n "$(printf '%s' "$TOP" | tr -d '[:space:]')" ] && ! printf '%s' "$PREV_BODY" | grep -qF "android-news:${TOP_ID}"; then
+              HEAD=$(awk '/^## /{ sub(/^## /, ""); print; exit }' "$NEWS")
+              echo "## New in the Android edition: ${HEAD}"
+              echo
+              printf '%s\n' "$TOP"
               echo
             fi
             echo "## Changes from upstream"
+            echo
             if [ -z "$PREV_SHA" ] || ! git rev-parse -q --verify "${PREV_SHA}^{commit}" > /dev/null; then
               echo "First build, or the previous build's upstream commit is no longer available."
             else
               COUNT=$(git rev-list --no-merges --count "${PREV_SHA}..HEAD")
               if [ "$COUNT" = "0" ]; then
-                echo "No upstream changes since the previous build (\`${PREV_SHA}\`): this build only updates the Android edition."
+                echo "No upstream changes since the previous build (\`${PREV_SHA}\`)."
               else
                 echo "${COUNT} upstream change(s) since the previous build (\`${PREV_SHA}\` → \`${SHA}\`):"
                 echo
                 git log --no-merges --max-count=40 --pretty='- %s' "${PREV_SHA}..HEAD"
                 if [ "$COUNT" -gt 40 ]; then echo "- …and $((COUNT - 40)) more"; fi
               fi
+            fi
+            # Upstream's own release notes, when this build is a new upstream version.
+            PREV_VER=$(printf '%s' "$PREV_TAG" | sed -nE 's/^android-v([^-]+)-.*/\1/p')
+            if [ "$PREV_VER" != "$VERSION" ] && gh release view "v${VERSION}" --repo "$UPSTREAM" --json body --jq .body > upstream-raw.md 2>/dev/null && [ -s upstream-raw.md ]; then
+              echo
+              echo "### Upstream ${VERSION} release notes"
+              echo
+              # Without GitHub's "New Contributors" section and the "by @user in <PR>" suffixes.
+              awk '/^#+[ \t]*New Contributors[ \t]*$/ { skip = 1; next } /^#+[ \t]/ { skip = 0 } !skip' upstream-raw.md | sed -E 's/ by @[^ ]+ in [^ ]+[[:space:]]*$//'
             fi
             echo
             echo "## About this build"
@@ -249,6 +292,40 @@ jobs:
             echo "- Needs an ARM64 phone or tablet running Android 9 or newer."
             echo "- Download the \`.apk\`, open it, and allow installs from your file manager or browser when Android asks."
             echo "- Unofficial build, not made or supported by the PhotoCraft team. If an update will not install over an older build, uninstall the old one first."
+            echo
+            echo "<!-- android-news:${TOP_ID} -->"
           } > notes.md
           gh release create "$TAG" "$APK" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
             --title "PhotoCraft ${VERSION} Android (${SHA})" --notes-file notes.md
+
+      - name: Keep the README's Android features list current
+        if: steps.ver.outputs.skip != 'true' && steps.ver.outputs.publish == 'true'
+        working-directory: fork
+        run: |
+          # Every "- " feature line of whats-new.md (all sections, so a feature stays listed after it
+          # stops being news) goes between the markers in README.md. Fixes are written with "* " and
+          # are not listed. If the markers are missing they are added at the end of the README.
+          python3 - "$RUNNER_TEMP/layer/whats-new.md" <<'PY'
+          import re, sys, pathlib
+          news = pathlib.Path(sys.argv[1])
+          if not news.exists():
+              sys.exit(0)
+          features = [l.rstrip() for l in news.read_text(encoding="utf-8").splitlines() if l.startswith("- ")]
+          start, end = "<!-- android-features:start -->", "<!-- android-features:end -->"
+          readme = pathlib.Path("README.md")
+          text = readme.read_text(encoding="utf-8") if readme.exists() else ""
+          if start not in text:
+              text = text.rstrip() + f"\n\n## Android features\n\nKept up to date automatically from each release.\n\n{start}\n{end}\n"
+          block = start + "\n" + "\n".join(features) + "\n" + end
+          text = re.sub(re.escape(start) + r".*?" + re.escape(end), lambda m: block, text, flags=re.S)
+          readme.write_text(text, encoding="utf-8")
+          PY
+          if ! git diff --quiet -- README.md; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add README.md
+            git commit -m "Update the Android features list in README [skip ci]"
+            BR="${GITHUB_REF_NAME}"
+            git pull --rebase -q origin "$BR" || true
+            git push origin "HEAD:${BR}" || echo "::warning::couldn't push the README update (the branch moved meanwhile)"
+          fi
