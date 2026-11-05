@@ -1,0 +1,285 @@
+name: Check that the Android layer builds on the newest upstream release
+
+# When upstream publishes a new release, take that exact version, add the Android layer and compile
+# it (no APK, no release). EVERY error is collected, not just the first one, and written as one list
+# you can copy: in a GitHub issue, in the run's summary and in a downloadable file. Paste that list
+# to Claude to get a fixed android-layer zip.
+#
+# - Runs every night, but only does work when upstream has a release this check has not seen yet
+#   (it remembers by the issue it opens or closes for each release).
+# - Run it by hand to check any upstream branch, tag or commit (empty = latest release); a manual
+#   run always checks, even if that release was checked before.
+# - A release that builds opens a closed issue as the record; a release that breaks opens an open
+#   issue with the error list. When a later check of the same release passes, the issue is closed.
+# Needs: Settings > General > Features > Issues ticked (forks have Issues off by default).
+on:
+  schedule:
+    - cron: "43 20 * * *"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Upstream branch, tag or commit to check (empty = the latest upstream release)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: android-canary
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: storytold/photocraft
+  TARGET: aarch64-linux-android
+  NDK_VERSION: 28.2.13676358
+  MIN_RUST: "1.95"
+  CARGO_TERM_COLOR: never
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Find the upstream version to check
+        id: rel
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          if [ -n "$INPUT_REF" ]; then
+            REF="$INPUT_REF"
+            RUN=true
+          else
+            REF=$(gh release list --repo "$UPSTREAM" --limit 1 --exclude-drafts --exclude-pre-releases --json tagName --jq '.[0].tagName // empty' 2>/dev/null || true)
+            if [ -z "$REF" ]; then
+              echo "Upstream has no release yet: nothing to check."
+              echo "run=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            RUN=true
+            # Already checked this release? (an issue titled "... vs upstream <tag>: ..." exists)
+            if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
+              SEEN=$(gh issue list --repo "$GITHUB_REPOSITORY" --state all --label android-canary --search "\"vs upstream ${REF}:\" in:title" --json number --jq '.[0].number // empty' 2>/dev/null || true)
+              if [ -n "$SEEN" ]; then
+                echo "Upstream ${REF} was already checked (issue #${SEEN})."
+                RUN=false
+              fi
+            fi
+          fi
+          {
+            echo "ref=$REF"
+            echo "run=$RUN"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check out this repository (the Android layer lives here)
+        if: steps.rel.outputs.run == 'true'
+        uses: actions/checkout@v4
+        with:
+          path: fork
+
+      - name: Check out upstream
+        if: steps.rel.outputs.run == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ steps.rel.outputs.ref }}
+          path: src
+
+      - name: Add the Android layer on top of upstream
+        id: layer
+        if: steps.rel.outputs.run == 'true'
+        continue-on-error: true
+        shell: bash
+        working-directory: src
+        run: |
+          mkdir -p "$RUNNER_TEMP/layer"
+          tar xzf ../fork/android-layer/android-layer.tar.gz -C "$RUNNER_TEMP/layer"
+          # apply_layer.py lists every file it cannot patch and every hook anchor that moved.
+          set -o pipefail
+          python3 "$RUNNER_TEMP/layer/apply_layer.py" 2>&1 | tee "$RUNNER_TEMP/layer.log"
+
+      - name: Install the Rust version upstream asks for
+        if: steps.rel.outputs.run == 'true' && steps.layer.outcome == 'success'
+        run: |
+          RUSTV=$(grep -m1 '^rust-version' src/Cargo.toml | cut -d'"' -f2)
+          RUSTV=$(printf '%s\n%s\n' "${RUSTV:-$MIN_RUST}" "$MIN_RUST" | sort -V | tail -n1)
+          rustup toolchain install "$RUSTV" --profile minimal --target "$TARGET"
+          rustup default "$RUSTV"
+          rustc --version
+
+      - uses: Swatinem/rust-cache@v2
+        if: steps.rel.outputs.run == 'true' && steps.layer.outcome == 'success'
+        with:
+          workspaces: src
+          key: android-arm64-check
+
+      - name: Install the Android NDK
+        if: steps.rel.outputs.run == 'true' && steps.layer.outcome == 'success'
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "ndk;${NDK_VERSION}"
+
+      - name: Compile the Android app (check only, keep going after errors)
+        id: compile
+        if: steps.rel.outputs.run == 'true' && steps.layer.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        working-directory: src
+        run: |
+          BIN="$ANDROID_HOME/ndk/${NDK_VERSION}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CC_aarch64_linux_android="$BIN/aarch64-linux-android28-clang"
+          export AR_aarch64_linux_android="$BIN/llvm-ar"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$BIN/aarch64-linux-android28-clang"
+          set -o pipefail
+          # --keep-going: carry on with the crates that do not depend on a broken one, so one run
+          # shows as many errors as possible instead of stopping at the first.
+          cargo check -p photocraft-android --target "$TARGET" --keep-going -j 3 2>&1 | tee "$RUNNER_TEMP/compile.log"
+
+      - name: Collect every error into one list
+        id: collect
+        if: steps.rel.outputs.run == 'true'
+        shell: bash
+        env:
+          LAYER_OUTCOME: ${{ steps.layer.outcome }}
+          COMPILE_OUTCOME: ${{ steps.compile.outcome }}
+          REF: ${{ steps.rel.outputs.ref }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, os, re, pathlib
+          tmp = pathlib.Path(os.environ["RUNNER_TEMP"])
+          layer_ok = os.environ["LAYER_OUTCOME"] == "success"
+          compile_ok = os.environ.get("COMPILE_OUTCOME") == "success"
+          out = []
+          count = 0
+          if not layer_ok:
+              # The layer did not even apply: list every line apply_layer.py printed about it.
+              log = (tmp / "layer.log").read_text(errors="replace") if (tmp / "layer.log").exists() else ""
+              lines = [l for l in log.splitlines() if l.strip()]
+              out.append("== The Android layer does not apply to this upstream version ==")
+              out.extend(lines[-60:])
+              count = max(1, sum(1 for l in lines if "/" in l and not l.startswith(("patch:", "pen_touch", "added", "translated", "::"))))
+          elif not compile_ok:
+              log = (tmp / "compile.log").read_text(errors="replace") if (tmp / "compile.log").exists() else ""
+              lines = log.splitlines()
+              # Each rustc error: "error[E0425]: message" then " --> path:line:col".
+              found, seen = [], set()
+              blocks = []
+              i = 0
+              while i < len(lines):
+                  m = re.match(r"^error(\[E\d+\])?: (.*)$", lines[i])
+                  if m and not re.match(r"(could not compile|aborting due to|build failed|failed to run custom build)", m.group(2)):
+                      loc = ""
+                      for j in range(i + 1, min(i + 6, len(lines))):
+                          lm = re.match(r"^\s*--> (\S+)", lines[j])
+                          if lm:
+                              loc = lm.group(1)
+                              break
+                      key = (m.group(1) or "", m.group(2), loc)
+                      if key not in seen:
+                          seen.add(key)
+                          found.append(f"{loc or '(no location)'}  error{m.group(1) or ''}: {m.group(2)}")
+                          # The whole block, up to the next blank line, for the details part.
+                          k = i
+                          while k < len(lines) and lines[k].strip():
+                              k += 1
+                          blocks.append("\n".join(lines[i:k]))
+                      i += 1
+                  else:
+                      i += 1
+              count = len(found)
+              if found:
+                  out.append(f"== {count} compile error(s) ==")
+                  out.extend(found)
+                  out.append("")
+                  out.append("== Details of each error ==")
+                  out.extend(b + "\n" for b in blocks[:60])
+                  if len(blocks) > 60:
+                      out.append(f"... and {len(blocks) - 60} more (see the full log)")
+              else:
+                  out.append("== The compile failed, but no 'error[...]' lines were found; last lines of the log ==")
+                  out.extend(lines[-60:])
+                  count = 1
+          text = "\n".join(out)
+          # GitHub allows 65536 characters in an issue body: keep room for the rest of it.
+          if len(text) > 56000:
+              text = text[:56000] + "\n... (cut; the full list is in the run's artifact)"
+          (tmp / "errors.txt").write_text(text + "\n")
+          sig = hashlib.sha256(text.encode()).hexdigest()[:12]
+          with open(os.environ["GITHUB_OUTPUT"], "a") as g:
+              g.write(f"count={count}\nsig={sig}\nfailed={'false' if (layer_ok and compile_ok) else 'true'}\n")
+          PY
+
+      - name: Keep the logs
+        if: always() && steps.rel.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-canary-logs
+          path: |
+            ${{ runner.temp }}/errors.txt
+            ${{ runner.temp }}/layer.log
+            ${{ runner.temp }}/compile.log
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Report the result
+        if: always() && steps.rel.outputs.run == 'true' && steps.collect.outcome == 'success'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ steps.rel.outputs.ref }}
+          FAILED: ${{ steps.collect.outputs.failed }}
+          COUNT: ${{ steps.collect.outputs.count }}
+          SIG: ${{ steps.collect.outputs.sig }}
+        run: |
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          gh label create android-canary --repo "$GITHUB_REPOSITORY" --color 0E8A16 --description "Android layer check against an upstream release" --force || true
+          # Any open issue for this same release is replaced by this result.
+          OPEN=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --label android-canary --search "\"vs upstream ${REF}:\" in:title" --json number --jq '.[0].number // empty' 2>/dev/null || true)
+          if [ "$FAILED" != "true" ]; then
+            echo "The Android layer builds on upstream ${REF}." | tee -a "$GITHUB_STEP_SUMMARY"
+            BODY="The Android layer builds on upstream \`${UPSTREAM}\` at \`${REF}\` (run ${RUN_URL}). Nothing to fix."
+            if [ -n "$OPEN" ]; then
+              gh issue comment "$OPEN" --repo "$GITHUB_REPOSITORY" --body "$BODY" || true
+              gh issue close "$OPEN" --repo "$GITHUB_REPOSITORY" || true
+            else
+              N=$(gh issue create --repo "$GITHUB_REPOSITORY" --label android-canary --title "Android layer vs upstream ${REF}: builds" --body "$BODY" 2>/dev/null | grep -oE '[0-9]+$' || true)
+              if [ -n "$N" ]; then gh issue close "$N" --repo "$GITHUB_REPOSITORY" || true; fi
+            fi
+            exit 0
+          fi
+          ERR=$(sed 's/@/＠/g' "$RUNNER_TEMP/errors.txt")
+          {
+            echo "The Android layer does not build on upstream \`${UPSTREAM}\` at \`${REF}\`: **${COUNT} problem(s)**."
+            echo
+            echo "Copy everything in the block below, paste it to Claude and ask for a fixed \`android-layer\` zip."
+            echo
+            echo '```text'
+            printf '%s\n' "$ERR"
+            echo '```'
+            echo
+            echo "Full logs: ${RUN_URL} (artifact \`android-canary-logs\`)"
+            echo
+            echo "<!-- error-signature:${SIG} -->"
+          } > "$RUNNER_TEMP/body.md"
+          cat "$RUNNER_TEMP/body.md" >> "$GITHUB_STEP_SUMMARY"
+          TITLE="Android layer vs upstream ${REF}: ${COUNT} error(s)"
+          if [ -n "$OPEN" ]; then
+            if gh issue view "$OPEN" --repo "$GITHUB_REPOSITORY" --json body,comments --jq '[.body] + [.comments[].body] | join("\n")' 2>/dev/null | grep -q "error-signature:${SIG}"; then
+              echo "This exact list is already reported in issue #$OPEN."
+            else
+              gh issue comment "$OPEN" --repo "$GITHUB_REPOSITORY" --body-file "$RUNNER_TEMP/body.md" || true
+              gh issue edit "$OPEN" --repo "$GITHUB_REPOSITORY" --title "$TITLE" || true
+            fi
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --label android-canary --title "$TITLE" --body-file "$RUNNER_TEMP/body.md" \
+              || echo "Could not open an issue: tick Settings > General > Features > Issues. The list is in the run summary and the artifact."
+          fi
+
+      - name: Mark the run red when the layer is broken
+        if: steps.rel.outputs.run == 'true' && steps.collect.outputs.failed == 'true'
+        run: |
+          echo "The Android layer does not build on upstream ${{ steps.rel.outputs.ref }}: ${{ steps.collect.outputs.count }} problem(s). See the summary."
+          exit 1
