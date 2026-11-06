@@ -455,3 +455,32 @@ Forks and modified versions must remove them.
 ## Star history
 
 [![Star History Chart](https://api.star-history.com/svg?repos=storytold/photocraft&type=Date&legend=top-left)](https://www.star-history.com/?repos=storytold%2Fphotocraft&type=date&legend=top-left)
+
+## Android features
+
+Kept up to date automatically from each release.
+
+<!-- android-features:start -->
+- 🎓 **Quick tour.** The first time you start the app, a short animated tour shows the gestures and pen actions with their default actions, rings the buttons you need to tap, and ends by saying everything is customizable. Replay it from **Help → Quick tour: pen and touch…** or **Preferences → Tools → Pen & Touch → Show the quick tour**.
+- ⏱️ **Longer press window.** The wait for the next press of a double or triple press is now 500 ms by default (it was 300 ms) and can be set up to 1000 ms. Saved settings that still had 300 ms move to 500 ms.
+- 👆 **Two- and three-finger taps.** A quick tap of 2 or 3 fingers on the canvas runs an action. Defaults: 2 fingers = Undo, 3 fingers = Redo. Each has its own on/off switch and a custom action (a key, a combination, or *Switch between recent tools*) under Preferences → Tools → Pen & Touch → *Finger taps*. They work in Pen only mode, and on an active-stylus screen where fingers move things (never where a finger paints, so a tap can't leave a dot).
+- 📜 Swiping on a Layers row, thumbnail or eye column now scrolls the list. Swipes on any short button, row, thumbnail or slider in panels and windows scroll them; title bars and scroll bars still drag.
+- ⭕ **The pen pointer ring now matches your brush automatically.** It follows the current brush size at the canvas zoom, and shrinks and grows with pen pressure when the brush uses pressure for size. Other tools use the fixed size from Preferences. Turn the matching off in Preferences → Tools → Pen & Touch → *Pen pointer*.
+- 📜 **Swipe to scroll panels and windows.** A quick up or down swipe that starts on a list row or slider (Brushes, Layers and similar) now scrolls the panel instead of fighting the row. Switch: *Panels and windows* in the same settings block.
+- 🔔 **Update checker.** The app looks for a newer build on this repository's Releases page at start (at most every 6 hours, silent offline) and offers **Download / Later / Skip this version**. The app now declares the Internet permission for this.
+- 🔢 **Press-count shortcuts.** Each pen button has *Press*, *Press twice* and *Press 3 times* actions, each a key, a combination, a tool or *Switch between recent tools*. Doing the same tool press again returns to the previous tool, so double press can pick Eraser and double press again goes back. A *Next press within* setting (default 300 ms) controls the window. A hold cancels a pending count.
+- ⭕ **Pen pointer ring.** Preferences → Tools → Pen & Touch → *Pen pointer*: show a ring where the pen hovers and touches, and pick its size (8–120 pt). Off by default.
+- 👋 **Discord link replaced.** The start page button, the About dialog and the Help menu entry now invite people to follow the developer on GitHub (https://github.com/HansaraKehan) instead of upstream's Discord.
+- ✋ **Pen only mode: one finger pans the canvas.** Two fingers still pan, zoom and rotate.
+- The "pan" switch in Preferences now covers both one and two fingers.
+- ⌨️ **Soft keys moved into the top bar**, to the right of Layers / Options, instead of a third bar. They contract with «.
+- 🔁 **Pen button 1 now switches between recent tools by default.** Press once to go to the previous tool, press again to return. Available for any pen button or soft key as *Switch between recent tools*.
+- 🖊️ **Pen barrel buttons.** Press and hold are separate actions, each a key or a combination. Modifier combinations latch (press to hold, press again to release).
+- ⌨️ **Soft-key strip** with Ctrl, Alt, Shift, Enter and Esc, editable in Preferences, with Record and Pick helpers and a limit of 24 keys.
+- 🔀 **Finger ⇄ Pen only** button for quick switching.
+- 🧭 **Two-finger canvas navigation** in Pen only mode: pan, zoom and rotate about the midpoint, each with its own switch.
+- 👆 **Active-stylus devices:** a finger drags items with the Move tool while the pen keeps painting; a held finger can stay a held press instead of right-clicking.
+- 🧰 **Device question at start-up** (*with / without an active stylus*) with a **Don't ask again** button, also in Preferences → Tools → Pen & Touch. Devices without an active stylus never get Enter pressed for you.
+- 🤖 **Android stylus support** in the window layer: barrel buttons arrive as pen buttons, and stylus tip and eraser contacts are told apart from fingers.
+- 💾 All settings are saved with your preferences.
+<!-- android-features:end -->
