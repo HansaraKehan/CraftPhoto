@@ -1,8 +1,10 @@
 name: Build and release Android APK
 
-# Builds the newest upstream PhotoCraft (storytold/photocraft) with the Android layer
-# and the English translation applied on top, then publishes the APK as a GitHub Release.
-# It only builds when upstream has something new (or when you run it by hand).
+# Builds the newest upstream PhotoCraft RELEASE (storytold/photocraft, its latest release tag, so
+# the APK is exactly that version) with the Android layer and the English translation applied on top,
+# then publishes the APK as a GitHub Release named after that version (android-v0.20.2).
+# It checks every night but only builds when upstream has published a release this repository has
+# no release for yet: no new upstream release means no release here.
 #
 # Run it by hand with "Publish a release" switched off to only build: the signed APK is kept as a
 # download on the run page (Artifacts) and nothing is released, tagged or committed.
@@ -15,7 +17,7 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: "Upstream branch or tag to build (empty = main)"
+        description: "Upstream tag, branch or commit to build (empty = upstream's latest release)"
         required: false
         default: ""
       force:
@@ -47,14 +49,25 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 150
     steps:
-      - name: Pick the upstream ref
+      - name: Pick the upstream version
         id: ref
         env:
+          GH_TOKEN: ${{ github.token }}
           INPUT_REF: ${{ inputs.ref }}
           VAR_REF: ${{ vars.UPSTREAM_REF }}
         run: |
-          REF="${INPUT_REF:-${VAR_REF:-main}}"
-          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          # A typed ref wins, then the UPSTREAM_REF variable, then upstream's latest release.
+          REF="${INPUT_REF:-$VAR_REF}"
+          if [ -z "$REF" ]; then
+            REF=$(gh release list --repo "$UPSTREAM" --limit 1 --exclude-drafts --exclude-pre-releases --json tagName --jq '.[0].tagName // empty' 2>/dev/null || true)
+          fi
+          if [ -z "$REF" ]; then
+            echo "Upstream has no release yet: nothing to build."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Building upstream $REF"
+            { echo "found=true"; echo "ref=$REF"; } >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Check out this repository (the Android layer lives here)
         uses: actions/checkout@v4
@@ -62,6 +75,7 @@ jobs:
           path: fork
 
       - name: Check out upstream PhotoCraft
+        if: steps.ref.outputs.found == 'true'
         uses: actions/checkout@v4
         with:
           repository: ${{ env.UPSTREAM }}
@@ -75,16 +89,32 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           FORCE: ${{ inputs.force }}
           INPUT_PUBLISH: ${{ inputs.publish }}
+          FOUND: ${{ steps.ref.outputs.found }}
+          REF: ${{ steps.ref.outputs.ref }}
         run: |
+          if [ "$FOUND" != "true" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           # Scheduled runs have no inputs: they always publish.
           PUBLISH="${INPUT_PUBLISH:-true}"
-          VER=$(grep -m1 '^version' src/Cargo.toml | cut -d'"' -f2)
           SHA=$(git -C src rev-parse --short=7 HEAD)
-          TAG="android-v${VER}-${SHA}"
+          # An upstream release builds as that version: its number comes from the tag, never from the
+          # Cargo.toml of whatever branch happens to be checked out. Anything else (a branch or
+          # commit typed by hand) takes the version from Cargo.toml and a commit suffix.
+          if gh release view "$REF" --repo "$UPSTREAM" > /dev/null 2>&1; then
+            VER="${REF#v}"
+            TAG="android-v${VER}"
+            IS_RELEASE=true
+          else
+            VER=$(grep -m1 '^version' src/Cargo.toml | cut -d'"' -f2)
+            TAG="android-v${VER}-${SHA}"
+            IS_RELEASE=false
+          fi
           SKIP=false
           if [ "$PUBLISH" = "true" ] && gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
             if [ "$FORCE" = "true" ]; then
-              # Same upstream commit, new Android layer: publish it as a new release.
+              # Same upstream version, new Android layer: publish it as a new release.
               TAG="${TAG}-r${GITHUB_RUN_NUMBER}"
             else
               echo "Release $TAG already exists - nothing to do."
@@ -97,6 +127,7 @@ jobs:
             echo "tag=$TAG"
             echo "skip=$SKIP"
             echo "publish=$PUBLISH"
+            echo "is_release=$IS_RELEASE"
           } >> "$GITHUB_OUTPUT"
 
       - name: Add the Android layer on top of upstream
@@ -243,7 +274,8 @@ jobs:
           #  3. Install notes.
           NEWS="$RUNNER_TEMP/layer/whats-new.md"
           PREV_TAG=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 50 --exclude-drafts --json tagName --jq '[.[] | select(.tagName | startswith("android-v"))][0].tagName' 2>/dev/null || true)
-          PREV_SHA=$(printf '%s' "$PREV_TAG" | sed -nE 's/^android-v[^-]+-([0-9a-f]{7}).*/\1/p')
+          # The upstream version the previous release was built from (android-v0.20.1[-suffix] -> v0.20.1).
+          PREV_VER=$(printf '%s' "$PREV_TAG" | sed -nE 's/^android-v([0-9][^-]*).*/\1/p')
           PREV_BODY=""
           if [ -n "$PREV_TAG" ]; then
             PREV_BODY=$(gh release view "$PREV_TAG" --repo "$GITHUB_REPOSITORY" --json body --jq .body 2>/dev/null || true)
@@ -263,22 +295,20 @@ jobs:
             fi
             echo "## Changes from upstream"
             echo
-            if [ -z "$PREV_SHA" ] || ! git rev-parse -q --verify "${PREV_SHA}^{commit}" > /dev/null; then
-              echo "First build, or the previous build's upstream commit is no longer available."
+            PREV_UP="v${PREV_VER}"
+            if [ -z "$PREV_VER" ] || ! git rev-parse -q --verify "refs/tags/${PREV_UP}^{commit}" > /dev/null; then
+              echo "First build, or the previous version's upstream tag is not available."
+            elif [ "$PREV_VER" = "$VERSION" ]; then
+              echo "Same upstream version as the previous build (${VERSION}): only the Android edition changed."
             else
-              COUNT=$(git rev-list --no-merges --count "${PREV_SHA}..HEAD")
-              if [ "$COUNT" = "0" ]; then
-                echo "No upstream changes since the previous build (\`${PREV_SHA}\`)."
-              else
-                echo "${COUNT} upstream change(s) since the previous build (\`${PREV_SHA}\` → \`${SHA}\`):"
-                echo
-                git log --no-merges --max-count=40 --pretty='- %s' "${PREV_SHA}..HEAD"
-                if [ "$COUNT" -gt 40 ]; then echo "- …and $((COUNT - 40)) more"; fi
-              fi
+              COUNT=$(git rev-list --no-merges --count "${PREV_UP}..HEAD")
+              echo "${COUNT} upstream change(s) from ${PREV_UP} to ${REF} (\`${SHA}\`):"
+              echo
+              git log --no-merges --max-count=40 --pretty='- %s' "${PREV_UP}..HEAD"
+              if [ "$COUNT" -gt 40 ]; then echo "- …and $((COUNT - 40)) more"; fi
             fi
-            # Upstream's own release notes, when this build is a new upstream version.
-            PREV_VER=$(printf '%s' "$PREV_TAG" | sed -nE 's/^android-v([^-]+)-.*/\1/p')
-            if [ "$PREV_VER" != "$VERSION" ] && gh release view "v${VERSION}" --repo "$UPSTREAM" --json body --jq .body > upstream-raw.md 2>/dev/null && [ -s upstream-raw.md ]; then
+            # Upstream's own release notes for this version.
+            if gh release view "$REF" --repo "$UPSTREAM" --json body --jq .body > upstream-raw.md 2>/dev/null && [ -s upstream-raw.md ]; then
               echo
               echo "### Upstream ${VERSION} release notes"
               echo
@@ -287,7 +317,7 @@ jobs:
             fi
             echo
             echo "## About this build"
-            echo "**PhotoCraft ${VERSION} for Android** (English, ARM64), built automatically from upstream \`${UPSTREAM}\` at \`${REF}\` (commit \`${SHA}\`) with the Android edition's layer and English translation applied."
+            echo "**PhotoCraft ${VERSION} for Android** (English, ARM64), built automatically from upstream \`${UPSTREAM}\` ${REF} (commit \`${SHA}\`) with the Android edition's layer and English translation applied."
             echo
             echo "- Needs an ARM64 phone or tablet running Android 9 or newer."
             echo "- Download the \`.apk\`, open it, and allow installs from your file manager or browser when Android asks."
@@ -296,7 +326,7 @@ jobs:
             echo "<!-- android-news:${TOP_ID} -->"
           } > notes.md
           gh release create "$TAG" "$APK" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
-            --title "PhotoCraft ${VERSION} Android (${SHA})" --notes-file notes.md
+            --title "PhotoCraft ${VERSION} Android" --notes-file notes.md
 
       - name: Keep the README's Android features list current
         if: steps.ver.outputs.skip != 'true' && steps.ver.outputs.publish == 'true'
